@@ -1,0 +1,46 @@
+# ====================================================================
+# 企业级 AI Agent 智能助手平台 - 完整依赖清单
+# 安装：pip install -r requirements.txt
+# Python >= 3.10
+# ====================================================================
+
+# ---- LangChain 基础组件 ----
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0      # DeepSeek 兼容 OpenAI 接口
+
+# ---- LangGraph 状态化 Agent（核心）----
+langgraph>=0.1.0
+
+# ---- LLM & Embedding ----
+openai>=1.0.0                 # DeepSeek/OpenAI 兼容客户端
+zhipuai>=2.0.0                # 智谱 embedding-2
+
+# ---- 向量存储 ----
+pymilvus>=2.4.0               # Milvus 静态知识库
+psycopg2-binary>=2.9.0       # PostgreSQL 驱动
+pgvector>=0.3.0              # pgvector 向量扩展支持
+
+# ---- RAG 文档处理 ----
+pypdf>=4.0.0                 # PDF文档加载
+tiktoken>=0.7.0              # token计数
+
+# ---- MCP 协议 ----
+mcp>=1.0.0                   # Model Context Protocol 标准库
+
+# ---- Web 服务（后端接口 + 鉴权）----
+fastapi>=0.110.0             # API服务框架
+uvicorn>=0.29.0              # ASGI服务器
+python-multipart>=0.0.9      # 表单解析
+
+# ---- 工程化辅助 ----
+python-dotenv>=1.0.0         # .env配置加载
+pydantic>=2.0.0              # 参数校验
+tenacity>=8.0.0              # 重试机制
+httpx>=0.27.0                # HTTP客户端（MCP/远程工具）
+loguru>=0.7.0                # 日志封装
+
+# ---- 工具类 ----
+requests>=2.31.0             # HTTP请求
+numpy>=1.24.0                # 向量计算

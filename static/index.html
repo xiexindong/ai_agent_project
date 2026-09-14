@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>企业级 AI Agent 智能助手</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <!-- jQuery 3.7.x CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+    <!-- Markdown 渲染（轻量） -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- ============ 顶部导航 ============ -->
+        <header class="topbar">
+            <div class="brand">
+                <span class="logo">◆</span>
+                <span class="title">企业级 AI Agent 智能助手</span>
+                <span class="badge">v1.0</span>
+            </div>
+            <div class="auth-area">
+                <input type="password" id="apiKey" class="api-input"
+                       placeholder="输入 API Key（如 sk-user-normal-001）">
+                <button id="btnAuth" class="btn btn-primary">连接</button>
+                <span id="connStatus" class="conn-status disconnected">● 未连接</span>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <!-- ============ 左侧栏 ============ -->
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <button id="btnNewSession" class="btn btn-block btn-accent" disabled>
+                        + 新建会话
+                    </button>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3 class="section-title">会话列表</h3>
+                    <ul id="sessionList" class="session-list">
+                        <li class="empty-tip">暂无会话</li>
+                    </ul>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3 class="section-title">知识库</h3>
+                    <div class="kb-stats">
+                        <div class="stat-row">
+                            <span>向量总数</span>
+                            <span id="kbTotal" class="stat-val">-</span>
+                        </div>
+                        <div class="stat-row">
+                            <span>集合</span>
+                            <span id="kbCollection" class="stat-val">-</span>
+                        </div>
+                        <button id="btnRefreshStats" class="btn btn-mini" disabled>刷新</button>
+                    </div>
+                    <div class="kb-upload">
+                        <label for="fileInput" class="btn btn-mini btn-block">上传文档入库</label>
+                        <input type="file" id="fileInput" hidden>
+                        <div id="uploadStatus" class="upload-status"></div>
+                    </div>
+                </div>
+
+                <div class="sidebar-section user-info">
+                    <h3 class="section-title">当前用户</h3>
+                    <div id="userInfo" class="user-card">
+                        <div class="user-name">未登录</div>
+                        <div class="user-level">-</div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- ============ 主对话区 ============ -->
+            <main class="chat-area">
+                <div class="chat-header">
+                    <div class="session-info">
+                        <span class="label">当前会话:</span>
+                        <span id="currentSession" class="session-id">-</span>
+                    </div>
+                    <div class="chat-stats">
+                        <span>推理轮次: <b id="statIterations">0</b></span>
+                        <span>工具调用: <b id="statToolCalls">0</b></span>
+                        <span>记忆压缩: <b id="statCompressed">-</b></span>
+                    </div>
+                </div>
+
+                <div id="messageList" class="message-list">
+                    <div class="welcome-banner">
+                        <h2>欢迎使用企业级 AI Agent</h2>
+                        <p>整合 Milvus RAG 知识库 + PG/pgvector 长记忆 + LangGraph ReAct Agent + MCP 工具调度</p>
+                        <div class="feature-tags">
+                            <span class="tag">私有RAG</span>
+                            <span class="tag">向量长记忆</span>
+                            <span class="tag">LangGraph</span>
+                            <span class="tag">MCP工具</span>
+                            <span class="tag">Function Calling</span>
+                        </div>
+                        <p class="tip">请在右上角输入 API Key 连接后开始对话</p>
+                        <p class="tip small">演示 Key: sk-user-normal-001 / sk-user-advanced-002 / sk-admin-003</p>
+                    </div>
+                </div>
+
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <textarea id="queryInput" class="query-input"
+                                  placeholder="输入你的问题...（Enter 发送，Shift+Enter 换行）"
+                                  disabled></textarea>
+                        <button id="btnSend" class="btn btn-primary btn-send" disabled>
+                            <span class="send-icon">➤</span> 发送
+                        </button>
+                    </div>
+                    <div class="input-tip">
+                        支持: 知识库问答 · 数学计算 · 数据查询 · 网络搜索 · 历史记忆召回
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- 加载遮罩 -->
+    <div id="loadingMask" class="loading-mask hidden">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <div id="loadingText" class="loading-text">Agent 推理中...</div>
+        </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

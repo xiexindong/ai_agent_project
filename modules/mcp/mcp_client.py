@@ -1,0 +1,233 @@
+"""
+MCP Client 模块
+===============
+MCP 标准化工具协议客户端：连接独立 MCP Server，发现工具、调用远程工具。
+基于 JSON-RPC 2.0 + stdio 传输，实现 Agent 与工具服务解耦。
+兼容【本地原生工具】+【MCP远程工具】双模式调度。
+"""
+import json
+import subprocess
+import threading
+from typing import Optional, List, Dict
+from queue import Queue, Empty
+from modules.common.logger import get_logger
+from modules.common.exceptions import MCPException, handle_exception
+from modules.mcp.protocol import (
+    create_request, parse_message,
+    create_error, INTERNAL_ERROR, METHOD_NOT_FOUND,
+)
+
+_logger = get_logger("mcp_client")
+
+
+class MCPClient:
+    """
+    MCP 客户端：通过 stdio 子进程与独立 MCP Server 通信。
+    生命周期：connect → discover_tools → call_tool → disconnect
+    """
+
+    def __init__(self, server_command: list, name: str = "mcp-server"):
+        self._server_command = server_command
+        self._name = name
+        self._process: Optional[subprocess.Popen] = None
+        self._stderr_queue: Queue = Queue()
+        self._req_id = 0
+        self._connected = False
+
+    def _next_id(self) -> int:
+        self._req_id += 1
+        return self._req_id
+
+    @handle_exception(default=None, log_msg="MCP连接异常", reraise=True)
+    def connect(self, timeout: float = 15.0) -> bool:
+        """启动 MCP Server 子进程并完成握手初始化。"""
+        try:
+            self._process = subprocess.Popen(
+                self._server_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                encoding="utf-8",
+            )
+            # 后台读取 stderr（日志/调试）
+            threading.Thread(
+                target=self._read_stderr, daemon=True
+            ).start()
+
+            # MCP initialize 握手
+            resp = self._send_request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "ai-agent-mcp-client", "version": "1.0.0"},
+            }, timeout=timeout)
+
+            if resp and "result" in resp:
+                self._connected = True
+                _logger.info(
+                    f"MCP Server 连接成功: {self._name} | "
+                    f"server={resp['result'].get('serverInfo', {})})"
+                )
+                # 发送 initialized 通知（MCP 协议要求）
+                self._send_notification("notifications/initialized", {})
+                return True
+            else:
+                raise MCPException("MCP握手失败", str(resp))
+        except FileNotFoundError:
+            raise MCPException(
+                "MCP Server 启动失败",
+                f"命令不存在: {self._server_command}",
+            )
+        except Exception as e:
+            raise MCPException("MCP连接异常", str(e))
+
+    def _read_stderr(self):
+        """后台读取 Server stderr 输出。"""
+        if not self._process or not self._process.stderr:
+            return
+        for line in self._process.stderr:
+            self._stderr_queue.put(line.rstrip())
+            _logger.debug(f"[{self._name}] stderr: {line.rstrip()}")
+
+    def _send_request(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+        """发送 JSON-RPC 请求并等待响应。"""
+        if not self._process or not self._process.stdin:
+            raise MCPException("MCP Server 未连接", "")
+        req_id = self._next_id()
+        msg = create_request(method, params, req_id=req_id)
+        self._process.stdin.write(msg + "\n")
+        self._process.stdin.flush()
+
+        # 读取响应行
+        try:
+            line = self._process.stdout.readline()
+            if not line:
+                raise MCPException("MCP Server 无响应", "")
+            resp = parse_message(line)
+            if "error" in resp:
+                err = resp["error"]
+                raise MCPException(
+                    f"MCP调用错误: {err.get('message', '')}",
+                    f"code={err.get('code')}",
+                )
+            return resp
+        except Empty:
+            raise MCPException("MCP响应超时", f"method={method}, timeout={timeout}s")
+
+    def _send_notification(self, method: str, params: dict):
+        """发送通知（无需响应）。"""
+        if not self._process or not self._process.stdin:
+            return
+        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
+        self._process.stdin.write(msg + "\n")
+        self._process.stdin.flush()
+
+    @handle_exception(default=[], log_msg="MCP工具发现异常")
+    def discover_tools(self) -> list:
+        """调用 MCP tools/list 发现远程工具。"""
+        resp = self._send_request("tools/list", {})
+        tools = resp.get("result", {}).get("tools", [])
+        _logger.info(f"MCP工具发现: {self._name} | 工具数={len(tools)}")
+        for t in tools:
+            _logger.info(f"  - {t.get('name')}: {t.get('description', '')[:60]}")
+        return tools
+
+    @handle_exception(default=None, log_msg="MCP工具调用异常")
+    def call_tool(self, tool_name: str, arguments: dict, timeout: float = 60.0) -> dict:
+        """调用 MCP 远程工具（tools/call）。"""
+        resp = self._send_request("tools/call", {
+            "name": tool_name,
+            "arguments": arguments,
+        }, timeout=timeout)
+        result = resp.get("result", {})
+        # MCP 工具结果格式: {content: [{type, text}], isError}
+        if result.get("isError"):
+            error_text = ""
+            for item in result.get("content", []):
+                if item.get("type") == "text":
+                    error_text += item.get("text", "")
+            raise MCPException(f"MCP工具执行失败: {tool_name}", error_text)
+        _logger.info(f"MCP工具调用成功: {tool_name}")
+        return result
+
+    def disconnect(self):
+        """关闭 MCP Server 连接。"""
+        if self._process:
+            try:
+                self._process.stdin.close()
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                self._process.kill()
+            finally:
+                self._process = None
+                self._connected = False
+                _logger.info(f"MCP Server 已断开: {self._name}")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._process is not None and self._process.poll() is None
+
+
+class MCPToolAdapter:
+    """
+    MCP 远程工具适配器：将 MCP 远程工具适配为 BaseTool 接口。
+    使 ToolRegistry 可统一管理本地工具与 MCP 工具。
+    """
+    def __init__(self, mcp_client: MCPClient, tool_info: dict):
+        self._client = mcp_client
+        self._tool_info = tool_info
+        self.name = tool_info["name"]
+        self.description = tool_info.get("description", "")
+        # MCP 工具的参数 schema
+        self.parameters_schema = tool_info.get("inputSchema", {
+            "type": "object", "properties": {}, "required": []
+        })
+
+    @property
+    def tool_type(self) -> str:
+        return "mcp"
+
+    def to_openai_format(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters_schema,
+            },
+        }
+
+    def validate_params(self, params: dict) -> dict:
+        required = self.parameters_schema.get("required", [])
+        missing = [r for r in required if r not in (params or {})]
+        if missing:
+            raise MCPException(f"参数缺失: {missing}", f"tool={self.name}")
+        return params or {}
+
+    def run(self, params: dict):
+        """执行 MCP 工具调用。"""
+        import time
+        start = time.time()
+        try:
+            validated = self.validate_params(params)
+            result = self._client.call_tool(self.name, validated)
+            # 提取文本内容
+            text_parts = []
+            for item in result.get("content", []):
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            from modules.tools.base_tool import ToolResult
+            return ToolResult(
+                success=True,
+                result="\n".join(text_parts) if text_parts else result,
+                duration_ms=int((time.time() - start) * 1000),
+            )
+        except Exception as e:
+            from modules.tools.base_tool import ToolResult
+            return ToolResult(
+                success=False,
+                error=str(e),
+                duration_ms=int((time.time() - start) * 1000),
+            )

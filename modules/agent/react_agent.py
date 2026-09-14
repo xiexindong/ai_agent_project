@@ -1,0 +1,322 @@
+"""
+ReAct Agent 模块
+================
+标准 ReAct 推理循环：Reason思考 → Action执行 → Observation观察。
+整合 RAG 知识库、向量记忆、本地工具、MCP远程工具全链路。
+覆盖边界2（输出校验）、边界3（死循环拦截）、边界6（Prompt防护）。
+"""
+import time
+from typing import Optional
+from modules.common.logger import get_logger
+from modules.common.exceptions import LLMException, ToolException, handle_exception
+from modules.common.validator import sanitize_input, check_prompt_injection, repair_json
+from modules.agent.llm import LLMClient
+from modules.agent.state import AgentState
+
+_logger = get_logger("react")
+
+
+class ReActAgent:
+    """ReAct 推理引擎（Reason-Action-Observation 循环）。"""
+
+    SYSTEM_PROMPT = (
+        "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"
+        "## 工作流程（ReAct）\n"
+        "1. Reason：分析用户问题，判断是否需要调用工具\n"
+        "2. Action：如需工具，调用对应工具获取信息\n"
+        "3. Observation：观察工具返回结果，决定是否继续调用或给出答案\n\n"
+        "## 核心规则\n"
+        "- 仅基于知识库和工具返回的事实回答，禁止编造\n"
+        "- 知识库无相关内容时，如实告知并尝试工具补充\n"
+        "- 工具调用需确认参数正确性\n"
+        " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"
+        "## 回答要求\n"
+        "- 提供完整详细的答案（包含推理依据、数据来源）\n"
+        "- 末尾附【摘要】标签，用一句话总结本轮对话核心"
+    )
+
+    REASON_PROMPT = (
+        "## 用户提问\n{query}\n\n"
+        "## 激活技能（SOP作业流程）\n{skill_context}\n\n"
+        "## 知识库参考\n{rag_context}\n\n"
+        "## 历史记忆\n{memory_context}\n\n"
+        "## 历史工具调用\n{tool_history}\n\n"
+        "## 工具观察结果\n{observation}\n\n"
+        "## 可用工具（Function Calling）\n{tools_desc}\n\n"
+        "请分析当前情况，决定下一步行动：\n"
+        "- 如果已激活技能，优先遵循该技能的作业流程(SOP)，并优先使用其推荐工具\n"
+        "- 如果已有足够信息回答，直接给出最终答案\n"
+        "- 如果需要更多信息，选择合适的工具调用\n"
+        "- 严格使用 Function Calling 格式输出工具调用"
+    )
+
+    def __init__(
+        self,
+        llm_client: LLMClient = None,
+        tool_registry=None,
+        rag_chain=None,
+        memory_manager=None,
+        skill_registry=None,
+    ):
+        self.llm = llm_client or LLMClient()
+        self.tool_registry = tool_registry
+        self.rag = rag_chain
+        self.memory = memory_manager
+        self.skill_registry = skill_registry
+        from config import get_settings
+        s = get_settings()
+        self._max_iter = s.max_react_iterations
+
+    def prepare_state(
+        self,
+        query: str,
+        session_id: str,
+        user_id: str,
+        user_level: str = "normal",
+    ) -> AgentState:
+        """
+        初始化 Agent 状态：输入清洗 → Prompt注入检测 → 记忆召回 → RAG召回。
+        覆盖边界6（Prompt注入防护）。
+        """
+        # 边界6：Prompt注入检测
+        if check_prompt_injection(query):
+            return AgentState(
+                session_id=session_id,
+                user_id=user_id,
+                user_query=query,
+                finished=True,
+                final_answer="检测到潜在的指令注入，已拦截。请使用正常方式提问。",
+                error="prompt_injection_blocked",
+            )
+
+        # 输入清洗
+        clean_query = sanitize_input(query)
+        state = AgentState(
+            session_id=session_id,
+            user_id=user_id,
+            user_query=clean_query,
+            max_iterations=self._max_iter,
+        )
+
+        # Skill 技能意图匹配（命中则注入专属 SOP，未命中走通用流程）
+        if self.skill_registry:
+            try:
+                matched_skill, skill_ctx = self.skill_registry.build_skill_context(clean_query)
+                if matched_skill:
+                    state.active_skill = matched_skill.name
+                    state.skill_context = skill_ctx
+                breakpoint()  # 【调试断点】技能匹配结果：可看 matched_skill / skill_ctx
+            except Exception as e:
+                _logger.warning(f"技能匹配降级（按通用助手流程处理）: {e}")
+                state.active_skill = ""
+                state.skill_context = ""
+
+        # 记忆召回（短期+长期）
+        if self.memory:
+            try:
+                query_emb = None
+                # 复用 embedding 避免重复计算
+                from modules.memory.embedding_service import get_embedding_service
+                query_emb = get_embedding_service().embed(clean_query)
+                mem_ctx = self.memory.build_context(
+                    session_id, user_id, clean_query, query_emb
+                )
+                state.memory_context = mem_ctx["context_text"]
+                state.long_term_memory = mem_ctx["long_term_memory"]
+                state.short_term_memory = mem_ctx["short_term_memory"]
+                state.memory_compressed = mem_ctx["compressed"]
+                state.summary_embedding = query_emb  # 暂存query向量
+            except Exception as e:
+                _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
+                state.memory_context = ""
+
+        # RAG 知识库召回
+        if self.rag:
+            try:
+                rag_ctx = self.rag.build_context(clean_query)
+                state.rag_context = rag_ctx
+                state.rag_sources = self.rag.retrieve(clean_query) if rag_ctx else []
+                breakpoint()  # 【调试断点】RAG召回结果：可看 rag_ctx（Milvus 召回的文档内容，空=没命中）
+            except Exception as e:
+                _logger.warning(f"RAG召回异常降级: {e}")
+                state.rag_context = ""
+
+        return state
+
+    def reason_step(self, state: AgentState) -> AgentState:
+        """
+        ReAct Reason 步骤：让 LLM 看 query + 历史 + 工具清单，决定"调工具还是直接答"。
+
+        【一次调用可能改写 state 的 4 个字段】
+            reasoning      : LLM 的思考过程文本（debug 用）
+            need_tool_call : True=要调工具, False=直接答
+            action         : 当要调工具时，存 {name, arguments, id}
+            final_answer   : 当不调工具时，直接填最终答案
+
+        【两种决策结果对比】
+            ✓ 调工具（用户问"3*7"，iteration=1，<max=10）:
+                state.need_tool_call = True
+                state.action = {"name": "calculator", "arguments": {"expression":"3*7"}, "id":"call_abc"}
+                state.final_answer = ""
+                → 图路由拿到 need_tool_call=True，走 act 节点
+
+            ✗ 直接答（用户问"你好"，或 iteration 已达 max=10）:
+                state.need_tool_call = False
+                state.action = None
+                state.final_answer = "你好！有什么可以帮你的？"
+                → 图路由走 answer 节点收尾
+
+        【覆盖的安全边界】
+            边界1 - Prompt 注入防护：在 prepare_state 阶段已做（本函数上游）
+            边界2 - 输出校验/参数修复：LLM 返回的 tool_calls 参数 JSON 可能非法
+                    （尾逗号/缺括号），由 repair_json 在 llm.invoke_with_tools 内修复
+            边界3 - 死循环拦截：若 iteration ≥ max_iterations 且仍要调工具，
+                    强制 need_tool_call=False 走 answer，防 ReAct 无限循环
+
+        【为什么 max_iterations=10？】项目硬约束：ReAct 循环不超过 10 次防死循环，
+            超出视为模型陷入"调工具-看结果-再调工具"的死循环，必须强制终止。
+        """
+        state.iteration += 1
+        _logger.info(f"ReAct循环 iteration={state.iteration}/{state.max_iterations}")
+        breakpoint()  # 【调试断点】Reason 节点入口：可看 state.user_query / iteration / observation
+
+        # 构建 Reason Prompt
+        tools_schema = []
+        tools_desc = "（无可用工具）"
+        if self.tool_registry:
+            tools_schema = self.tool_registry.get_openai_tools_schema()
+            tools_desc = "\n".join(
+                f"- {t['function']['name']}: {t['function']['description']}"
+                for t in tools_schema
+            )
+
+        tool_history = "\n".join(
+            f"  - {log.get('name', '')}({log.get('arguments', {})}) → {log.get('result', '')[:100]}"
+            for log in state.tool_calls_history
+        ) or "（无）"
+
+        prompt = self.REASON_PROMPT.format(
+            query=state.user_query,
+            skill_context=state.skill_context or "（未匹配到专门技能，按通用企业助手流程处理）",
+            rag_context=state.rag_context or "（知识库无相关内容）",
+            memory_context=state.memory_context or "（无历史记忆）",
+            tool_history=tool_history,
+            observation=state.observation or "（初始状态，暂无工具观察）",
+            tools_desc=tools_desc,
+        )
+
+        # 调用 LLM（带工具）
+        result = self.llm.invoke_with_tools(
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT.format(max_iter=self._max_iter)},
+                {"role": "user", "content": prompt},
+            ],
+            tools=tools_schema,
+        )
+
+        state.reasoning = result["content"] or ""
+        tool_calls = result.get("tool_calls")
+        breakpoint()  # 【调试断点】模型决策结果：可看 tool_calls（模型决定调不调工具、调哪个）
+
+        # 判断是否需要工具
+        if tool_calls and state.iteration < state.max_iterations:
+            state.need_tool_call = True
+            state.action = tool_calls[0]  # 取第一个工具调用
+        else:
+            # 不需要工具，直接作为最终答案
+            state.need_tool_call = False
+            state.final_answer = result["content"] or "抱歉，我暂时无法回答这个问题。"
+
+        # 最大循环次数拦截（边界3）
+        if state.iteration >= state.max_iterations and state.need_tool_call:
+            _logger.warning(f"达到最大循环次数{state.max_iterations}，强制终止ReAct循环")
+            state.need_tool_call = False
+            state.final_answer = result["content"] or "已达到最大推理次数，基于当前信息给出最佳答案。"
+
+        return state
+
+    def act_step(self, state: AgentState) -> AgentState:
+        """ReAct Action 步骤：执行工具调用（本地 or MCP）。"""
+        action = state.action
+        tool_name = action.get("name", "")
+        arguments = action.get("arguments", {})
+        breakpoint()  # 【调试断点】Act 节点入口：可看 tool_name / arguments（模型决定调的工具）
+
+        _logger.info(f"工具调用: {tool_name} | args={arguments}")
+
+        # 通过 ToolRegistry 统一调度（本地+MCP）
+        if not self.tool_registry:
+            state.observation = "工具注册器未初始化，无法调用工具"
+            return state
+
+        result = self.tool_registry.execute_tool(
+            name=tool_name,
+            params=arguments,
+            session_id=state.session_id,
+        )
+        breakpoint()  # 【调试断点】工具执行完成：可看 result.result / result.success / result.duration_ms
+
+        # 记录工具调用日志
+        log_entry = {
+            "name": tool_name,
+            "arguments": arguments,
+            "result": str(result.result)[:500] if result.success else result.error,
+            "success": result.success,
+            "duration_ms": result.duration_ms,
+        }
+        state.tool_calls_history.append(log_entry)
+        state.tool_call_logs.append(log_entry)
+
+        if result.success:
+            state.observation = str(result.result)
+        else:
+            state.observation = f"工具执行失败: {result.error}"
+            _logger.warning(f"工具执行失败: {tool_name} | {result.error}")
+
+        # 重置 action，准备下一轮
+        state.action = {}
+        return state
+
+    def generate_answer(self, state: AgentState) -> AgentState:
+        """生成最终完整答案。"""
+        if state.final_answer and not state.need_tool_call:
+            # Reason 步骤已生成答案
+            pass
+        else:
+            # 基于所有观察生成最终答案
+            prompt = (
+                f"## 用户提问\n{state.user_query}\n\n"
+                f"## 知识库参考\n{state.rag_context or '无'}\n\n"
+                f"## 工具观察结果\n{state.observation or '无'}\n\n"
+                f"## 推理过程\n{state.reasoning}\n\n"
+                "请基于以上信息，给出完整详细的最终答案。"
+            )
+            state.final_answer = self.llm.invoke(
+                prompt,
+                system_prompt=self.SYSTEM_PROMPT.format(max_iter=self._max_iter),
+            )
+
+        state.finished = True
+        return state
+
+    def generate_summary(self, state: AgentState) -> str:
+        """生成精简摘要（用于向量入库）。"""
+        if not state.final_answer:
+            return state.user_query[:50]
+        # 提取已有的摘要标签，或重新生成
+        if "【摘要】" in state.final_answer:
+            import re
+            m = re.search(r'【摘要】(.+?)(?:$|\n)', state.final_answer, re.S)
+            if m:
+                return m.group(1).strip()[:100]
+        # 调用 LLM 生成摘要
+        if self.memory:
+            try:
+                summary = self.memory.summary_generator.generate_summary(
+                    state.user_query, state.final_answer
+                )
+                return summary
+            except Exception as e:
+                _logger.warning(f"摘要生成降级: {e}")
+        # 兜底
+        return state.user_query[:50]
