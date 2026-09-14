@@ -62,7 +62,35 @@ class AppContext:
 
 def create_app() -> FastAPI:
     """创建 FastAPI 应用实例。"""
+    # ━━━ 创建 FastAPI 应用实例 ━━━
+    # FastAPI() 内部干了 5 件事：① 继承 Starlette 装 ASGI 引擎
+    # ② 初始化路由表 self.router ③ 装中间件栈 self.user_middleware=[]
+    # ④ 准备 OpenAPI 文档生成器 ⑤ 注册 /docs /redoc 等默认路由
+    #
+    # title 和 version 不是给代码用的，是给 /docs 文档页用的：
+    #   浏览器开 http://localhost:8000/docs，页面顶部显示：
+    #     企业级 AI Agent 智能助手  1.0.0   ← title + version
+    # 类比 Express：const app = express() —— 拿到空应用，等你往里加路由/中间件
     app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0")
+
+    # ━━━ 装跨域中间件（CORS）━━━
+    # 【为什么要这个】浏览器同源策略：前端在 localhost:5500 请求 localhost:8000
+    # 会被浏览器拦截（跨域），后端必须明确"允许来源"才放行
+    #
+    # 【参数拆解】
+    #   CORSMiddleware       → FastAPI 自带的跨域处理中间件类
+    #   allow_origins=["*"] → 允许哪些域名来访，"*" = 全放行
+    #   allow_methods=["*"] → 允许 HTTP 方法，"*" = GET/POST/PUT/DELETE 全放行
+    #   allow_headers=["*"] → 允许请求头，"*" = X-API-Key/Content-Type 全放行
+    #
+    # 【实际效果】
+    #   ✗ 不加：前端 fetch('/chat') 浏览器报 CORS 错，请求被拦在浏览器侧
+    #   ✓ 加：后端响应头带 Access-Control-Allow-Origin: *，浏览器放行
+    #
+    # 【生产环境】allow_origins=["*"] 是开发期方便，生产要换成具体域名：
+    #   allow_origins=["http://localhost:5500", "https://your-frontend.com"]
+    #
+    # 类比 Express：app.use(cors())
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -311,7 +339,29 @@ class APIServer:
 
     def run(self):
         """启动 API 服务。"""
+        # ━━━ 真正启动 HTTP 服务的方法 ━━━
+        # 前面 __init__ / _init_components / _register_routes 三步只是"造车 + 装货"：
+        #   ① FastAPI() 造应用对象（车） ② 装配 6 大组件（货） ③ 注册 7 个路由（装货上车）
+        # 但车还停在车库里——FastAPI 自己不会启动服务（没有 listen 方法）。
+        # 这一行 import uvicorn 才是真正"找司机来开车"的步骤。
+        #
+        # 【FastAPI vs uvicorn 分工】
+        #     FastAPI = 应用层：定义路由、处理请求、生成文档  → 类比"装好货的车"
+        #     uvicorn  = 服务器层：开端口、收 socket、转 ASGI  → 类比"司机点火开车"
+        #     FastAPI 把网络层外包给 uvicorn（职责分离设计），
+        #     所以 FastAPI 对象本身不会启动服务，必须 uvicorn.run(app, ...) 来跑。
+        #
+        # 【对照 Express】
+        #     Express：app.listen(8000)              ← 车和司机合一，一步启动
+        #     FastAPI：uvicorn.run(app, port=8000)   ← 车和司机分离，两步启动
         import uvicorn
+
+        # get_settings() = 读 .env 配置单例（端口/主机/密钥都从这里拿）
+        # s.app_host / s.app_port 来自 .env 的 APP_HOST / APP_PORT 配置项
         s = get_settings()
         _logger.info(f"API服务启动: {s.app_host}:{s.app_port}")
+        # ━━━ 点火启动：让 uvicorn 在 host:port 开 socket 监听 ━━━
+        # 调用后进程一直阻塞在 uvicorn 事件循环里，收到 HTTP 请求 → 转给 self.app（FastAPI）
+        # → FastAPI 路由匹配 → 调对应处理函数（如 @app.post("/chat") 的 chat()）
+        # 直到 Ctrl+C 才退出。
         uvicorn.run(self.app, host=s.app_host, port=s.app_port)
