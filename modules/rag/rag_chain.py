@@ -8,7 +8,7 @@ from typing import List, Optional
 from modules.common.logger import get_logger
 from modules.common.exceptions import RAGException
 from modules.rag.document_loader import DocumentLoader, Document
-from modules.rag.text_splitter import TextSplitter
+from modules.rag.text_splitter import TextChunk, TextSplitter
 from modules.rag.vector_store import MilvusVectorStore
 from modules.rag.reranker import BGEReranker
 from config import get_settings
@@ -37,7 +37,7 @@ class RAGChain:
         返回入库分片数。
         """
         doc = self.loader.load(file_path)
-        chunks = self.splitter.split_document(doc)
+        chunks: List[TextChunk] = self.splitter.split_document(doc)
         if not chunks:
             _logger.warning(f"文档无有效内容: {file_path}")
             return 0

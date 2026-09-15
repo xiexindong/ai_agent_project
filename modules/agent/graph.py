@@ -269,6 +269,7 @@ class AgentGraph:
             "user_query": query,
             "prepared": False,
         }
+    # recursion_limit 递归深度限制，防止死循环
         result = self._graph.invoke(initial_state, {"recursion_limit": 30})
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "

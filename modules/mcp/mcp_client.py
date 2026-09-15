@@ -43,14 +43,43 @@ class MCPClient:
     def connect(self, timeout: float = 15.0) -> bool:
         """启动 MCP Server 子进程并完成握手初始化。"""
         try:
+            # ── 干什么：在本机新起一个子进程跑 MCP Server ──
+            # 注意它不是网络服务（没有 IP/端口），就是操作系统层面的"父子进程"，
+            # 双方靠 3 根管道说 JSON-RPC 2.0，一次一行 JSON（NDJSON 行协议）。
+            #
+            # 通俗比喻：你（主进程）和一位关在小黑屋里的专家（子进程）合作——
+            #   塞进门缝的「问题纸条」= stdin
+            #   专家递出来的「回答纸条」= stdout
+            #   专家自言自语的「碎碎念（日志）」= stderr
+            #
+            # 命令来自 main.py:107 → [sys.executable, "-m", "modules.mcp.mcp_server"]
+            # 等价于在终端敲：python -m modules.mcp.mcp_server
+            # 子进程那头跑的是 mcp_server.py:204 的 `for line in sys.stdin:` 事件循环
             self._process = subprocess.Popen(
                 self._server_command,
+                # 父 → 子：写请求（initialize / tools/list / tools/call）
+                # 专业点说：管道是单向的，所以"说"和"听"必须是两根不同的管子
                 stdin=subprocess.PIPE,
+                # 子 → 父：读响应（_send_request 里 stdout.readline() 一次读一行）
+                # ⚠ 这是"协议专线"：子进程任何 print / 日志都不许打到这里，
+                #   否则 parse_message 拿到非 JSON 的行，整个协议就崩了
                 stdout=subprocess.PIPE,
+                # 子 → 父：子进程的 loguru 日志，不参与协议，只给人看
+                # ⚠ 必须有人持续读（下面 _read_stderr 线程就在干这事）：
+                #   管道是内核里固定大小的缓冲区（Linux 默认 64KB），写满后
+                #   子进程再 write 就会卡住等 → 双方互相等 = 死锁
                 stderr=subprocess.PIPE,
+                # 文本模式：读写直接拿 str，省掉 encode / decode
                 text=True,
+                # 行缓冲（text 模式下 bufsize=1 即 line-buffered）：
+                # 写一行立刻发出去，否则会攒在缓冲区里，对面半天收不到
+                # （所以 _send_request 写完还跟了一行 flush）
                 bufsize=1,
+                # 显式 UTF-8：Windows 上不写会走系统默认 GBK，中文工具参数必乱码
                 encoding="utf-8",
+                # ⚠ 未传 cwd：子进程继承父进程工作目录
+                #   → 必须在项目根目录运行，否则 `-m modules.mcp.mcp_server` 找不到包，
+                #     启动失败被上层降级（main.py:114），表现为"少了几个工具"而不是报错
             )
             # 后台读取 stderr（日志/调试）
             threading.Thread(
