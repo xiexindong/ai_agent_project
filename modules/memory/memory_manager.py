@@ -38,10 +38,10 @@ class MemoryManager:
         llm_full_answer: str,
         llm_summary: str,
         summary_embedding: list,
-        tool_call_log: list = None,
-        rag_sources: list = None,
-        query_embedding: list = None,
-    ) -> int:
+        tool_call_log: list | None = None,
+        rag_sources: list | None = None,
+        query_embedding: list | None = None,
+    ) -> int | None:
         """保存一轮对话全量数据（原文+摘要+摘要向量+问句向量+工具日志）。"""
         return self.pg.save_history(
             session_id, user_id,
@@ -55,7 +55,7 @@ class MemoryManager:
         session_id: str,
         user_id: str,
         query: str,
-        query_embedding: list = None,
+        query_embedding: list | None = None,
     ) -> dict:
         """
         构建塞给 LLM 的记忆上下文 = 长期向量召回 + 短期原文 + 压缩标记。
@@ -110,7 +110,7 @@ class MemoryManager:
 
     @handle_exception(default=[], log_msg="长期记忆召回异常")
     def _recall_long_term(
-        self, query: str, user_id: str, query_embedding: list = None
+        self, query: str, user_id: str, query_embedding: list | None = None
     ) -> list:
         """
         用问题向量召回历史摘要，并按相似度阈值过滤。

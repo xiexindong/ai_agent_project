@@ -5,10 +5,15 @@
 提供统一异常处理装饰器，支持重试、兜底、日志记录。
 """
 import functools
-from typing import Callable
+from typing import Any, Callable, Literal, ParamSpec, TypeVar, overload
 from modules.common.logger import get_logger
 
 _logger = get_logger("exception")
+
+# 泛型参数：P = 被装饰函数的参数签名，R = 被装饰函数的返回类型
+# 有了这两个泛型，装饰后的函数能保留原函数的参数/返回类型（否则全变 Unknown）
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 # ---- 基础异常 ----
@@ -41,22 +46,42 @@ class MCPException(AgentException):
 
 
 # ---- 统一异常处理 ----
+# ---- 两个 overload：让类型检查器精确推断装饰后的返回类型 ----
+# 情形1：reraise=False（默认），default 与函数返回值同类型（如 default=[] 配 -> list）
+#        → 异常时返回 default，类型仍是 R，不会把 None 传染给调用方
+@overload
 def handle_exception(
-    default=None,
+    default: R = ...,
+    log_msg: str = "操作异常",
+    reraise: Literal[False] = False,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+# 情形2：reraise=True（关键写路径），异常直接重抛、default 永远不会被返回
+#        → 返回类型就是 R 本身（default 此时只是占位，所以标 Any）
+@overload
+def handle_exception(
+    default: Any = None,
+    log_msg: str = "操作异常",
+    reraise: Literal[True] = True,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def handle_exception(
+    default: Any = None,
     log_msg: str = "操作异常",
     reraise: bool = False,
-):
+) -> Callable[[Callable[P, R]], Callable[P, R | None]]:
     """
     装饰器：统一捕获异常，记录日志，返回兜底值。
-    
+
     Args:
         default: 异常时返回的兜底值
         log_msg: 日志描述前缀
         reraise: 是否重新抛出异常（关键路径用）
     """
-    def decorator(func: Callable):
+    def decorator(func: Callable[P, R]) -> Callable[P, R | None]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | None:
             try:
                 return func(*args, **kwargs)
             except AgentException as e:

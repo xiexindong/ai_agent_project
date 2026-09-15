@@ -52,7 +52,7 @@ class ReActAgent:
 
     def __init__(
         self,
-        llm_client: LLMClient = None,
+        llm_client: LLMClient | None = None,
         tool_registry=None,
         rag_chain=None,
         memory_manager=None,

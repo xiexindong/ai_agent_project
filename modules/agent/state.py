@@ -59,6 +59,7 @@ class AgentStateDict(TypedDict, total=False):
     need_tool_call: bool    # 是否需要调用工具
     finished: bool          # 是否完成
     error: str
+    prepared: bool          # prepare 节点是否已执行（True = 跳过重复召回，断点续跑用）
 
 
 @dataclass
@@ -97,6 +98,7 @@ class AgentState:
     need_tool_call: bool = False
     finished: bool = False
     error: str = ""
+    prepared: bool = False
 
     def to_dict(self) -> AgentStateDict:
         """
@@ -141,6 +143,7 @@ class AgentState:
             "need_tool_call": self.need_tool_call,
             "finished": self.finished,
             "error": self.error,
+            "prepared": self.prepared,
         }
 
     @classmethod
@@ -186,4 +189,5 @@ class AgentState:
             need_tool_call=d.get("need_tool_call", False),
             finished=d.get("finished", False),
             error=d.get("error", ""),
+            prepared=d.get("prepared", False),
         )

@@ -29,7 +29,7 @@ LangGraph 图构建模块
         save     → 落 PG（原文+摘要+向量+工具日志）→ END
     输出: {final_answer:"3*7 等于 21", iteration:2, tool_call_logs:[...]}
 """
-from typing import Annotated
+from typing import Annotated, Any
 from langgraph.graph import StateGraph, END
 from modules.common.logger import get_logger
 from modules.agent.state import AgentStateDict
@@ -104,7 +104,7 @@ class AgentGraph:
 
     # ==================== 节点实现 ====================
 
-    def _prepare_node(self, state: dict) -> dict:
+    def _prepare_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
         breakpoint()  # 【调试断点】图节点[prepare]入口：可看 state 初始状态
@@ -122,7 +122,7 @@ class AgentGraph:
             return updates
         return {}
 
-    def _reason_node(self, state: dict) -> dict:
+    def _reason_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """推理节点：LLM ReAct 分析，判断是否调用工具。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
@@ -142,7 +142,7 @@ class AgentGraph:
         }
         return updates
 
-    def _act_node(self, state: dict) -> dict:
+    def _act_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """执行节点：调用工具（本地 or MCP）。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
@@ -156,7 +156,7 @@ class AgentGraph:
             "tool_call_logs": updated.tool_call_logs,
         }
 
-    def _answer_node(self, state: dict) -> dict:
+    def _answer_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """答案节点：生成完整答案 + 精简摘要。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
@@ -171,7 +171,7 @@ class AgentGraph:
             "finished": True,
         }
 
-    def _save_node(self, state: dict) -> dict:
+    def _save_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """保存节点：记忆入库（原文+摘要+向量），Agent状态持久化。"""
         session_id = state.get("session_id", "")
         user_id = state.get("user_id", "")
@@ -258,11 +258,12 @@ class AgentGraph:
         query: str,
         session_id: str,
         user_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """执行完整 Agent 流程。"""
         _logger.info(f"Agent执行: session={session_id} | query='{query[:50]}'")
         breakpoint()  # 【调试断点】Agent图执行入口：可看 query / session_id / user_id
-        initial_state = {
+        # 标注 AgentStateDict：LangGraph invoke 期待状态 TypedDict，纯 dict 会被类型检查器拒收
+        initial_state: AgentStateDict = {
             "session_id": session_id,
             "user_id": user_id,
             "user_query": query,

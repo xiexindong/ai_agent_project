@@ -1,0 +1,25 @@
+{
+  // basedpyright 类型检查配置
+  // 问题背景：basedpyright 默认 recommended 模式极严（连 Any、隐式字符串拼接都报），
+  // 项目现有代码未做全量类型标注，导致满屏红黄波浪线。
+  // 本配置降为 standard（保留真 bug 检测：类型不匹配、返回值错误等），只关掉风格类噪音规则。
+  "typeCheckingMode": "standard",
+
+  // ---- 关闭的风格类噪音（不影响真实缺陷检测）----
+  "reportMissingTypeArgument": "none",          // dict/list 必须写泛型参数 → 太苛刻，关
+  "reportUnknownVariableType": "none",          // 变量类型未知（来自 Any）→ 关
+  "reportUnknownArgumentType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownMemberType": "none",
+  "reportAny": "none",                          // 使用 Any 就报 → 关
+  "reportImplicitStringConcatenation": "none",  // 相邻字符串自动拼接 → 项目注释/SQL 大量使用，关
+  "reportUnannotatedClassAttribute": "none",    // 类属性必须标注类型 → 关
+  "reportUninitializedInstanceVariable": "none",// 实例变量未在 __init__ 初始化 → 本项目 _conn 在 _connect() 里赋值，关
+  "reportDeprecated": "none",                   // List/Optional 弃用提醒 → 关
+
+  // ---- 保留的有用检测（standard 默认开启，显式写出以示重视）----
+  "reportArgumentType": "error",                // 参数类型不匹配（真 bug）
+  "reportReturnType": "error",                  // 返回类型不匹配（真 bug）
+  "reportAttributeAccessIssue": "error",        // 访问不存在的属性（真 bug）
+  "reportCallIssue": "error"                    // 调用参数个数/名称错误（真 bug）
+}

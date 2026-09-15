@@ -455,7 +455,22 @@ class PGManager:
             "SELECT agent_state FROM chat_session WHERE session_id = %s AND user_id = %s",
             (session_id, user_id),
         )
+        # 【为什么 execute 之后还要 fetchone？】
+        #   execute() 只是把 SQL 发给数据库执行，结果还留在数据库那边（Python 手里什么都没有）；
+        #   fetchone() 才是把结果搬回 Python 内存，变成下面这个 row。
+        #   → 类比：execute = 下单，fetchone = 取餐；不 fetch 就永远拿不到数据。
+        #   这里用 fetchone 而非 fetchall：session_id 是主键，最多只可能有 1 行。
+        # ⚠ fetchone() 查不到时返回 None（不抛异常），所以下一行必须先判空再取 row[0]，
+        #   否则直接 TypeError: 'NoneType' object is not subscriptable
         row = self._cur.fetchone()
+
+        # row 是「元组」，列顺序对应 SELECT 的顺序，如 ({'iteration': 2},)
+        #   → row[0] 才是第 0 列 agent_state 的值
+        # 判两次的原因：两种"空"都算没查到，统一兜底成 {}
+        #   ① row 是 None   → 没这个会话，或该会话不属于这个 user_id
+        #   ② row[0] 是 {}  → 有记录，但 agent_state 是空字典（{} 是假值）
+        # 好处：调用方不用判空，server.py 可直接写 if not get_session_state(...) 当越权校验
+        # 注意：agent_state 是 JSONB 列，驱动已自动 parse 成 dict，无需 json.loads
         return row[0] if row and row[0] else {}
 
     # ==================== 对话记忆 ====================
@@ -469,10 +484,10 @@ class PGManager:
         llm_full_answer: str,
         llm_summary: str,
         summary_embedding: list,
-        tool_call_log: list = None,
-        rag_sources: list = None,
-        query_embedding: list = None,
-    ) -> int:
+        tool_call_log: list | None = None,
+        rag_sources: list | None = None,
+        query_embedding: list | None = None,
+    ) -> int | None:
         """
         保存一轮对话到 chat_history 表（四数据落库）。
 
@@ -521,6 +536,12 @@ class PGManager:
                 json.dumps(rag_sources or [], ensure_ascii=False),
             ),
         )
+        # ⚠ 顺序不能反：必须「先 fetchone，再 commit」
+        #   ① RETURNING id 的值在 execute() 时已由数据库算好并随结果集返回，
+        #      fetchone() 只是把它搬回 Python —— 不是"提交之后才产生 id"
+        #   ② commit() 会结束事务，服务端游标（cursor(name="xxx")）会被一并关闭，
+        #      此时再 fetchone() 直接报错
+        #   ③ 先 commit 的话，若 fetch 出错，会留下"插进去了却没拿到 id"的孤儿数据
         row = self._cur.fetchone()
         self._conn.commit()
         history_id = row[0] if row else None
@@ -658,7 +679,7 @@ class PGManager:
         ]
 
     @handle_exception(default=0, log_msg="回填问句向量异常")
-    def backfill_query_embeddings(self, user_id: str = None, batch_size: int = 64) -> int:
+    def backfill_query_embeddings(self, user_id: str | None = None, batch_size: int = 64) -> int:
         """
         历史数据回填：把老记录的 user_query 向量化，写进 query_embedding 列。
 

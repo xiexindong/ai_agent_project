@@ -29,7 +29,7 @@ class TextSplitter:
         self,
         chunk_size: int = 500,
         chunk_overlap: int = 80,
-        separators: list = None,
+        separators: list | None = None,
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap

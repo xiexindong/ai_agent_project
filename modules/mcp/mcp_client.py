@@ -12,6 +12,7 @@ from typing import Optional, List, Dict
 from queue import Queue, Empty
 from modules.common.logger import get_logger
 from modules.common.exceptions import MCPException, handle_exception
+from modules.tools.base_tool import BaseTool, ToolResult
 from modules.mcp.protocol import (
     create_request, parse_message,
     create_error, INTERNAL_ERROR, METHOD_NOT_FOUND,
@@ -170,10 +171,16 @@ class MCPClient:
         return self._connected and self._process is not None and self._process.poll() is None
 
 
-class MCPToolAdapter:
+class MCPToolAdapter(BaseTool):
     """
     MCP 远程工具适配器：将 MCP 远程工具适配为 BaseTool 接口。
     使 ToolRegistry 可统一管理本地工具与 MCP 工具。
+
+    【为什么继承 BaseTool】ToolRegistry.register 只收 BaseTool，
+    此前靠 duck typing 碰巧兼容（有 name/run 等同名成员），
+    现在正式继承，类型检查器可验证接口完整性（抽象方法 execute 必须实现）。
+    注意：不走 BaseTool.__init__（它要求 parameters dict），
+    这里直接从 MCP 的 inputSchema 组装同名属性。
     """
     def __init__(self, mcp_client: MCPClient, tool_info: dict):
         self._client = mcp_client
@@ -206,28 +213,20 @@ class MCPToolAdapter:
             raise MCPException(f"参数缺失: {missing}", f"tool={self.name}")
         return params or {}
 
-    def run(self, params: dict):
-        """执行 MCP 工具调用。"""
-        import time
-        start = time.time()
-        try:
-            validated = self.validate_params(params)
-            result = self._client.call_tool(self.name, validated)
-            # 提取文本内容
-            text_parts = []
-            for item in result.get("content", []):
-                if item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            from modules.tools.base_tool import ToolResult
-            return ToolResult(
-                success=True,
-                result="\n".join(text_parts) if text_parts else result,
-                duration_ms=int((time.time() - start) * 1000),
-            )
-        except Exception as e:
-            from modules.tools.base_tool import ToolResult
-            return ToolResult(
-                success=False,
-                error=str(e),
-                duration_ms=int((time.time() - start) * 1000),
-            )
+    def execute(self, **kwargs) -> ToolResult:
+        """真正调用 MCP 远程工具（BaseTool 抽象方法的实现）。
+
+        BaseTool.run 的统一链路是：validate_params → execute → 封装 ToolResult，
+        这里只负责"调远程 + 提取文本"，参数校验/计时/异常兜底交给父类 run。
+        """
+        result = self._client.call_tool(self.name, kwargs)
+        # 提取文本内容（MCP 返回 content 数组，取其中 type=text 的部分拼接）
+        text_parts = []
+        for item in result.get("content", []):
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return ToolResult(
+            success=True,
+            result="\n".join(text_parts) if text_parts else result,
+        )
+        # 注：不再自带 duration_ms / 异常兜底 —— 统一由继承来的 BaseTool.run 负责
