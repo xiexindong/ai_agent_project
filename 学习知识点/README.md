@@ -13,6 +13,7 @@
 | 05 | [conn 与 cur 的区别](./05-conn与cur的区别.md) | 连接管事务、游标管执行；`commit()` 该挂谁身上 |
 | 06 | [MCP 接入全流程](./06-MCP接入全流程.md) | 子进程 + JSON-RPC：拉起→握手→发现→适配→调用 6 阶段完整链路 |
 | 07 | [依赖注入与 Agent 全链路](./07-依赖注入与Agent全链路.md) | 5 个组件怎么接线；prepare→reason↔act→answer→save 完整执行链路 |
+| 08 | [Skill 与 Tool 的区别](./08-Skill与Tool的区别.md) | Skill=作业指导书(文本)，Tool=螺丝刀(代码)；`bound_tools` 只是软引导 |
 
 ## 计划中（想到再加）
 
