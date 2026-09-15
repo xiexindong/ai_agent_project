@@ -52,10 +52,48 @@ class EmbeddingService:
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         """调用智谱API批量生成向量（单次最多64条）。"""
         s = get_settings()
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 【是的 —— 这里就是在调用「向量模型」（Embedding 模型）】
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 它【不是】对话模型，不会"回答"任何问题，只做一件事：文字 → 一串数字。
+        #
+        #   对话模型（本项目是 DeepSeek，见 modules/agent/llm.py）
+        #       llm.invoke("12*8等于多少")  →  "12×8 = 96"      （生成文字）
+        #
+        #   向量模型（本方法，智谱 embedding-2）
+        #       embed("12*8等于多少")       →  [0.12, -0.34, ...] （生成 1024 个小数）
+        #
+        # 【逐行拆解】
+        #   self._client  → 第 44 行创建的 ZhipuAI 客户端（注意：不是 DeepSeek 的 OpenAI 客户端）
+        #   .embeddings.create()  → 智谱 SDK 的「向量接口」
+        #       对照：对话接口叫 chat.completions.create()，这里没有 chat，
+        #             因为根本没有"对话"这回事，只是把文本丢进去换算成坐标
+        #   model=self._model → 配置里的 EMBEDDING_MODEL（默认 "embedding-2"）
+        #       注意和对话模型的 DEEPSEEK_MODEL 是两个不同的字段、两家不同的厂商
+        #   input=texts  → 字符串数组（["摘要1", "摘要2", ...]），
+        #       不是 messages 那种 [{"role":"user",...}] 结构，因为不存在多轮对话
+        #
+        # 【输入输出对比】
+        #   输入：texts = ["数学计算:12*8=96", "餐饮推荐"]
+        #   返回：[[0.012, -0.34, ...共1024个], [0.88, 0.02, ...共1024个]]
+        #        ↑ resp.data 的顺序和 input 一一对应，第 i 条文本对应第 i 个向量
+        #
+        # 【为什么用智谱而不用 DeepSeek？】
+        #   DeepSeek 目前只提供对话/推理模型，没有开放 embedding 接口；
+        #   所以本项目是「两家混用」：聊天用 DeepSeek，向量用智谱 embedding-2。
+        #   这也是为什么数据库里向量维度是 1024（embedding-2 固定 1024 维，
+        #   见 config.py 的 embedding_dimension，建表 vector(1024) 必须和它一致）。
+        #
+        # 【一个反直觉的点】
+        #   同样的文本调两次，得到的 1024 个数字【完全一样】。
+        #   向量模型是确定性的、无状态的——它不"思考"、不"发挥"，
+        #   本质是个查表+计算的编码器，和我们平时说的"AI 生成"不是一回事。
         resp = self._client.embeddings.create(
             model=self._model,
             input=texts,
         )
+        # resp.data 是对象数组，每个元素长这样：{"index":0, "embedding":[0.1,0.2,...]}
+        # 用列表推导只把 embedding 字段抽出来，丢掉 index 等元信息
         return [item.embedding for item in resp.data]
 
     def embed(self, text: str) -> List[float]:

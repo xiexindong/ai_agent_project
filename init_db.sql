@@ -33,15 +33,38 @@ CREATE TABLE IF NOT EXISTS chat_history (
     llm_full_answer    TEXT,                              -- 完整详细答案（溯源）
     llm_summary        TEXT,                               -- 精简摘要（上下文投喂）
     summary_embedding  vector(1024),                      -- 摘要向量（智谱embedding-2，1024维）
+    query_embedding    vector(1024),                      -- 问句向量（用户原话的向量，长期记忆主检索列）
     tool_call_log      JSONB DEFAULT '[]'::jsonb,         -- 工具调用日志
     rag_sources        JSONB DEFAULT '[]'::jsonb,          -- RAG召回来源
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 【为什么还要多一列 query_embedding？】
+-- 当前长期记忆检索用的是 summary_embedding（原因见下），query_embedding 暂不参与检索，
+-- 是给将来的「重复提问检测」预留的：那种场景需要问句比问句 + 更高的相似度阈值，
+-- 与本表的「主题宽召回」不是一个目标，不应混用同一列。
+-- 若确定不做重复检测，这一列可以删掉，不影响主流程。
+--
+-- 【为什么主检索用摘要向量而不是问句向量？】
+-- 摘要格式是「问题主题 + 结论」，比问句原文信息更完整：
+--   ① 换说法也能召回：现在问"最近业绩如何？" ↔ 历史摘要"Q3财报:营收增长12%"
+--   ② 抗代词漂移：历史问句可能是"那它呢？"，原文脱离上下文语义是飘的，
+--      但它的摘要是自包含的，任何时候都搜得到
+--   ③ 只存一列，省一半 embedding 调用与存储
+
+-- 问句向量索引（长期记忆主检索列，ivfflat 加速）
+CREATE INDEX IF NOT EXISTS idx_history_query_emb
+ON chat_history USING ivfflat (query_embedding vector_cosine_ops)
+WITH (lists = 100);
+
 -- 摘要向量索引（ivfflat 加速历史记忆语义检索，生产必备）
 CREATE INDEX IF NOT EXISTS idx_history_summary_emb
 ON chat_history USING ivfflat (summary_embedding vector_cosine_ops)
 WITH (lists = 100);
+
+-- 【老库升级】如果 chat_history 表在本次改动前已存在，上面的 CREATE TABLE 不会生效，
+-- 需对已有库手工补一列（幂等，可重复执行）：
+ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS query_embedding vector(1024);
 
 -- 会话+用户联合索引（多用户隔离查询加速）
 CREATE INDEX IF NOT EXISTS idx_history_session_user

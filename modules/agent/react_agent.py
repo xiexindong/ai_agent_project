@@ -125,6 +125,9 @@ class ReActAgent:
                 state.long_term_memory = mem_ctx["long_term_memory"]
                 state.short_term_memory = mem_ctx["short_term_memory"]
                 state.memory_compressed = mem_ctx["compressed"]
+                # 注意：字段名 summary_embedding 是历史包袱，这里存的其实是【问句】的向量
+                # （下一行 embed 的是 clean_query）。它在 graph._save_node 里被复用，
+                # 落库到 chat_history.query_embedding 列，作为长期记忆的主检索向量。
                 state.summary_embedding = query_emb  # 暂存query向量
             except Exception as e:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")

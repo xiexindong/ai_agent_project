@@ -40,12 +40,14 @@ class MemoryManager:
         summary_embedding: list,
         tool_call_log: list = None,
         rag_sources: list = None,
+        query_embedding: list = None,
     ) -> int:
-        """保存一轮对话全量数据（原文+摘要+向量+工具日志）。"""
+        """保存一轮对话全量数据（原文+摘要+摘要向量+问句向量+工具日志）。"""
         return self.pg.save_history(
             session_id, user_id,
             user_query, llm_full_answer, llm_summary,
             summary_embedding, tool_call_log, rag_sources,
+            query_embedding,
         )
 
     def build_context(

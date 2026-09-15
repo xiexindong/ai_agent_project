@@ -38,6 +38,37 @@ class LLMClient:
     # 类属性：存放唯一实例的「槽位」，初始为 None（还没创建过）
     _instance = None
 
+#     cls 就是类本身（class 的缩写），它是 new 方法的第一个参数，类似于 self 代表实例，cls 代表类。
+
+# 简单对比
+# 参数   代表什么   常见于
+# self   当前实例对象   普通方法 def method(self)
+
+# cls   当前类对象   类方法 @classmethod 和 new
+
+# 在这段代码里的作用
+
+# def new(cls):
+#     if cls._instance is None:          # 从类上取 _instance 属性
+#         cls._instance = super().new(cls)  # 创建实例并存到类上
+#     return cls._instance               # 返回那个实例
+
+# cls._instance → 访问类级别的属性 _instance（所有实例共享这一个）
+# super().__new__(cls) → 告诉父类："请帮我创建一个 cls 这个类的实例"
+
+# 为什么用 cls 而不是直接写类名？
+
+# 因为 cls 是动态的。如果将来有子类继承 LLMClient：
+
+# class SpecialLLMClient(LLMClient):
+#     pass
+
+# 调用 SpecialLLMClient() 时，cls 会自动变成 SpecialLLMClient，而不是写死的 LLMClient。这样代码更通用、更灵活。
+
+# 💡 一句话总结：cls = "我自己这个类"，self = "我自己这个实例"。new 在实例还没创建出来的时候执行，所以没有 self，只能用 cls 来操作类本身。
+
+# 这段代码实现的是单例模式，需要我帮你整理一份单例模式的速查表吗？包括线程安全写法、与 @lru_cache 的区别这些。
+
     def __new__(cls):
         """__new__ 负责「创建并返回实例」（在 __init__ 之前执行）。
 
@@ -72,7 +103,7 @@ class LLMClient:
                     api_key=s.deepseek_api_key,
                     base_url=s.deepseek_base_url,
                 )
-                self._model = s.deepseek_model
+                self._model: str = s.deepseek_model
                 _logger.info(f"LLM客户端初始化: model={self._model}")
             except Exception as e:
                 # 初始化失败（缺 key / 网络配置错误等）统一转成项目自定义异常向上抛
@@ -115,7 +146,10 @@ class LLMClient:
                 max_tokens=max_tokens,
             )
             # 响应结构：resp.choices[0].message.content 即第一个候选回答的文本
-            return resp.choices[0].message.content.strip()
+
+
+
+
         except Exception as e:
             _logger.error(f"LLM调用失败: {e}")
             # 不直接抛裸异常，包装成 LLMException 便于上层统一捕获

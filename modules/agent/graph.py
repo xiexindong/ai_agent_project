@@ -183,16 +183,27 @@ class AgentGraph:
                 # 生成摘要向量
                 summary = state.get("llm_summary", "")
                 from modules.memory.embedding_service import get_embedding_service
-                summary_emb = get_embedding_service().embed(summary) if summary else None
+                svc = get_embedding_service()
+                summary_emb = svc.embed(summary) if summary else None
 
-                # 三数据落库（原文+摘要+向量，缺一不可）
+                # 生成【问句向量】：长期记忆的主检索列（问句 vs 历史问句，对称检索更准）
+                # 优先复用 perceive 阶段已算好的那个（react_agent.py 里 embed(clean_query)，
+                # 暂存在 state.summary_embedding 字段里——注意它存的其实是问句向量，字段名有历史包袱），
+                # 复用可以省一次 embedding 调用；拿不到才现场算
+                user_query = state.get("user_query", "")
+                query_emb = state.get("summary_embedding") or (
+                    svc.embed(user_query) if user_query else None
+                )
+
+                # 四数据落库（原文+摘要+摘要向量+问句向量，缺一不可）
                 self.agent.memory.save_turn(
                     session_id=session_id,
                     user_id=user_id,
-                    user_query=state.get("user_query", ""),
+                    user_query=user_query,
                     llm_full_answer=state.get("final_answer", ""),
                     llm_summary=summary,
                     summary_embedding=summary_emb or [],
+                    query_embedding=query_emb or [],
                     tool_call_log=state.get("tool_call_logs", []),
                     rag_sources=[
                         {"source": s.get("file_name", ""), "score": s.get("rerank_score", s.get("score", 0))}
