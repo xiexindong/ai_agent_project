@@ -669,7 +669,29 @@ class PGManager:
                LIMIT %s""",
             (emb, user_id, emb, top_k),
         )
+        # ------------------------------------------------------------------
+        # 【fetchall() 干了什么】
+        #   execute 只是把 SQL 发给 PG，结果集还挂在游标上（尚未读进 Python）；
+        #   fetchall() 才真正把 top_k 行一次性读回来（只要一行用 fetchone()）。
+        #
+        # 【读回来是什么】list[tuple]，字段顺序 = 上面 SELECT 的书写顺序，不带列名
+        #   （psycopg2 默认游标不返回 dict，想直接拿列名得换成 RealDictCursor）：
+        #     r[0]        r[1]          r[2]              r[3]        r[4]
+        #   user_query  llm_summary  llm_full_answer   similarity  created_at
         rows = self._cur.fetchall()
+        #
+        # 【下面在做什么】把「靠位置记忆的下标」翻译成「业务字段名」，
+        #   上层 memory_manager._recall_long_term 才能写 item["similarity"] >= 0.65。
+        #
+        #   【依赖警告】r[0]..r[4] 与上面 SELECT 的字段顺序是硬绑定的：
+        #   改了 SQL 的选取顺序就必须同步改这里，否则会静默错位（similarity 与
+        #   time 的值对调），不报错、不抛异常，属于极难排查的一类 bug。
+        #
+        # 【两个加工点】
+        #   float(r[3])   ：pgvector 的 1-(<=>) 本身已返回 float，这里只是防御性转换——
+        #                   若该列是 numeric，psycopg2 会返回 Decimal，json 序列化直接报错
+        #   round(..., 4) ：相似度留 4 位小数，日志里好看，也削掉浮点尾巴（0.91000000001）
+        # ------------------------------------------------------------------
         return [
             {
                 "query": r[0], "summary": r[1], "answer": r[2],

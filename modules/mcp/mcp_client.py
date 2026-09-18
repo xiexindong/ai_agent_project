@@ -30,7 +30,7 @@ class MCPClient:
     def __init__(self, server_command: list, name: str = "mcp-server"):
         self._server_command = server_command
         self._name = name
-        self._process: Optional[subprocess.Popen] = None
+        self._process: Optional[subprocess.Popen] = None 
         self._stderr_queue: Queue = Queue()
         self._req_id = 0
         self._connected = False
@@ -126,6 +126,7 @@ class MCPClient:
             raise MCPException("MCP Server 未连接", "")
         req_id = self._next_id()
         msg = create_request(method, params, req_id=req_id)
+        # 写进一个进程 self._process = subprocess.Popen 的自进程
         self._process.stdin.write(msg + "\n")
         self._process.stdin.flush()
 

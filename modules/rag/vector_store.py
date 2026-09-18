@@ -26,26 +26,84 @@ class MilvusVectorStore:
         return cls._instance
 
     def __init__(self):
+        # s 是全局配置单例（config.py 的 Settings），所有 *_xxx 参数都从它身上取值，
+        # 也都可以用 .env 同名环境变量覆盖，所以这里没有一个值是写死的。
         s = get_settings()
+
+        # 【_collection_name】Milvus 里的"集合名"，等价于 MySQL 的"表名"。
+        #   默认 knowledge_base（config.py:58 ← .env 的 MILVUS_COLLECTION）。
+        #   本项目只有一个集合——"文档知识库 RAG"和"长期记忆"用的是两套不同的库：
+        #   这里走 Milvus，长期记忆走 PostgreSQL + pgvector（pg_manager.py），别混。
         self._collection_name = s.milvus_collection
+
+        # 【_dim】向量维度，默认 1024（config.py:43 ← .env 的 EMBEDDING_DIMENSION）。
+        #   必须和 embedding 模型的输出维度严格一致：本项目用智谱 embedding-2，固定产出 1024 维。
+        #   它被用在两个地方：
+        #     ① 建集合时声明字段类型 → 下面 vector_store.py:73 的 dim=self._dim
+        #     ② 间接约束 pg_manager.py:280 建表的 vector(1024)
+        #   三者必须同步改，否则入库时报 "dimension mismatch"。
+        #
+        #   【陷阱】这个值只在"集合不存在、第一次创建"时才生效（has_collection 为 False 才走创建）。
+        #   集合一旦建成，再改 EMBEDDING_DIMENSION 不会有任何效果——
+        #   Milvus 不会给你改表，必须删集合重来。
         self._dim = s.embedding_dimension
+
+        # 【_top_k】一次粗召回最多返回几条候选，默认 5（config.py:69 ← .env 的 RAG_TOP_K）。
+        #   用在下面 search() 121 行的 limit=k，是"召回上限"，不是"最终条数"：
+        #   粗召回 5 条 → 再被 threshold 过滤一遍 → 剩下的才交给 rag_chain 精排。
+        #   search(query, top_k=...) 允许调用方临时覆盖，不传就用这里的值（119 行 k = top_k or self._top_k）。
         self._top_k = s.rag_top_k
+
+        # 【_threshold】余弦相似度及格线，默认 0.65（config.py:71 ← .env 的 SIMILARITY_THRESHOLD）。
+        #   用在下面 search() 132 行：score < threshold 的结果直接丢弃。
+        #   作用是边界1/边界8——防止"用户问天气、召回到股票"的误匹配污染 Prompt。
+        #   调小 → 召得宽但噪声多；调大 → 宁缺毋滥，可能一条都不剩。
+        #
+        #   【注意】这个阈值是"两个模块共用"的：
+        #     modules/rag/vector_store.py  ← 文档知识库 RAG（Milvus + COSINE）
+        #     modules/memory/memory_manager.py:31  ← 长期记忆召回（pgvector）
+        #   两处读的是同一个 config 字段。改 .env 会同时影响两边，别只想着一边。
         self._threshold = s.similarity_threshold
+
+        # 连接 + 确保集合存在 + 建索引 + load 到内存，全在这一步里完成。
+        #
+        # 【一个容易忽略的点】上面 __new__ 是单例，但单例挡不住 __init__ 重跑：
+        #   每写一次 MilvusVectorStore()，__new__ 返回同一个对象，可 __init__ 照常执行一遍，
+        #   于是 connections.connect(...) 又被调用一次。
+        #   pymilvus 的 connect 是幂等的（同 alias 重复连接覆盖同一条连接，不会泄漏），所以没问题，
+        #   但如果哪天在里面塞了有副作用的代码，这里就是个坑。
         self._connect()
 
     def _connect(self):
         """连接 Milvus 并确保集合存在。"""
         try:
+            # pymilvus 放在函数内 import，而不是文件顶部：
+            #   这是刻意的——模块 import 失败（pip 没装 pymilvus）不该让整个项目起不来，
+            #   要让它在用到时才失败、并被下面 58-60 行的 except 转成 RAGException 交给上层降级。
+            #   对比：pg_manager.py 的 psycopg2 也是同样的策略。
             from pymilvus import (
                 connections, utility, Collection,
                 CollectionSchema, FieldSchema, DataType,
             )
             s = get_settings()
+
+            # connections.connect 只做一件事：建立一个带 alias 的连接。
+            #   alias="default" 是这条连接的"名字"——后续 Collection(...)、utility.xxx()
+            #   都不传 host/port，靠的就是这个默认 alias 自己去认。类比 psycopg2 的 conn 对象。
+            #   host 默认 localhost / port 默认 19530（config.py:56-57 ← MILVUS_HOST / MILVUS_PORT）。
+            #   port 要 str()：settings 里是 int，但 pymilvus 这版只吃字符串，传 int 会静默连不上。
+            #
+            #   【这里没有 timeout 也没有重试】Milvus 没起时不会立刻报错，
+            #   而是在这里阻塞到 pymilvus 自己的默认超时才抛异常。
             connections.connect(
                 alias="default",
                 host=s.milvus_host,
                 port=str(s.milvus_port),
             )
+
+            # 下面 5 行：把 import 进来的 pymilvus 符号挂到 self 上，做成"实例持有"。
+            #   这么做是为了让 _ensure_collection / insert_chunks 等方法也能用到它们，
+            #   而不用每个方法都重复 import 一遍。
             self._connections = connections
             # pymilvus 2.6：has_collection 等集合管理函数在 utility 模块下，不在 connections 上
             self._utility = utility

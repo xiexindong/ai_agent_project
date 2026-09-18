@@ -88,19 +88,65 @@ class EmbeddingService:
         #   同样的文本调两次，得到的 1024 个数字【完全一样】。
         #   向量模型是确定性的、无状态的——它不"思考"、不"发挥"，
         #   本质是个查表+计算的编码器，和我们平时说的"AI 生成"不是一回事。
+
+        #就是把问句 转化为 向量  调用大模型
         resp = self._client.embeddings.create(
             model=self._model,
             input=texts,
         )
         # resp.data 是对象数组，每个元素长这样：{"index":0, "embedding":[0.1,0.2,...]}
         # 用列表推导只把 embedding 字段抽出来，丢掉 index 等元信息
+        #         resp.data = [
+        #     { "embedding": [0.1, 0.2, 0.3], "index": 0 },  # 第1条文本的向量
+        #     { "embedding": [0.4, 0.5, 0.6], "index": 1 },  # 第2条文本的向量
+        # ]
+        # 获取的结果
+        # [
+        #     [0.0023, -0.0093, 0.0156, ...],  # 第1段文本的向量（1536个数字）
+        #     [0.0041, -0.0012, 0.0234, ...],  # 第2段文本的向量（1536个数字）
+        # ]
         return [item.embedding for item in resp.data]
 
     def embed(self, text: str) -> List[float]:
         """生成单条文本的向量。"""
+        # 空文本 / 纯空白 → 不发请求，直接返回一个「零向量」兜底。
+        #
+        # 【为什么要返回 [0.0] * self._dim，而不是 [] 或 None？】
+        #   因为下游 pg_manager.save_history 会把它写进 pgvector 的 vector(1024) 列，
+        #   维度/类型不对 INSERT 会直接报错。所以这里必须造一个「形状合法」的假向量，
+        #   让整条链路（np.array → INSERT → 建 traces）照常走完，只是内容无意义。
+        #
+        # 【为什么用 0.0，而不是随机数？】
+        #   零向量与任何向量做点积都得 0 → 余弦相似度必然低于 similarity_threshold
+        #   （pgvector 那边度量为 NaN 也一样，Python 里 float('nan') >= 0.6 是 False）
+        #   → 必定被 _recall_long_term 的阈值过滤掉。
+        #   效果就是「存得进去，但永远不会被召回」——不报错、不污染记忆结果，这是安全降级。
+        #
+        # 【为什么不交给上面 @retry 重试？】
+        #   智谱对空字符串必然返回 400，重试 3 次纯属浪费时间与额度；
+        #   这里是「明知没必要发」，和下面 except（API 真的挂了）性质完全不同。
         if not text or not text.strip():
             return [0.0] * self._dim
         try:
+            # 把单条文本包成「只有一个元素的列表」去调批处理接口，再把结果解开。
+            # 本质是「借批量通道走单条」：
+            #   ["数学计算:12*8=96"]  →  [[0.12, -0.34, ... 共1024个]]
+            #                             ↑ 外面还套着一层列表
+            #                               ↓ [0] 拆包
+            #                             [0.12, -0.34, ... 共1024个]
+            #
+            # 【为什么不直接让接口接收单个字符串？】
+            #   智谱 embeddings.create 的 input 参数只收 `list[str]`，不收裸字符串；
+            #   而且统一走 _embed_batch 可以复用它的 @retry 重试、单次 64 条上限等逻辑，
+            #   将来要做「批量生成向量」时上层直接调 _embed_batch 即可，无需另写一套。
+            #
+            # 【为什么又要 strip() 一次？】
+            #   上面守卫里判断的只是「去空白后是否非空」，并没有改掉原值；
+            #   这里再 strip 是为了喂给模型的是干净文本，首尾空格不参与编码。
+            #
+            # 【resp.data 的顺序契约】
+            #   返回的第 0 个向量必定对应输入的第 0 条文本（API 保证一一对应），
+            #   所以 vectors[0] 才是安全的取法，而不是按某个 id 去查。
             vectors = self._embed_batch([text.strip()])
             return vectors[0]
         except Exception as e:
