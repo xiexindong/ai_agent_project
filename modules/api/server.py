@@ -217,7 +217,6 @@ class APIServer:
             user_id = user["user_id"]
             is_new_session = not req.session_id
             session_id = req.session_id or str(uuid.uuid4())
-            breakpoint()  # 【调试断点】/chat鉴权通过：可看 user_id / req.query / session_id
 
             # 创建会话（新会话）；已有会话做归属校验（防越权访问他人会话）
             if is_new_session:
@@ -310,11 +309,9 @@ class APIServer:
                     #   + task.cancel），本项目目前没做。
                     #   （简单起见此处不做补偿：单次请求失败不会污染会话状态，
                     #    会话已在上面 223-226 行创建/校验过，工具记录也已在 229 行 reset 清零。）
-                    breakpoint()  # 【调试断点】Agent推理即将开始：可看 req.query / session_id
                     result = await asyncio.to_thread(
                         ctx.agent_graph.run, req.query, session_id, user_id
                     )
-                    breakpoint()  # 【调试断点】Agent推理完成：可看 result（final_answer / tool_call_logs / iteration）
                 except Exception as e:
                     _logger.error(f"Agent推理异常: {e}")
                     yield sse_event("answer_start", {"iterations": 0})

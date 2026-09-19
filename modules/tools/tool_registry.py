@@ -153,7 +153,6 @@ class ToolRegistry:
             去重账本只在"成功发起执行后"才记录；失败的调用不计数，
             避免一次参数错误把工具的调用配额浪费掉。
         """
-        breakpoint()  # 【调试断点】工具调度入口：可看 name / params / session_id
         # ① 存在性检查：LLM 可能幻觉出一个未注册的工具名
         tool = self.get_tool(name)
         if not tool:
@@ -179,7 +178,6 @@ class ToolRegistry:
 
         # ④ 真正执行：BaseTool.run() 内部还会做必填参数校验并统一捕获异常
         result = tool.run(params)
-        breakpoint()  # 【调试断点】工具执行完成：可看 result（success/result/error/duration_ms）
 
         # ⑤ 记账：累计次数 + 记录参数指纹（仅在执行后记录，失败不占配额）
         self._call_counts[name] += 1

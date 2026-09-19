@@ -147,7 +147,7 @@ class AgentState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "AgentState":
+    def  from_dict(cls, d: dict) -> "AgentState":
         """
         从 dict 恢复成 dataclass 对象（to_dict 的逆操作）。
 

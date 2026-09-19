@@ -83,7 +83,6 @@ class MemoryManager:
             边界8 - 相似度过滤：长期召回结果低于 similarity_threshold 舍弃，
                     避免"用户问天气、召回到股票"的误匹配
         """
-        breakpoint()  # 【调试断点】记忆构建入口：可看 query / session_id / user_id
         # ---- 长期记忆：摘要向量语义召回 ----
         long_term = self._recall_long_term(query, user_id, query_embedding)
 
@@ -187,7 +186,6 @@ class MemoryManager:
                 f"历史记忆召回{len(results)}条但全部低于阈值{self._similarity_threshold}，已舍弃"
             )
         _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")
-        breakpoint()  # 【调试断点】长期记忆召回结果：可看 filtered（过阈值后的记忆）
         return filtered
 
     def _compress_long_term(self, long_term: list, user_id: str, query: str) -> list:

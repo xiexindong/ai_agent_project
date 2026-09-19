@@ -62,17 +62,14 @@ class RAGChain:
         知识库检索：Milvus向量召回 → BGE精排过滤。
         返回精排后的 top_k 相关文档列表。
         """
-        breakpoint()  # 【调试断点】RAG检索入口：可看 query / top_k
         k = top_k or self._top_k
         # 第一步：Milvus 向量召回
         candidates = self.vector_store.search(query, top_k=k)
-        breakpoint()  # 【调试断点】Milvus召回结果：可看 candidates（召回的文档分片，空=没命中）
         if not candidates:
             _logger.warning(f"RAG无结果，触发兜底（边界1）: query='{query[:50]}'")
             return []
         # 第二步：BGE 精排
         reranked = self.reranker.rerank(query, candidates, top_k=self._rerank_top_k)
-        breakpoint()  # 【调试断点】精排结果：可看 reranked（精排后的文档及 rerank_score）
         return reranked if reranked else []
 
     def build_context(self, query: str, top_k: Optional[int] = None) -> str:

@@ -196,7 +196,6 @@ class LLMClient:
         【为什么 tool_choice="auto"？】项目硬约束：工具调用必须由 LLM 自主决策，
             不强制调工具。auto 让模型基于上下文判断"现在该不该用工具"。
         """
-        breakpoint()  # 【调试断点】LLM调用入口：可看 messages / tools（发给模型的内容）
         try:
             # create() = 向 /chat/completions 发一次 HTTP 请求（本文件真正联网调模型的一下），
             # 括号内是随请求发出去的配置，各司其职：
@@ -237,7 +236,6 @@ class LLMClient:
                         "id": tc.id,                # 本次工具调用的唯一ID（多轮对话回填结果时要用）
                     })
                 _logger.info(f"LLM请求工具调用: {[tc['name'] for tc in tool_calls]}")
-            breakpoint()  # 【调试断点】LLM返回结果：可看 content / tool_calls（模型决策）
             return {"content": content, "tool_calls": tool_calls}
         except Exception as e:
             _logger.error(f"LLM工具调用失败: {e}")

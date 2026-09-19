@@ -135,7 +135,7 @@ class MCPClient:
             line = self._process.stdout.readline()
             if not line:
                 raise MCPException("MCP Server 无响应", "")
-            resp = parse_message(line)
+            resp = parse_message(raw=line)
             if "error" in resp:
                 err = resp["error"]
                 raise MCPException(

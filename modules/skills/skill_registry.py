@@ -3,30 +3,120 @@
 ==============
 统一管理技能的注册、意图匹配、上下文构建。
 
-匹配策略（关键词加权打分，与项目 reranker 降级精排同一风格，零外部依赖）：
-- 对所有已注册技能计算 match_score；
-- 选取得分最高的技能，同分按 priority 决出；
-- 得分低于 match_threshold 视为「未命中专门技能」，走通用助手流程。
+匹配策略 —— 三级路由（成本由低到高，逐层兜底，命中即停）：
+
+    L1 关键词路由（零外部依赖、零成本、可复现）
+        score >= skill_high_threshold(0.6)  → 判定命中，结束路由
+        score <  skill_low_threshold(0.1)   → 判定「完全无关」，直接走通用对话
+        卡在两者之间（模糊地带）            → 下沉到 L2
+
+    L2 向量语义路由（1 次 embedding，能识别同义转述）
+        把 query 与 L1 候选前 N 个技能的语义画像算余弦相似度
+        最高相似度 >= skill_vector_threshold(0.75) → 判定命中，结束路由
+        否则                                       → 下沉到 L3
+
+    L3 LLM 兜底路由（1 次 LLM 调用，理解力最强）
+        只把 query + L1 候选前 N 个技能清单丢给模型做分类
+        模型输出 {skill_name, confidence}，校验「名字必须真实存在」
+        confidence >= skill_llm_confidence(0.5) → 判定命中
+        否则 → 未命中，走通用助手流程
+
+为什么要分层：高频简单问句由 L1 白嫖搞定（不花一分钱）；换种说法的交给 L2；
+真正歧义/复杂的才动用 L3。整体成本与延迟远低于「每次都问 LLM」。
 
 设计原则：
-- 技能系统全程可降级：匹配异常时返回 None，不影响 ReAct 主链路；
+- 技能系统全程可降级：任一层异常都只降级到下一层或放弃，绝不影响 ReAct 主链路；
 - 技能只做「软引导」：注入 SOP 与推荐工具，不硬屏蔽其他工具，避免误匹配导致无法作答。
 """
+from config import Settings
+
+
 from typing import Dict, List, Optional, Tuple
 from modules.common.logger import get_logger
 from modules.common.exceptions import handle_exception
-from modules.skills.base_skill import BaseSkill, SkillMatch
+from modules.skills.base_skill import BaseSkill, SkillMatch, ROUTE_LABELS
 
 _logger = get_logger("skill_registry")
+
+
+def _cosine(vec_a: List[float], vec_b: List[float]) -> float:
+    """
+    余弦相似度：算两个向量的夹角，返回 -1~1（本项目 embedding 归一化后实际落在 0~1）。
+
+    为什么用余弦而不是欧氏距离：余弦只看「方向」不看「长度」，
+    长句和短句只要语义接近就能拿到高分，正是语义匹配需要的性质。
+
+    维度不一致 / 零向量 → 直接返回 0.0（安全降级，绝不抛异常打断路由）。
+    """
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    try:
+        import numpy as np
+        va = np.asarray(vec_a, dtype=float)
+        vb = np.asarray(vec_b, dtype=float)
+        denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(va, vb) / denom)
+    except Exception:
+        # numpy 缺失或数据异常时退回纯 Python 实现，保证路由链路不被中断
+        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        na = sum(a * a for a in vec_a) ** 0.5
+        nb = sum(b * b for b in vec_b) ** 0.5
+        if na == 0.0 or nb == 0.0:
+            return 0.0
+        return dot / (na * nb)
 
 
 class SkillRegistry:
     """技能注册器（本地内存注册表）。"""
 
-    def __init__(self, match_threshold: float = 0.35):
+    def __init__(
+        self,
+        match_threshold: float = 0.35,
+        high_threshold: Optional[float] = None,
+        low_threshold: Optional[float] = None,
+        vector_threshold: Optional[float] = None,
+        vector_top_n: Optional[int] = None,
+        llm_route_enabled: Optional[bool] = None,
+        llm_top_n: Optional[int] = None,
+        llm_confidence: Optional[float] = None,
+    ):
         # 阈值含义：命中 1 个双字意图词(0.4)即可激活；仅命中单个单字弱词(0.15)不激活，防闲聊误命中
         self._skills: Dict[str, BaseSkill] = {}
         self._threshold = match_threshold
+
+        # ---- 三级路由参数 ----
+        # 优先级：构造参数 > config（.env）> 代码默认值。
+        # 参数留 None 是为了让「调用方显式传值」能覆盖 .env，和 match_threshold 的既有语义保持一致。
+        from config import get_settings
+        s: Settings = get_settings()
+        self._high = high_threshold if high_threshold is not None else s.skill_high_threshold
+        self._low = low_threshold if low_threshold is not None else s.skill_low_threshold
+        self._vec_threshold = (
+            vector_threshold if vector_threshold is not None else s.skill_vector_threshold
+        )
+        self._vec_top_n = vector_top_n if vector_top_n is not None else s.skill_vector_top_n
+        self._llm_enabled = (
+            llm_route_enabled if llm_route_enabled is not None else s.skill_llm_route_enabled
+        )
+        self._llm_top_n = llm_top_n if llm_top_n is not None else s.skill_llm_top_n
+        self._llm_confidence = (
+            llm_confidence if llm_confidence is not None else s.skill_llm_confidence
+        )
+
+        # L2 缓存：技能名 → 语义向量。技能画像只需编码一次，之后所有请求复用
+        self._vec_cache: Dict[str, List[float]] = {}
+        # 熔断开关：某层真的不可用（没配 Key / 服务挂了）就永久降级，
+        # 避免每个请求都去撞一次注定失败的网络调用
+        self._vector_available = True
+
+        _logger.info(
+            f"技能三级路由就绪: L1关键词[低{self._low}, 高{self._high}] "
+            f"| L2向量[阈值{self._vec_threshold}, top{self._vec_top_n}] "
+            f"| L3 LLM[{'开' if self._llm_enabled else '关'}, top{self._llm_top_n}, "
+            f"conf>={self._llm_confidence}]"
+        )
 
     def register(self, skill: BaseSkill):
         """注册技能，重名时覆盖并告警。"""
@@ -35,6 +125,8 @@ class SkillRegistry:
         if skill.name in self._skills:
             _logger.warning(f"技能重复注册，覆盖: {skill.name}")
         self._skills[skill.name] = skill
+        # 技能被覆盖 = 语义画像变了，旧向量必须作废，否则 L2 会拿旧向量比对
+        self._vec_cache.pop(skill.name, None)
         _logger.info(
             f"技能注册: {skill.name} | 触发词{len(skill.trigger_keywords)}个 "
             f"| 绑定工具={skill.bound_tools or '无'}"
@@ -53,14 +145,11 @@ class SkillRegistry:
         """列出全部已注册技能。"""
         return list(self._skills.values())
 
-    def match(self, query: str) -> Optional[SkillMatch]:
-        """
-        按用户提问匹配最佳技能。
-        返回 SkillMatch；无技能达到阈值时返回 None（走通用流程）。
-        """
+    # ==================== L1：关键词路由（零成本） ====================
+    def score_candidates(self, query: str) -> List[SkillMatch]:
+        """对所有已注册技能做关键词打分，返回 score>0 的候选（按 score、priority 降序）。"""
         if not query or not self._skills:
-            return None
-
+            return []
         candidates: List[SkillMatch] = []
         for skill in self._skills.values():
             try:
@@ -70,39 +159,234 @@ class SkillRegistry:
                 continue
             if m.score > 0:
                 candidates.append(m)
+        # 得分降序，同分按 priority 降序
+        candidates.sort(key=lambda m: (m.score, m.skill.priority), reverse=True)
+        return candidates
 
+    def _route_keyword(self, query: str) -> Tuple[str, List[SkillMatch]]:
+        """
+        L1 关键词路由：三档裁决，决定「命中 / 放弃 / 继续往下问」。
+
+        Returns:
+            (决策, 候选列表)，决策 ∈ {"hit", "miss", "ambiguous"}
+              hit       —— 得分 >= 高阈值，证据充分，路由到此结束
+              miss      —— 得分 <  低阈值，与所有技能无关，路由到此结束
+              ambiguous —— 卡在中间（例如只蹭中一个单字弱词），交给 L2/L3 继续判
+        """
+        candidates = self.score_candidates(query)
         if not candidates:
-            _logger.info(f"技能未命中: query='{query[:30]}...' 走通用助手流程")
+            _logger.info(f"[L1关键词路由] 无任何技能命中，走通用助手流程: query='{query[:30]}'")
+            return "miss", []
+        best = candidates[0]
+        if best.score >= self._high:
+            _logger.info(
+                f"技能命中[L1关键词]: {best.skill.name} | score={best.score} "
+                f"| 命中词={best.hit_keywords} | 候选数={len(candidates)}"
+            )
+            return "hit", candidates
+        if best.score < self._low:
+            _logger.info(
+                f"[L1关键词路由] 最高分{best.score} < 低阈值{self._low}，"
+                f"判定与技能无关: {best.skill.name}"
+            )
+            return "miss", candidates
+        _logger.info(
+            f"[L1关键词路由] 最高分{best.score} 落在模糊地带"
+            f"[{self._low}, {self._high})，下沉L2向量路由: {best.skill.name}"
+        )
+        return "ambiguous", candidates
+
+    # ==================== L2：向量语义路由（1 次 embedding） ====================
+    def _skill_vectors(self, names: List[str]) -> Dict[str, List[float]]:
+        """懒加载 + 缓存技能语义向量：每个技能只在首次参与比对时编码一次。"""
+        missing = [n for n in names if n not in self._vec_cache]
+        if missing:
+            from modules.memory.embedding_service import get_embedding_service
+            svc = get_embedding_service()
+            texts = [self._skills[n].routing_text for n in missing]
+            vectors = svc.embed_batch(texts)
+            for name, vec in zip(missing, vectors):
+                self._vec_cache[name] = vec
+            _logger.info(f"[L2向量路由] 技能语义向量已编码并缓存: {missing}")
+        return {n: self._vec_cache[n] for n in names if n in self._vec_cache}
+
+    def _route_vector(
+        self,
+        query: str,
+        candidates: List[SkillMatch],
+        query_emb: Optional[List[float]] = None,
+    ) -> Optional[SkillMatch]:
+        """
+        L2 向量语义路由：识别「换了个说法」的问句（关键词表里没有，但语义是一回事）。
+
+        坑（见设计文档第四节）：向量分不出「查账号」和「注销账号」这种动作相反的说法，
+        所以它只负责「选出候选」，最终仍由阈值把关，宁可漏判也不误判。
+        """
+        if not self._vector_available or not candidates:
+            return None
+        cands = candidates[: self._vec_top_n]
+        try:
+            from modules.memory.embedding_service import get_embedding_service
+            # 上层（prepare_state）若已算过问句向量就复用，省一次 embedding 调用
+            qv = query_emb if query_emb is not None else get_embedding_service().embed(query)
+            vecs = self._skill_vectors([m.skill.name for m in cands])
+            scored = [
+                (_cosine(qv, vecs[m.skill.name]), m)
+                for m in cands if m.skill.name in vecs
+            ]
+            if not scored:
+                return None
+            scored.sort(key=lambda x: x[0], reverse=True)
+            _logger.info(
+                "[L2向量路由] 相似度: "
+                + ", ".join(f"{m.skill.name}={sim:.4f}" for sim, m in scored)
+            )
+            sim, best = scored[0]
+            if sim >= self._vec_threshold:
+                _logger.info(
+                    f"技能命中[L2向量]: {best.skill.name} | sim={sim:.4f} >= {self._vec_threshold}"
+                )
+                return SkillMatch(
+                    skill=best.skill,
+                    score=round(float(sim), 4),
+                    hit_keywords=list(best.hit_keywords),
+                    route="vector",
+                    vector_score=round(float(sim), 4),
+                )
+            _logger.info(f"[L2向量路由] 最高相似度{sim:.4f} < {self._vec_threshold}，下沉L3 LLM路由")
+            return None
+        except Exception as e:
+            # 熔断：embedding 不可用时不再逐请求重试，直接让后续请求只走 L1/L3
+            self._vector_available = False
+            _logger.warning(f"L2向量路由不可用，已永久降级: {e}")
             return None
 
-        # 得分降序，同分按 priority 降序
-        candidates.sort(
-            key=lambda m: (m.score, m.skill.priority),
-            reverse=True,
+    # ==================== L3：LLM 兜底路由（1 次 LLM 调用） ====================
+    _LLM_ROUTE_SYSTEM = (
+        "你是技能路由器。根据用户提问，从给定的候选技能中选出唯一最合适的一个。\n"
+        "只输出 JSON，不要输出任何解释性文字。\n"
+        "若用户提问不属于任何候选技能，就把 skill_name 填为 \"none\"。\n"
+        '输出格式: {"skill_name": "<候选技能的name，或 none>", '
+        '"confidence": <0到1之间的小数>, "reason": "<一句话理由>"}'
+    )
+
+    def _route_llm(self, query: str, candidates: List[SkillMatch]) -> Optional[SkillMatch]:
+        """
+        L3 LLM 兜底路由：把 query + 候选技能清单丢给模型做分类。
+
+        两条硬约束（设计文档第四节）：
+        1. 强制结构化 JSON 输出，不让模型自由发挥长文本；
+        2. 必须校验返回的 skill_name 真实存在，防幻觉；置信度不够也按未命中处理。
+        """
+        if not self._llm_enabled or not candidates:
+            return None
+        cands = candidates[: self._llm_top_n]
+        try:
+            from modules.agent.llm import LLMClient
+            llm = LLMClient()
+        except Exception as e:
+            self._llm_enabled = False
+            _logger.warning(f"L3 LLM路由不可用（客户端初始化失败），已永久降级: {e}")
+            return None
+
+        # 只把候选技能丢给 LLM（而不是全部技能）：省 token，也缩小模型的幻觉空间
+        lines = []
+        for i, m in enumerate(cands, 1):
+            sk = m.skill
+            kws = "、".join(sk.trigger_keywords[:8])
+            lines.append(
+                f'{i}. name="{sk.name}" | 展示名: {sk.display_name or sk.name}\n'
+                f"   说明: {sk.description}\n"
+                f"   典型触发词: {kws}"
+            )
+        prompt = (
+            f"## 用户提问\n{query}\n\n"
+            f"## 候选技能（只能从中选一个，或选 none）\n" + "\n".join(lines)
         )
-        best = candidates[0]
-        if best.score < self._threshold:
-            _logger.info(
-                f"技能最高得分{best.score}低于阈值{self._threshold}，不激活: "
-                f"{best.skill.name}"
+        try:
+            result = llm.invoke_structured(
+                prompt, system_prompt=self._LLM_ROUTE_SYSTEM, temperature=0.1
+            )
+        except Exception as e:
+            _logger.warning(f"L3 LLM路由调用失败，按未命中处理: {e}")
+            return None
+        if not isinstance(result, dict) or result.get("error"):
+            _logger.warning(f"L3 LLM路由输出解析失败，按未命中处理: {str(result)[:200]}")
+            return None
+
+        name = str(result.get("skill_name", "") or "").strip()
+        reason = str(result.get("reason", "") or "")
+        try:
+            confidence = float(result.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        if not name or name.lower() in ("none", "null", "无"):
+            _logger.info(f"[L3 LLM路由] 模型判定无合适技能: reason={reason}")
+            return None
+        # 幻觉校验：模型可能编造一个根本没注册的技能名，必须查表确认
+        skill = self._skills.get(name)
+        if skill is None:
+            _logger.warning(
+                f"[L3 LLM路由] 模型返回了未注册的技能名 '{name}'（幻觉），按未命中处理"
             )
             return None
-
-        _logger.info(
-            f"技能命中: {best.skill.name} | score={best.score} "
-            f"| 命中词={best.hit_keywords} | 候选数={len(candidates)}"
+        if confidence < self._llm_confidence:
+            _logger.info(
+                f"[L3 LLM路由] 置信度{confidence} < {self._llm_confidence}，按未命中处理: {name}"
+            )
+            return None
+        _logger.info(f"技能命中[L3 LLM路由]: {name} | confidence={confidence} | reason={reason}")
+        return SkillMatch(
+            skill=skill,
+            score=round(confidence, 4),
+            hit_keywords=[],
+            route="llm",
+            confidence=round(confidence, 4),
+            route_reason=reason,
         )
-        return best
+
+    def match(self, query: str, query_emb: Optional[List[float]] = None) -> Optional[SkillMatch]:
+        """
+        三级路由主入口：L1关键词 → L2向量语义 → L3 LLM兜底，命中即停。
+
+        Args:
+            query:     用户提问（应已过 sanitize_input 清洗）
+            query_emb: 可选的问句向量。上层若已算过可传入，帮 L2 省一次 embedding 调用。
+
+        Returns:
+            SkillMatch（route 字段标明命中层级）；三层都未判定命中则返回 None（走通用流程）。
+        """
+        decision, candidates = self._route_keyword(query)
+        if decision == "hit":
+            return candidates[0]
+        if decision == "miss":
+            return None
+        # 模糊地带：先让向量层试，再让 LLM 兜底
+        m = self._route_vector(query, candidates, query_emb)
+        if m:
+            return m
+        m = self._route_llm(query, candidates)
+        if m:
+            return m
+        _logger.info("技能未命中（L1/L2/L3 三层均未判定命中），走通用助手流程")
+        return None
 
     @handle_exception(default=(None, ""), log_msg="技能上下文构建异常")
-    def build_skill_context(self, query: str) -> Tuple[Optional[BaseSkill], str]:
+    def build_skill_context(
+        self, query: str, query_emb: Optional[List[float]] = None
+    ) -> Tuple[Optional[BaseSkill], str]:
         """
-        一步完成「匹配 + 上下文文本构建」，供 ReActAgent.prepare_state 调用。
+        一步完成「三级路由匹配 + 上下文文本构建」，供 ReActAgent.prepare_state 调用。
         返回 (匹配到的技能, 注入Prompt的文本)；未命中时返回 (None, "")。
         """
-        match = self.match(query)
+        match = self.match(query, query_emb=query_emb)
         if not match:
             return None, ""
+        _logger.info(
+            f"技能上下文已构建: {match.skill.name} | "
+            f"路由层={ROUTE_LABELS.get(match.route, match.route)}"
+        )
         return match.skill, match.skill.format_context(match)
 
     def describe_all(self) -> str:

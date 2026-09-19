@@ -39,7 +39,7 @@ class MilvusVectorStore:
         # 【_dim】向量维度，默认 1024（config.py:43 ← .env 的 EMBEDDING_DIMENSION）。
         #   必须和 embedding 模型的输出维度严格一致：本项目用智谱 embedding-2，固定产出 1024 维。
         #   它被用在两个地方：
-        #     ① 建集合时声明字段类型 → 下面 vector_store.py:73 的 dim=self._dim
+        #     ① 建集合时声明字段类型 → _ensure_collection() 里 embedding 字段的 dim=self._dim
         #     ② 间接约束 pg_manager.py:280 建表的 vector(1024)
         #   三者必须同步改，否则入库时报 "dimension mismatch"。
         #
@@ -49,13 +49,14 @@ class MilvusVectorStore:
         self._dim = s.embedding_dimension
 
         # 【_top_k】一次粗召回最多返回几条候选，默认 5（config.py:69 ← .env 的 RAG_TOP_K）。
-        #   用在下面 search() 121 行的 limit=k，是"召回上限"，不是"最终条数"：
+        #   用在下面 search() 的 limit=k 参数上，是"召回上限"，不是"最终条数"：
         #   粗召回 5 条 → 再被 threshold 过滤一遍 → 剩下的才交给 rag_chain 精排。
-        #   search(query, top_k=...) 允许调用方临时覆盖，不传就用这里的值（119 行 k = top_k or self._top_k）。
+        #   search(query, top_k=...) 允许调用方临时覆盖，不传就用这里的值
+        #   （search() 里 k = top_k or self._top_k）。
         self._top_k = s.rag_top_k
 
         # 【_threshold】余弦相似度及格线，默认 0.65（config.py:71 ← .env 的 SIMILARITY_THRESHOLD）。
-        #   用在下面 search() 132 行：score < threshold 的结果直接丢弃。
+        #   用在下面 search() 的过滤循环里：score < threshold 的结果直接丢弃。
         #   作用是边界1/边界8——防止"用户问天气、召回到股票"的误匹配污染 Prompt。
         #   调小 → 召得宽但噪声多；调大 → 宁缺毋滥，可能一条都不剩。
         #
@@ -173,14 +174,54 @@ class MilvusVectorStore:
         相似度低于 threshold 的结果会被过滤。
         """
         emb_service = get_embedding_service()
-        query_vec = emb_service.embed(query)
+        query_vec = emb_service.embed(text=query)
         k = top_k or self._top_k
 
+        # ------------------------------------------------------------------
+        # 【做什么】向 Milvus 发起一次 ANN（近似最近邻）检索：
+        #   拿 1 个问句向量，在整张表里找出和它最相似的 k 条分片。
+        #
+        # 【为什么下面要写 results[0]】search() 支持「一次传多个 query 批量搜」，
+        #   所以它的返回值外层永远是「每个 query 一个结果集」：
+        #     results     = [结果集0]                 ← 只传了 1 个 query，长度就是 1
+        #     results[0]  = [Hit0, Hit1, ...]         ← 下面 for hit in results[0] 遍历的就是这一层
+        #   少写 [0] 会拿着一个列表去当 Hit 用，取 .score 直接 AttributeError。
+        #
+        # 【输入输出对照】
+        #   输入: query_vec = [0.021, -0.117, ...] 共 1024 个 float，k = 5
+        #   输出: results[0] 最多 5 个 Hit，每个形如
+        #         score = 0.8321
+        #         entity = {'content': '年假按工龄计算...',
+        #                   'file_name': '员工手册.pdf', 'source': '...', ...}
+        #   注意 hit.score 是【相似度】，越大越像（-1~1，文本向量实际落在 0~1），
+        #   不是「距离」（越小越像）。下面 if score < self._threshold(0.65) 就丢弃，
+        #   用的正是"越大越像"这个方向。
+        #
+        # 【依赖警告】这里的 metric_type 必须和建索引时（_ensure_collection 里的 create_index）一致：
+        #   建索引写的是 IVF_FLAT + COSINE + nlist=128，所以这里也得是 COSINE。
+        #   nprobe 的上限就是 nlist=128：填 200 无意义，填 1 只搜 1/128 的表，
+        #   召回率明显下降却不报错——这是静默降质，不是崩溃，日志里看不出来。
+        # ------------------------------------------------------------------
         results = self._collection.search(
+            # 【data】要查的向量，必须是「二维」：外层是 batch，内层是那 1024 个 float。
+            #   写成 [query_vec] 而不是 query_vec，少一层会报 DataNotMatchException。
             data=[query_vec],
+            # 【anns_field】在哪个字段上比向量。anns = Approximate Nearest Neighbor Search。
+            #   必须填建集合时那个 FLOAT_VECTOR 字段名（_ensure_collection 里 name="embedding"），
+            #   名字写错会报 field not exist。
             anns_field="embedding",
+            # 【param】检索参数，两层字典，不能写平：
+            #   "metric_type"       : 距离度量。COSINE = 余弦相似度，只看方向不看长度，
+            #                         所以长句和短句只要语义接近也能拿高分。
+            #   "params": {"nprobe"}: 只搜 128 个聚类桶里最像的 16 个（16/128 = 12.5%），
+            #                         用召回率换速度；改成 128 等于全表暴力搜（慢但最准）。
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            # 【limit】最多返回几条候选，默认 5（config.py RAG_TOP_K ← .env）。
+            #   这是「召回上限」不是最终条数：这 5 条还得过下面的 0.65 阈值过滤。
             limit=k,
+            # 【output_fields】除了向量，还要把哪些标量字段一起取回来。
+            #   不写就只剩 id + score，下面取 content/file_name 会全是空字符串。
+            #   chunk_id 是主键，不写也能用 hit.id 取；这里写了但下游组装 hits 时没用到它。
             output_fields=["chunk_id", "doc_id", "content", "source", "file_name", "updated_at"],
         )
 

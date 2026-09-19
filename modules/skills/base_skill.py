@@ -18,13 +18,30 @@ from modules.common.logger import get_logger
 
 _logger = get_logger("skill")
 
+# 三级路由的分层标签（日志 / 注入上下文展示用）
+ROUTE_LABELS = {
+    "keyword": "L1关键词路由",
+    "vector": "L2向量语义路由",
+    "llm": "L3 LLM兜底路由",
+}
+
 
 @dataclass
 class SkillMatch:
-    """技能匹配结果。"""
+    """技能匹配结果。
+
+    三级路由共用这一个对象，用 route 字段区分是哪一层判定的：
+        keyword → score 是关键词命中权重累加值（base_skill.match_score）
+        vector  → score 是 query 与技能描述文本的余弦相似度
+        llm     → score 是 LLM 自评的置信度 confidence
+    """
     skill: "BaseSkill"
-    score: float          # 匹配得分 0~1
+    score: float          # 匹配得分 0~1（不同路由层含义不同，见上）
     hit_keywords: List[str]
+    route: str = "keyword"      # 命中层级：keyword / vector / llm
+    vector_score: float = 0.0   # L2 余弦相似度，仅 route="vector" 时有值
+    confidence: float = 0.0     # L3 LLM 自评置信度，仅 route="llm" 时有值
+    route_reason: str = ""      # L3 LLM 给出的选择理由（便于排查误判）
 
     def __iter__(self):
         # 便于 `skill, score = registry.match(...)` 之外的元组式解包场景
@@ -85,6 +102,24 @@ class BaseSkill(ABC):
             return cls._WEIGHT_WORD
         return cls._WEIGHT_CHAR
 
+    @property
+    def routing_text(self) -> str:
+        """
+        供【L2 向量语义路由】编码的语义文本。
+
+        为什么不是直接用 description：单独的描述太短，向量区分度不够。
+        这里把「展示名 + 职责说明 + 典型触发词 + SOP 首句」拼成一段话，
+        相当于给这个技能画一张语义画像，让 query 与它算相似度时更有判别力。
+        """
+        kws = "、".join(self.trigger_keywords)
+        sop_head = ""
+        if self.instructions:
+            sop_head = self.instructions.strip().splitlines()[0]
+        return (
+            f"{self.display_name or self.name}。"
+            f"{self.description} 典型问法: {kws}。{sop_head}"
+        )
+
     def format_context(self, match: Optional[SkillMatch] = None) -> str:
         """
         格式化为注入 ReAct Prompt 的技能上下文文本。
@@ -92,9 +127,16 @@ class BaseSkill(ABC):
         hit_text = ""
         if match and match.hit_keywords:
             hit_text = f"\n命中意图词: {', '.join(match.hit_keywords)}"
+        # 非关键词层命中时，把路由来源写进上下文，方便排查「为什么激活了这个技能」
+        route_text = ""
+        if match and match.route and match.route != "keyword":
+            route_text = (
+                f"\n路由来源: {ROUTE_LABELS.get(match.route, match.route)}"
+                f"（得分 {match.score:.2f}）"
+            )
         tools_text = "、".join(self.bound_tools) if self.bound_tools else "（无专用工具，依据知识库与通用能力处理）"
         return (
-            f"【激活技能】{self.display_name or self.name}{hit_text}\n"
+            f"【激活技能】{self.display_name or self.name}{hit_text}{route_text}\n"
             f"技能说明: {self.description}\n"
             f"推荐工具: {tools_text}\n"
             f"作业流程(SOP):\n{self.instructions}"

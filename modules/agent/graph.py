@@ -107,7 +107,6 @@ class AgentGraph:
     def _prepare_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
-        breakpoint()  # 【调试断点】图节点[prepare]入口：可看 state 初始状态
 
         # 如果是首轮调用，需要初始化状态
         if not state.get("prepared"):
@@ -270,7 +269,7 @@ class AgentGraph:
             "prepared": False,
         }
     # recursion_limit 递归深度限制，防止死循环
-        result = self._graph.invoke(initial_state, {"recursion_limit": 30})
+        result: dict[str, Any] | Any = self._graph.invoke(initial_state, {"recursion_limit": 30})
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "
             f"tool_calls={len(result.get('tool_call_logs', []))} | "

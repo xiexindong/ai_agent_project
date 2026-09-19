@@ -98,14 +98,18 @@ class ReActAgent:
             max_iterations=self._max_iter,
         )
 
-        # Skill 技能意图匹配（命中则注入专属 SOP，未命中走通用流程）
+        # Skill 技能意图匹配 —— 三级路由，命中即停：
+        #   L1 关键词路由：得分 >= 0.6 直接命中 / < 0.1 直接放弃（零成本，覆盖大多数问句）
+        #   L2 向量语义路由：识别「换了个说法」的问句（相似度 >= 0.75 才算命中）
+        #   L3 LLM兜底路由：把问句 + 候选技能清单丢给模型分类，校验通过才采信
+        # 三层都判不中 → 不激活技能，走通用助手流程（active_skill 留空）
         if self.skill_registry:
             try:
+                # 传 query_emb 可让 L2 省一次向量调用；这里没提前算，交给 L2 按需自行编码
                 matched_skill, skill_ctx = self.skill_registry.build_skill_context(clean_query)
                 if matched_skill:
                     state.active_skill = matched_skill.name
                     state.skill_context = skill_ctx
-                breakpoint()  # 【调试断点】技能匹配结果：可看 matched_skill / skill_ctx
             except Exception as e:
                 _logger.warning(f"技能匹配降级（按通用助手流程处理）: {e}")
                 state.active_skill = ""
@@ -139,7 +143,6 @@ class ReActAgent:
                 rag_ctx = self.rag.build_context(clean_query)
                 state.rag_context = rag_ctx
                 state.rag_sources = self.rag.retrieve(clean_query) if rag_ctx else []
-                breakpoint()  # 【调试断点】RAG召回结果：可看 rag_ctx（Milvus 召回的文档内容，空=没命中）
             except Exception as e:
                 _logger.warning(f"RAG召回异常降级: {e}")
                 state.rag_context = ""
@@ -181,7 +184,6 @@ class ReActAgent:
         """
         state.iteration += 1
         _logger.info(f"ReAct循环 iteration={state.iteration}/{state.max_iterations}")
-        breakpoint()  # 【调试断点】Reason 节点入口：可看 state.user_query / iteration / observation
 
         # 构建 Reason Prompt
         tools_schema = []
@@ -219,7 +221,6 @@ class ReActAgent:
 
         state.reasoning = result["content"] or ""
         tool_calls = result.get("tool_calls")
-        breakpoint()  # 【调试断点】模型决策结果：可看 tool_calls（模型决定调不调工具、调哪个）
 
         # 判断是否需要工具
         if tool_calls and state.iteration < state.max_iterations:
@@ -243,7 +244,6 @@ class ReActAgent:
         action = state.action
         tool_name = action.get("name", "")
         arguments = action.get("arguments", {})
-        breakpoint()  # 【调试断点】Act 节点入口：可看 tool_name / arguments（模型决定调的工具）
 
         _logger.info(f"工具调用: {tool_name} | args={arguments}")
 
@@ -257,7 +257,6 @@ class ReActAgent:
             params=arguments,
             session_id=state.session_id,
         )
-        breakpoint()  # 【调试断点】工具执行完成：可看 result.result / result.success / result.duration_ms
 
         # 记录工具调用日志
         log_entry = {

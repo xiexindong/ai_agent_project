@@ -71,6 +71,22 @@ class Settings(BaseSettings):
     similarity_threshold: float = Field(default=0.65, alias="SIMILARITY_THRESHOLD")
     session_expire_hours: int = Field(default=72, alias="SESSION_EXPIRE_HOURS")
 
+    # ---- 技能三级路由参数（L1关键词 → L2向量 → L3 LLM兜底）----
+    # L1 高阈值：关键词得分 >= 此值直接判定命中，不再走 L2/L3（省 embedding 与 token）
+    skill_high_threshold: float = Field(default=0.6, alias="SKILL_HIGH_THRESHOLD")
+    # L1 低阈值：最高得分 < 此值视为「完全无关」，直接放弃技能，走通用对话（不再耗 L2/L3）
+    skill_low_threshold: float = Field(default=0.1, alias="SKILL_LOW_THRESHOLD")
+    # L2 向量相似度阈值：只有最高相似度 >= 此值才认定语义命中
+    skill_vector_threshold: float = Field(default=0.75, alias="SKILL_VECTOR_THRESHOLD")
+    # L2 参与向量比对的候选技能数（只取 L1 打分最高的前 N 个，避免全量编码）
+    skill_vector_top_n: int = Field(default=3, alias="SKILL_VECTOR_TOP_N")
+    # L3 总开关：False 时关闭 LLM 兜底路由（省钱/低延迟场景）
+    skill_llm_route_enabled: bool = Field(default=True, alias="SKILL_LLM_ROUTE_ENABLED")
+    # L3 候选技能数（只把 L1 打分最高的前 N 个丢给 LLM，减少 token 与幻觉）
+    skill_llm_top_n: int = Field(default=3, alias="SKILL_LLM_TOP_N")
+    # L3 置信度门槛：LLM 自评 confidence < 此值视为「没把握」，按未命中处理
+    skill_llm_confidence: float = Field(default=0.5, alias="SKILL_LLM_CONFIDENCE")
+
     # ---- 服务参数 ----
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")

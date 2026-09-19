@@ -37,8 +37,8 @@ class MCPServer:
         self._tools = self._define_tools()
         self._initialized = False
 
-    def _define_tools(self) -> list:
         """定义 Server 提供的工具列表。"""
+    def _define_tools(self) -> list:
         return [
             {
                 "name": "web_search",
