@@ -14,57 +14,45 @@ class AgentStateDict(TypedDict, total=False):
     LangGraph Agent 全局状态（TypedDict，支持部分字段）。
     贯穿 ReAct 循环、工具调度、记忆管理全链路。
     """
-    # ---- 会话信息 ----
     session_id: str
     user_id: str
     user_query: str
 
-    # ---- 权限载体（Principal）----
-    # 入口解析一次，全链路只读判定：工具过滤、知识库 expr、数据域、脱敏都靠它。
-    # 不进 to_dict 的持久化内容（AgentState.to_dict 会带上它，但不落库）。
     principal: Any
 
-    # ---- 消息历史（LangGraph MessagesState 兼容）----
     messages: list
 
-    # ---- RAG 知识库上下文 ----
     rag_context: str
     rag_sources: list
 
-    # ---- Skill 技能上下文（意图匹配命中的技能 SOP）----
-    active_skill: str       # 激活技能的 name，未命中为空串
-    skill_context: str      # 注入推理 Prompt 的技能 SOP 文本
+    active_skill: str
+    skill_context: str
 
-    # ---- 记忆上下文 ----
     memory_context: str
     long_term_memory: list
     short_term_memory: list
     memory_compressed: bool
 
-    # ---- ReAct 循环 ----
     iteration: int
     max_iterations: int
-    reasoning: str          # Reason 思考
-    action: dict            # Action 执行的工具 {name, arguments}
-    observation: str        # Observation 工具返回观察
-    tool_call_logs: list    # 全量工具调用日志
+    reasoning: str
+    action: dict
+    observation: str
+    tool_call_logs: list
     tool_calls_history: list
 
-    # ---- 任务编排 ----
-    sub_tasks: list         # 拆解的子任务队列
+    sub_tasks: list
     current_task_index: int
     task_results: list
 
-    # ---- 最终输出 ----
-    final_answer: str       # 完整详细答案
-    llm_summary: str        # 精简摘要
-    summary_embedding: list # 摘要向量
+    final_answer: str
+    llm_summary: str
+    summary_embedding: list
 
-    # ---- 控制 ----
-    need_tool_call: bool    # 是否需要调用工具
-    finished: bool          # 是否完成
+    need_tool_call: bool
+    finished: bool
     error: str
-    prepared: bool          # prepare 节点是否已执行（True = 跳过重复召回，断点续跑用）
+    prepared: bool
 
 
 @dataclass
@@ -74,7 +62,6 @@ class AgentState:
     user_id: str = ""
     user_query: str = ""
 
-    # 权限载体：None 表示未做权限校验（如 CLI 模式），此时按最小权限处理
     principal: Any = None
 
     messages: list = field(default_factory=list)

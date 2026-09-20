@@ -35,14 +35,10 @@ class ToolRegistry:
     """
 
     def __init__(self):
-        # 工具注册表：name 作为唯一键，本地工具和 MCPToolAdapter 都放这里
         self._tools: Dict[str, BaseTool] = {}
-        # 调用去重：记录每个会话已执行过的「工具+参数」（边界3：防死循环）
-        # 用 defaultdict(set) 类比 JS 的 { sessionId: new Set() }，首次访问自动建空集合
         self._call_records: Dict[str, set] = defaultdict(set)
-        # 每个工具的累计调用次数（当前轮次内），超限即拦截
         self._call_counts: Dict[str, int] = defaultdict(int)
-        self._max_calls_per_tool = 5  # 单工具最大调用次数
+        self._max_calls_per_tool = 5
 
     def register(self, tool: BaseTool):
         """
@@ -165,20 +161,16 @@ class ToolRegistry:
             去重账本只在"成功发起执行后"才记录；失败的调用不计数，
             避免一次参数错误把工具的调用配额浪费掉。
         """
-        # ① 存在性检查：LLM 可能幻觉出一个未注册的工具名
         tool = self.get_tool(name)
         if not tool:
             return ToolResult(success=False, error=f"工具不存在: {name}")
 
-        # ② 闸门一：单工具调用次数限制（超过 5 次判定为疑似死循环）
         if self._call_counts[name] >= self._max_calls_per_tool:
             return ToolResult(
                 success=False,
                 error=f"工具 {name} 调用次数超限({self._max_calls_per_tool})，疑似死循环，已拦截",
             )
 
-        # ③ 闸门二：相同参数去重
-        # 生成"工具名+参数指纹"，同一会话内完全相同的调用只允许执行一次
         param_key = self._hash_params(params)
         dedup_key = f"{name}:{param_key}"
         if dedup_key in self._call_records.get(session_id, set()):
@@ -188,14 +180,11 @@ class ToolRegistry:
                 error=f"工具 {name} 已用相同参数调用过，拒绝重复执行（防死循环）",
             )
 
-        # ④ 真正执行：BaseTool.run() 内部还会做必填参数校验并统一捕获异常
-        #    context 里的私有参数在此合并（数据域、脱敏强度等服务端判定结果）
         call_params = dict(params or {})
         if context:
             call_params.update(context)
         result = tool.run(call_params)
 
-        # ⑤ 记账：累计次数 + 记录参数指纹（仅在执行后记录，失败不占配额）
         self._call_counts[name] += 1
         if session_id:
             self._call_records[session_id].add(dedup_key)
@@ -217,7 +206,6 @@ class ToolRegistry:
         """
         if not params:
             return ""
-        # sorted() 按 key 排序，使指纹不受字典书写顺序影响
         return str(sorted(params.items()))
 
     def reset_session(self, session_id: str):

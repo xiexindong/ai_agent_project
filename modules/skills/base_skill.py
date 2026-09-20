@@ -18,7 +18,6 @@ from modules.common.logger import get_logger
 
 _logger = get_logger("skill")
 
-# 三级路由的分层标签（日志 / 注入上下文展示用）
 ROUTE_LABELS = {
     "keyword": "L1关键词路由",
     "vector": "L2向量语义路由",
@@ -36,15 +35,14 @@ class SkillMatch:
         llm     → score 是 LLM 自评的置信度 confidence
     """
     skill: "BaseSkill"
-    score: float          # 匹配得分 0~1（不同路由层含义不同，见上）
+    score: float
     hit_keywords: List[str]
-    route: str = "keyword"      # 命中层级：keyword / vector / llm
-    vector_score: float = 0.0   # L2 余弦相似度，仅 route="vector" 时有值
-    confidence: float = 0.0     # L3 LLM 自评置信度，仅 route="llm" 时有值
-    route_reason: str = ""      # L3 LLM 给出的选择理由（便于排查误判）
+    route: str = "keyword"
+    vector_score: float = 0.0
+    confidence: float = 0.0
+    route_reason: str = ""
 
     def __iter__(self):
-        # 便于 `skill, score = registry.match(...)` 之外的元组式解包场景
         yield self.skill
         yield self.score
 
@@ -70,10 +68,9 @@ class BaseSkill(ABC):
     bound_tools: List[str] = []
     priority: int = 0
 
-    # 命中证据权重：短语越长意图越强；单字词证据弱，需多个叠加才足以激活
-    _WEIGHT_PHRASE = 0.6   # >=3 字的强意图短语（如「等于多少」「查一下」）
-    _WEIGHT_WORD = 0.4     # 2 字意图词（如「订单」「计算」「新闻」）
-    _WEIGHT_CHAR = 0.15    # 单字弱词（如「加」「除」），防闲聊误命中
+    _WEIGHT_PHRASE = 0.6
+    _WEIGHT_WORD = 0.4
+    _WEIGHT_CHAR = 0.15
 
     def match_score(self, query: str) -> SkillMatch:
         """
@@ -127,7 +124,6 @@ class BaseSkill(ABC):
         hit_text = ""
         if match and match.hit_keywords:
             hit_text = f"\n命中意图词: {', '.join(match.hit_keywords)}"
-        # 非关键词层命中时，把路由来源写进上下文，方便排查「为什么激活了这个技能」
         route_text = ""
         if match and match.route and match.route != "keyword":
             route_text = (

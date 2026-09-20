@@ -95,7 +95,6 @@ class PGManager:
 
     def __new__(cls):
         if cls._instance is None:
-            # 没有就初始化一个 cls 是 class 本身 instance 是初始化后的实例对象
             cls._instance = super().__new__(cls)
         return cls._instance
 
@@ -117,92 +116,14 @@ class PGManager:
                 password=s.pg_password,
                 dbname=s.pg_database,
             )
-            # self._conn.autocommit = False 的作用是关闭数据库连接的自动提交模式，开启手动事务控制。
-            # 【手动事务】关闭自动提交，改为手动事务控制
-            # autocommit=True（默认）时：每条 SQL 执行完立刻落盘，无法回滚，也保证不了多步写入的原子性
-            # 设为 False 后：SQL 先攒在事务里，必须显式 conn.commit() 才真正生效，
-            #                出问题时 conn.rollback() 可整体撤销
-            # 本项目为什么必须关：一次对话记忆入库涉及多步写入（原文 + 摘要 + 摘要向量），
-            #   任何一步失败都要整体回滚，否则会出现「有原文没向量」的脏数据，
-            #   后续基于 summary_embedding 的长期记忆语义召回会直接失效
-            #   【通俗例子 —— 银行转账】
-            #   autocommit=True（自动提交）：
-            #       A 账户 -100  → 钱立刻真的扣了，落盘不可撤销
-            #       B 账户 +100  → 如果这一步失败崩了...
-            #       💥 结果：A 的钱没了，B 没收到，钱凭空消失（脏数据）
-            #
-            #   autocommit=False（手动事务，本项目用法）：
-            #       A 账户 -100  → 先记在草稿纸上，数据库里还没变
-            #       B 账户 +100  → 也记在草稿纸上
-            #       ✅ 两步都成功 → conn.commit()   把草稿一次性抄正，正式生效
-            #       ❌ 任一步失败 → conn.rollback() 把草稿撕掉，A 的钱纹丝未动
-            #
-            #   类比 JS：await client.query('BEGIN') ... await client.query('COMMIT')
-            #           中间所有 query 要么全生效，要么全不算
             self._conn.autocommit = False
 
-            # 【游标】cursor 是执行 SQL 并取回结果的「句柄」，所有 execute / fetchone / fetchall 都通过它
-            # 类比 JS 的 db.query()，区别是 psycopg2 里游标是独立可复用的对象
-            # 注意：本类全程复用这一个游标（self._cur），不是每次查询新建
             self._cur = self._conn.cursor()
 
-            # 【安装 pgvector 扩展】在数据库里注册 vector 类型（提供 vector 列 + 向量距离运算符）
-            # IF NOT EXISTS = 幂等写法：扩展已存在时静默跳过不报错，所以每次启动都执行也安全
-            # 前置条件：PG 镜像必须自带 pgvector（项目用 pgvector/pgvector 镜像），
-            #   纯官方 postgres 镜像执行这条会失败，并走到下方 except 抛 MemoryException
-            # 没有这一步，下面 _init_tables() 里的 vector({dim}) 列根本建不出来
             self._cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-            # 【提交 DDL】CREATE EXTENSION 属于 DDL，在 autocommit=False 下不会自动生效，
-            # 必须显式 commit 一次让扩展真正落盘；否则一旦中途 rollback，
-            # 后续建表引用 vector 类型会报 "type vector does not exist"
-            # 注意和下面 register_vector 的分工：
-            #   commit()          → 服务端的活（让 PG 数据库里真有 vector 类型）
-            #   register_vector() → 客户端的活（让 Python 驱动认识这个类型）
-            # 两者谁也替代不了谁，详见下方 register_vector 处的说明
             self._conn.commit()
 
-            # 【注册类型映射】告诉 psycopg2：PG 的 vector 类型 ↔ Python 的 list 如何互相转换
-            # 没有这一行：写入/读出向量时 psycopg2 不认识 vector 类型，会抛
-            #   "can't adapt type 'numpy.ndarray'" 或把向量当裸字符串返回
-            # 有这一行：Python 直接传 list[float]（如 [0.12, -0.03, ...]）即可写入，
-            #   查询结果也自动还原成 list，不用手工拼 '[0.1,0.2]' 这种字符串
-            # 作用范围：注册在「连接」上，本连接后续所有游标（含 _init_tables 里新建的）都生效
-            # JS 类比：相当于给 pg 客户端注册类型解析器 pg.types.setTypeParser(vectorOID, parseFn)
-            #
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # 【❓常见疑问：上面不是已经 commit 了吗，为什么还要 register_vector？】
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # 因为这两行【根本不在同一个地方干活】：
-            #
-            #     CREATE EXTENSION + commit  → 作用在【PostgreSQL 服务端】
-            #         让「数据库」认识 vector 这种数据类型，能建 vector 列、能算距离
-            #
-            #     register_vector(self._conn) → 作用在【Python 客户端 / psycopg2 驱动】
-            #         让「我们的代码」认识这个类型，知道 Python 的 list / numpy 数组
-            #         要怎么翻译成 PG 的 vector 格式，以及读回来怎么还原
-            #
-            #   【通俗例子 —— 跨国网购】
-            #       服务端 commit = 国外商家上线了一种新商品：日元标价的商品（数据库支持 vector 了）
-            #       客户端注册   = 你的手机银行 App 装个「日元换算器」插件（Python 认识这个类型了）
-            #       缺前者：压根没这商品，下单报错 "type vector does not exist"
-            #       缺后者：商品有，但 App 看到日元金额显示成一串乱码，没法用
-            #
-            #   【缺了它具体会报什么错？】
-            #       写入时（save_history 传 list/numpy）：
-            #           psycopg2.ProgrammingError: can't adapt type 'numpy.ndarray'
-            #       读取时（search_memory_by_vector 取向量）：
-            #           拿不到数字数组，只能拿到裸字符串 '[0.12,-0.34,...]'
-            #      → register_vector 就是干掉这两个问题的
-            #
-            #   【所以它跟 commit 谁也替代不了谁】
-            #       只有 commit、没 register_vector → 建表成功，但一写向量就崩
-            #       只有 register_vector、没 commit → 注册时查 vector 类型的编号(OID)查不到，直接失败
-            #
-            #   【另一个细节：为什么它写在 _connect 里？】
-            #       注册信息只跟着「那一个连接」走，不会全局生效。
-            #       而 _reconnect_if_needed() 断线重连时会重新 _connect()，
-            #       所以每次重建连接都必须再注册一次 —— 放在这里天然自动覆盖重连场景。
             register_vector(self._conn)
             self._init_tables()
             _logger.info(f"PG连接成功: {s.pg_host}:{s.pg_port}/{s.pg_database}")
@@ -259,7 +180,6 @@ class PGManager:
         s = get_settings()
         dim = s.embedding_dimension
         ddl = [
-            # 会话主表
             f"""
             CREATE TABLE IF NOT EXISTS chat_session (
                 session_id   VARCHAR(64) PRIMARY KEY,
@@ -270,7 +190,6 @@ class PGManager:
                 agent_state  JSONB DEFAULT '{{}}'::jsonb
             );
             """,
-            # 对话记忆表（核心向量记忆表）
             f"""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id                 BIGSERIAL PRIMARY KEY,
@@ -286,31 +205,24 @@ class PGManager:
                 created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 【老库迁移】CREATE TABLE IF NOT EXISTS 对「已存在的旧表」不会补列，
-            # 所以必须再补一条幂等的 ALTER，否则老库升级后没有 query_embedding 列，
-            # 写入会报 column "query_embedding" of relation "chat_history" does not exist
             f"""
             ALTER TABLE chat_history
             ADD COLUMN IF NOT EXISTS query_embedding vector({dim});
             """,
-            # 问句向量索引（长期记忆主检索列）
             f"""
             CREATE INDEX IF NOT EXISTS idx_history_query_emb
             ON chat_history USING ivfflat (query_embedding vector_cosine_ops)
             WITH (lists = 100);
             """,
-            # 摘要向量索引（ivfflat 加速语义检索）
             f"""
             CREATE INDEX IF NOT EXISTS idx_history_summary_emb
             ON chat_history USING ivfflat (summary_embedding vector_cosine_ops)
             WITH (lists = 100);
             """,
-            # 会话+用户联合索引（多用户隔离查询加速）
             f"""
             CREATE INDEX IF NOT EXISTS idx_history_session_user
             ON chat_history (session_id, user_id, created_at DESC);
             """,
-            # 工具调用日志表
             f"""
             CREATE TABLE IF NOT EXISTS tool_call_log (
                 id           BIGSERIAL PRIMARY KEY,
@@ -325,7 +237,6 @@ class PGManager:
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 人工审核标记表
             f"""
             CREATE TABLE IF NOT EXISTS review_queue (
                 id           BIGSERIAL PRIMARY KEY,
@@ -350,26 +261,12 @@ class PGManager:
     def _reconnect_if_needed(self):
         """连接断开时自动重连（心跳探活 + 失败自愈）。"""
         try:
-            # 心跳探测：发一条最轻量的 SQL（SELECT 1 不查表、无业务开销），
-            # 成功 = TCP 连接还活着，直接返回继续后续 SQL；
-            # 失败 = 连接已失效（PG 重启 / 空闲超时被断开 / 网络抖动），进入 except
             self._cur.execute("SELECT 1")
         except Exception:
-            # 捕获到任意数据库异常（如 OperationalError 连接已关闭）：
-            # 不把错误抛给上层业务，而是就地自愈——重置标记并调用 _connect() 重建连接池/游标，
-            # 让本次请求随后的 SQL 能在新连接上继续执行（后续每个方法入口都会先调本方法）。
-            # 类比 JS：axios 拦截器里发现网络断了，先 await reconnect() 再重放原请求
-            #
-            #   【通俗例子 —— 打电话】
-            #   你要跟同事说件事（执行 SQL），先喂一声「喂喂？」(SELECT 1)：
-            #       听到回应 → 电话还通着，直接说事
-            #       没动静   → 断了，挂掉重拨一次(_connect)，然后再说事
-            #   好处：上层业务完全不用关心"连接断没断"，调 save_history 就一定想办法给你存进去。
             _logger.warning("PG连接断开，尝试重连...")
             self._connected = False
             self._connect()
 
-    # ==================== 会话管理 ====================
 
     @handle_exception(default=None, log_msg="创建会话异常", reraise=True)
     def create_session(self, session_id: str, user_id: str, title: str = "") -> None:
@@ -455,25 +352,10 @@ class PGManager:
             "SELECT agent_state FROM chat_session WHERE session_id = %s AND user_id = %s",
             (session_id, user_id),
         )
-        # 【为什么 execute 之后还要 fetchone？】
-        #   execute() 只是把 SQL 发给数据库执行，结果还留在数据库那边（Python 手里什么都没有）；
-        #   fetchone() 才是把结果搬回 Python 内存，变成下面这个 row。
-        #   → 类比：execute = 下单，fetchone = 取餐；不 fetch 就永远拿不到数据。
-        #   这里用 fetchone 而非 fetchall：session_id 是主键，最多只可能有 1 行。
-        # ⚠ fetchone() 查不到时返回 None（不抛异常），所以下一行必须先判空再取 row[0]，
-        #   否则直接 TypeError: 'NoneType' object is not subscriptable
         row = self._cur.fetchone()
 
-        # row 是「元组」，列顺序对应 SELECT 的顺序，如 ({'iteration': 2},)
-        #   → row[0] 才是第 0 列 agent_state 的值
-        # 判两次的原因：两种"空"都算没查到，统一兜底成 {}
-        #   ① row 是 None   → 没这个会话，或该会话不属于这个 user_id
-        #   ② row[0] 是 {}  → 有记录，但 agent_state 是空字典（{} 是假值）
-        # 好处：调用方不用判空，server.py 可直接写 if not get_session_state(...) 当越权校验
-        # 注意：agent_state 是 JSONB 列，驱动已自动 parse 成 dict，无需 json.loads
         return row[0] if row and row[0] else {}
 
-    # ==================== 对话记忆 ====================
 
     @handle_exception(default=None, log_msg="保存对话记忆异常", reraise=True)
     def save_history(
@@ -536,12 +418,6 @@ class PGManager:
                 json.dumps(rag_sources or [], ensure_ascii=False),
             ),
         )
-        # ⚠ 顺序不能反：必须「先 fetchone，再 commit」
-        #   ① RETURNING id 的值在 execute() 时已由数据库算好并随结果集返回，
-        #      fetchone() 只是把它搬回 Python —— 不是"提交之后才产生 id"
-        #   ② commit() 会结束事务，服务端游标（cursor(name="xxx")）会被一并关闭，
-        #      此时再 fetchone() 直接报错
-        #   ③ 先 commit 的话，若 fetch 出错，会留下"插进去了却没拿到 id"的孤儿数据
         row = self._cur.fetchone()
         self._conn.commit()
         history_id = row[0] if row else None
@@ -598,7 +474,6 @@ class PGManager:
             (session_id, user_id, rounds),
         )
         rows = self._cur.fetchall()
-        # 时间正序（旧→新）
         rows.reverse()
         return [
             {"query": r[0], "answer": r[1], "summary": r[2], "time": r[3]}
@@ -669,29 +544,7 @@ class PGManager:
                LIMIT %s""",
             (emb, user_id, emb, top_k),
         )
-        # ------------------------------------------------------------------
-        # 【fetchall() 干了什么】
-        #   execute 只是把 SQL 发给 PG，结果集还挂在游标上（尚未读进 Python）；
-        #   fetchall() 才真正把 top_k 行一次性读回来（只要一行用 fetchone()）。
-        #
-        # 【读回来是什么】list[tuple]，字段顺序 = 上面 SELECT 的书写顺序，不带列名
-        #   （psycopg2 默认游标不返回 dict，想直接拿列名得换成 RealDictCursor）：
-        #     r[0]        r[1]          r[2]              r[3]        r[4]
-        #   user_query  llm_summary  llm_full_answer   similarity  created_at
         rows = self._cur.fetchall()
-        #
-        # 【下面在做什么】把「靠位置记忆的下标」翻译成「业务字段名」，
-        #   上层 memory_manager._recall_long_term 才能写 item["similarity"] >= 0.65。
-        #
-        #   【依赖警告】r[0]..r[4] 与上面 SELECT 的字段顺序是硬绑定的：
-        #   改了 SQL 的选取顺序就必须同步改这里，否则会静默错位（similarity 与
-        #   time 的值对调），不报错、不抛异常，属于极难排查的一类 bug。
-        #
-        # 【两个加工点】
-        #   float(r[3])   ：pgvector 的 1-(<=>) 本身已返回 float，这里只是防御性转换——
-        #                   若该列是 numeric，psycopg2 会返回 Decimal，json 序列化直接报错
-        #   round(..., 4) ：相似度留 4 位小数，日志里好看，也削掉浮点尾巴（0.91000000001）
-        # ------------------------------------------------------------------
         return [
             {
                 "query": r[0], "summary": r[1], "answer": r[2],
@@ -757,7 +610,6 @@ class PGManager:
         _logger.info(f"回填问句向量完成: 共 {total} 行")
         return total
 
-    # ==================== 工具调用日志 ====================
 
     @handle_exception(default=None, log_msg="保存工具日志异常")
     def save_tool_log(
@@ -803,7 +655,6 @@ class PGManager:
         )
         self._conn.commit()
 
-    # ==================== 人工审核 ====================
 
     @handle_exception(default=None, log_msg="加入审核队列异常")
     def add_to_review_queue(

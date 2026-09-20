@@ -83,7 +83,6 @@ class MCPServer:
             },
         ]
 
-    # ==================== 工具实现 ====================
 
     def _web_search(self, query: str, max_results: int = 3) -> str:
         """Tavily 网络搜索。"""
@@ -135,7 +134,6 @@ class MCPServer:
             "timestamp": datetime.now().isoformat(),
         }, ensure_ascii=False)
 
-    # ==================== MCP 协议处理 ====================
 
     def handle_request(self, msg: dict) -> str:
         """处理 JSON-RPC 请求，返回响应 JSON。"""
@@ -156,7 +154,7 @@ class MCPServer:
 
             elif method == "notifications/initialized":
                 _logger.info("MCP Client 已完成初始化")
-                return None  # 通知无需响应
+                return None
 
             elif method == "tools/list":
                 return create_response(req_id, {"tools": self._tools})
@@ -179,7 +177,6 @@ class MCPServer:
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
 
-        # 路由到具体工具
         if tool_name == "web_search":
             result = self._web_search(**arguments)
         elif tool_name == "get_current_time":
@@ -192,7 +189,6 @@ class MCPServer:
                 f"工具不存在: {tool_name}",
             )
 
-        # MCP 标准返回格式: content + isError
         return create_response(req_id, {
             "content": [{"type": "text", "text": str(result)}],
             "isError": False,

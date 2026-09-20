@@ -17,7 +17,6 @@ Principal（主体）= 一次请求里"这个用户到底是谁、能干啥"的�
 from dataclasses import dataclass, field
 from typing import Iterable
 
-# 数据域：可见范围由小到大，多角色冲突时取最大
 _SCOPE_ORDER = {"self": 0, "dept": 1, "all": 2}
 
 
@@ -25,21 +24,20 @@ _SCOPE_ORDER = {"self": 0, "dept": 1, "all": 2}
 class Principal:
     """一次请求的权限快照（不可变语义，构造后只读）。"""
 
-    user_code: str                      # 工号，等价于旧代码的 user_id
+    user_code: str
     real_name: str = ""
     tenant_code: str = ""
     dept_code: str = ""
     dept_name: str = ""
     job_title: str = ""
-    user_level: str = "normal"          # normal/advanced/admin，兼容旧一维分级
+    user_level: str = "normal"
     roles: list = field(default_factory=list)
     permissions: set = field(default_factory=set)
-    kb_codes: list = field(default_factory=list)     # 可见知识库 kb_code 列表
-    data_scope: str = "self"            # self / dept / all
-    mask_level: int = 0                 # 0 不脱敏 1 部分 2 强脱敏
-    source: str = "mysql"               # mysql / memory（降级来源，排障用）
+    kb_codes: list = field(default_factory=list)
+    data_scope: str = "self"
+    mask_level: int = 0
+    source: str = "mysql"
 
-    # ==================== 权限判定 ====================
 
     def can(self, perm_code: str) -> bool:
         """
@@ -56,7 +54,7 @@ class Principal:
             return True
         for granted in self.permissions:
             if granted.endswith("*"):
-                prefix = granted[:-1]                   # 'tool:mcp:*' → 'tool:mcp:'
+                prefix = granted[:-1]
                 if perm_code.startswith(prefix):
                     return True
         return False
@@ -84,7 +82,6 @@ class Principal:
                     scope = cand
         return scope
 
-    # ==================== 展示与日志 ====================
 
     def to_dict(self) -> dict:
         return {

@@ -9,7 +9,6 @@ from pathlib import Path
 from loguru import logger
 from config import get_settings
 
-# ---- 日志目录 ----
 _LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,9 +21,8 @@ def _configure_logger():
     if _configured:
         return
     s = get_settings()
-    logger.remove()  # 清除默认handler
+    logger.remove()
 
-    # 控制台输出：彩色、精简
     logger.add(
         sys.stderr,
         level=s.log_level,
@@ -34,20 +32,18 @@ def _configure_logger():
             "<cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
         ),
     )
-    # 文件输出：按天轮转，保留7天
     logger.add(
         _LOG_DIR / "agent_{time:YYYY-MM-DD}.log",
         level=s.log_level,
-        rotation="00:00",       # 每天午夜轮转
-        retention="7 days",     # 保留7天
-        compression="zip",      # 自动压缩
+        rotation="00:00",
+        retention="7 days",
+        compression="zip",
         encoding="utf-8",
         format=(
             "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
             "{name}:{line} - {message}"
         ),
     )
-    # 错误日志单独文件，方便快速定位
     logger.add(
         _LOG_DIR / "error_{time:YYYY-MM-DD}.log",
         level="ERROR",
@@ -65,5 +61,4 @@ def get_logger(name: str = "agent"):
     return logger.bind(module=name)
 
 
-# 启动时自动配置
 _configure_logger()

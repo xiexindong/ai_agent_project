@@ -43,50 +43,19 @@ class MCPClient:
     def connect(self, timeout: float = 15.0) -> bool:
         """启动 MCP Server 子进程并完成握手初始化。"""
         try:
-            # ── 干什么：在本机新起一个子进程跑 MCP Server ──
-            # 注意它不是网络服务（没有 IP/端口），就是操作系统层面的"父子进程"，
-            # 双方靠 3 根管道说 JSON-RPC 2.0，一次一行 JSON（NDJSON 行协议）。
-            #
-            # 通俗比喻：你（主进程）和一位关在小黑屋里的专家（子进程）合作——
-            #   塞进门缝的「问题纸条」= stdin
-            #   专家递出来的「回答纸条」= stdout
-            #   专家自言自语的「碎碎念（日志）」= stderr
-            #
-            # 命令来自 main.py:107 → [sys.executable, "-m", "modules.mcp.mcp_server"]
-            # 等价于在终端敲：python -m modules.mcp.mcp_server
-            # 子进程那头跑的是 mcp_server.py:204 的 `for line in sys.stdin:` 事件循环
             self._process = subprocess.Popen(
                 self._server_command,
-                # 父 → 子：写请求（initialize / tools/list / tools/call）
-                # 专业点说：管道是单向的，所以"说"和"听"必须是两根不同的管子
                 stdin=subprocess.PIPE,
-                # 子 → 父：读响应（_send_request 里 stdout.readline() 一次读一行）
-                # ⚠ 这是"协议专线"：子进程任何 print / 日志都不许打到这里，
-                #   否则 parse_message 拿到非 JSON 的行，整个协议就崩了
                 stdout=subprocess.PIPE,
-                # 子 → 父：子进程的 loguru 日志，不参与协议，只给人看
-                # ⚠ 必须有人持续读（下面 _read_stderr 线程就在干这事）：
-                #   管道是内核里固定大小的缓冲区（Linux 默认 64KB），写满后
-                #   子进程再 write 就会卡住等 → 双方互相等 = 死锁
                 stderr=subprocess.PIPE,
-                # 文本模式：读写直接拿 str，省掉 encode / decode
                 text=True,
-                # 行缓冲（text 模式下 bufsize=1 即 line-buffered）：
-                # 写一行立刻发出去，否则会攒在缓冲区里，对面半天收不到
-                # （所以 _send_request 写完还跟了一行 flush）
                 bufsize=1,
-                # 显式 UTF-8：Windows 上不写会走系统默认 GBK，中文工具参数必乱码
                 encoding="utf-8",
-                # ⚠ 未传 cwd：子进程继承父进程工作目录
-                #   → 必须在项目根目录运行，否则 `-m modules.mcp.mcp_server` 找不到包，
-                #     启动失败被上层降级（main.py:114），表现为"少了几个工具"而不是报错
             )
-            # 后台读取 stderr（日志/调试）
             threading.Thread(
                 target=self._read_stderr, daemon=True
             ).start()
 
-            # MCP initialize 握手
             resp = self._send_request("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
@@ -99,7 +68,6 @@ class MCPClient:
                     f"MCP Server 连接成功: {self._name} | "
                     f"server={resp['result'].get('serverInfo', {})})"
                 )
-                # 发送 initialized 通知（MCP 协议要求）
                 self._send_notification("notifications/initialized", {})
                 return True
             else:
@@ -126,11 +94,9 @@ class MCPClient:
             raise MCPException("MCP Server 未连接", "")
         req_id = self._next_id()
         msg = create_request(method, params, req_id=req_id)
-        # 写进一个进程 self._process = subprocess.Popen 的自进程
         self._process.stdin.write(msg + "\n")
         self._process.stdin.flush()
 
-        # 读取响应行
         try:
             line = self._process.stdout.readline()
             if not line:
@@ -172,7 +138,6 @@ class MCPClient:
             "arguments": arguments,
         }, timeout=timeout)
         result = resp.get("result", {})
-        # MCP 工具结果格式: {content: [{type, text}], isError}
         if result.get("isError"):
             error_text = ""
             for item in result.get("content", []):
@@ -217,7 +182,6 @@ class MCPToolAdapter(BaseTool):
         self._tool_info = tool_info
         self.name = tool_info["name"]
         self.description = tool_info.get("description", "")
-        # MCP 工具的参数 schema
         self.parameters_schema = tool_info.get("inputSchema", {
             "type": "object", "properties": {}, "required": []
         })
@@ -250,7 +214,6 @@ class MCPToolAdapter(BaseTool):
         这里只负责"调远程 + 提取文本"，参数校验/计时/异常兜底交给父类 run。
         """
         result = self._client.call_tool(self.name, kwargs)
-        # 提取文本内容（MCP 返回 content 数组，取其中 type=text 的部分拼接）
         text_parts = []
         for item in result.get("content", []):
             if item.get("type") == "text":
@@ -259,4 +222,3 @@ class MCPToolAdapter(BaseTool):
             success=True,
             result="\n".join(text_parts) if text_parts else result,
         )
-        # 注：不再自带 duration_ms / 异常兜底 —— 统一由继承来的 BaseTool.run 负责

@@ -31,13 +31,11 @@ from modules.enterprise import audit
 
 _logger = get_logger("rbac")
 
-# 降级用的内存 Key（MySQL 不可用时的兜底，与旧 auth.py 保持一致）
 _FALLBACK_KEYS = {
     "sk-user-normal-001":   ("U001", "张三", "normal"),
     "sk-user-advanced-002": ("U002", "李四", "advanced"),
     "sk-admin-003":         ("U003", "管理员", "admin"),
 }
-# 降级权限集：宽松放行，保证功能可演示
 _FALLBACK_PERMS = {
     "normal":   {"tool:calculator", "kb:public", "data:users:self"},
     "advanced": {"*"},
@@ -50,7 +48,7 @@ class AuthResult:
     """鉴权结果：ok=True 时 principal 必不为空。"""
     ok: bool
     principal: Optional[Principal] = None
-    reason: str = "ok"          # ok / no_key / invalid / disabled / expired / resigned
+    reason: str = "ok"
     message: str = ""
 
 
@@ -63,9 +61,8 @@ class RBACService:
         self._ttl = int(s.rbac_cache_ttl)
         self._kb_acl = bool(s.kb_acl_enabled)
         self._cache: dict = {}
-        self._available: Optional[bool] = None     # MySQL 可用性探测结果（惰性）
+        self._available: Optional[bool] = None
 
-    # ==================== 可用性 ====================
 
     def available(self) -> bool:
         """MySQL 权限库是否可用（结果缓存，避免每次请求都探测）。"""
@@ -76,7 +73,6 @@ class RBACService:
             _logger.info(f"MySQL 权限库可用性: {self._available}")
         return self._available
 
-    # ==================== 主入口 ====================
 
     def resolve(self, api_key: str) -> AuthResult:
         """API Key → AuthResult。缓存命中直接返回，未命中走库或降级。"""
@@ -102,7 +98,6 @@ class RBACService:
                 audit.log_audit("system", "auth", "mysql", "error", detail={"error": str(e)})
         return self._from_memory(api_key)
 
-    # ==================== 从 MySQL 解析 ====================
 
     def _from_db(self, api_key: str) -> AuthResult:
         db = get_mysql_client()
@@ -179,7 +174,6 @@ class RBACService:
         )
         return [r["kb_code"] for r in rows]
 
-    # ==================== 降级：内存鉴权 ====================
 
     def _from_memory(self, api_key: str) -> AuthResult:
         info = _FALLBACK_KEYS.get(api_key)
@@ -195,14 +189,13 @@ class RBACService:
             user_level=level,
             roles=[f"FALLBACK_{level.upper()}"],
             permissions=set(_FALLBACK_PERMS.get(level, set())),
-            kb_codes=[],                    # 空 = 不做知识库隔离
+            kb_codes=[],
             data_scope="all" if level in ("advanced", "admin") else "self",
             mask_level=0,
             source="memory",
         )
         return AuthResult(True, principal, "ok", "降级鉴权（MySQL 不可用）")
 
-    # ==================== 派生判定 ====================
 
     def allowed_tools(self, principal: Principal, tools: list) -> list:
         """
@@ -241,7 +234,6 @@ class RBACService:
         """清空权限缓存（改权限后立即生效时调用）。"""
         self._cache.clear()
 
-    # ==================== 内部 ====================
 
     def _record_auth(self, result: AuthResult, cache_key: str):
         """鉴权结果入审计（失败也记，key 只留摘要）。"""
@@ -254,7 +246,6 @@ class RBACService:
                             detail={"reason": result.reason})
 
 
-# ==================== 工具函数 ====================
 
 _SCOPE_ORDER = {"self": 0, "dept": 1, "all": 2}
 

@@ -59,7 +59,6 @@ def _cosine(vec_a: List[float], vec_b: List[float]) -> float:
             return 0.0
         return float(np.dot(va, vb) / denom)
     except Exception:
-        # numpy 缺失或数据异常时退回纯 Python 实现，保证路由链路不被中断
         dot = sum(a * b for a, b in zip(vec_a, vec_b))
         na = sum(a * a for a in vec_a) ** 0.5
         nb = sum(b * b for b in vec_b) ** 0.5
@@ -82,13 +81,9 @@ class SkillRegistry:
         llm_top_n: Optional[int] = None,
         llm_confidence: Optional[float] = None,
     ):
-        # 阈值含义：命中 1 个双字意图词(0.4)即可激活；仅命中单个单字弱词(0.15)不激活，防闲聊误命中
         self._skills: Dict[str, BaseSkill] = {}
         self._threshold = match_threshold
 
-        # ---- 三级路由参数 ----
-        # 优先级：构造参数 > config（.env）> 代码默认值。
-        # 参数留 None 是为了让「调用方显式传值」能覆盖 .env，和 match_threshold 的既有语义保持一致。
         from config import get_settings
         s: Settings = get_settings()
         self._high = high_threshold if high_threshold is not None else s.skill_high_threshold
@@ -105,10 +100,7 @@ class SkillRegistry:
             llm_confidence if llm_confidence is not None else s.skill_llm_confidence
         )
 
-        # L2 缓存：技能名 → 语义向量。技能画像只需编码一次，之后所有请求复用
         self._vec_cache: Dict[str, List[float]] = {}
-        # 熔断开关：某层真的不可用（没配 Key / 服务挂了）就永久降级，
-        # 避免每个请求都去撞一次注定失败的网络调用
         self._vector_available = True
 
         _logger.info(
@@ -125,7 +117,6 @@ class SkillRegistry:
         if skill.name in self._skills:
             _logger.warning(f"技能重复注册，覆盖: {skill.name}")
         self._skills[skill.name] = skill
-        # 技能被覆盖 = 语义画像变了，旧向量必须作废，否则 L2 会拿旧向量比对
         self._vec_cache.pop(skill.name, None)
         _logger.info(
             f"技能注册: {skill.name} | 触发词{len(skill.trigger_keywords)}个 "
@@ -145,7 +136,6 @@ class SkillRegistry:
         """列出全部已注册技能。"""
         return list(self._skills.values())
 
-    # ==================== L1：关键词路由（零成本） ====================
     def score_candidates(self, query: str) -> List[SkillMatch]:
         """对所有已注册技能做关键词打分，返回 score>0 的候选（按 score、priority 降序）。"""
         if not query or not self._skills:
@@ -159,7 +149,6 @@ class SkillRegistry:
                 continue
             if m.score > 0:
                 candidates.append(m)
-        # 得分降序，同分按 priority 降序
         candidates.sort(key=lambda m: (m.score, m.skill.priority), reverse=True)
         return candidates
 
@@ -196,7 +185,6 @@ class SkillRegistry:
         )
         return "ambiguous", candidates
 
-    # ==================== L2：向量语义路由（1 次 embedding） ====================
     def _skill_vectors(self, names: List[str]) -> Dict[str, List[float]]:
         """懒加载 + 缓存技能语义向量：每个技能只在首次参与比对时编码一次。"""
         missing = [n for n in names if n not in self._vec_cache]
@@ -227,7 +215,6 @@ class SkillRegistry:
         cands = candidates[: self._vec_top_n]
         try:
             from modules.memory.embedding_service import get_embedding_service
-            # 上层（prepare_state）若已算过问句向量就复用，省一次 embedding 调用
             qv = query_emb if query_emb is not None else get_embedding_service().embed(query)
             vecs = self._skill_vectors([m.skill.name for m in cands])
             scored = [
@@ -256,12 +243,10 @@ class SkillRegistry:
             _logger.info(f"[L2向量路由] 最高相似度{sim:.4f} < {self._vec_threshold}，下沉L3 LLM路由")
             return None
         except Exception as e:
-            # 熔断：embedding 不可用时不再逐请求重试，直接让后续请求只走 L1/L3
             self._vector_available = False
             _logger.warning(f"L2向量路由不可用，已永久降级: {e}")
             return None
 
-    # ==================== L3：LLM 兜底路由（1 次 LLM 调用） ====================
     _LLM_ROUTE_SYSTEM = (
         "你是技能路由器。根据用户提问，从给定的候选技能中选出唯一最合适的一个。\n"
         "只输出 JSON，不要输出任何解释性文字。\n"
@@ -289,7 +274,6 @@ class SkillRegistry:
             _logger.warning(f"L3 LLM路由不可用（客户端初始化失败），已永久降级: {e}")
             return None
 
-        # 只把候选技能丢给 LLM（而不是全部技能）：省 token，也缩小模型的幻觉空间
         lines = []
         for i, m in enumerate(cands, 1):
             sk = m.skill
@@ -324,7 +308,6 @@ class SkillRegistry:
         if not name or name.lower() in ("none", "null", "无"):
             _logger.info(f"[L3 LLM路由] 模型判定无合适技能: reason={reason}")
             return None
-        # 幻觉校验：模型可能编造一个根本没注册的技能名，必须查表确认
         skill = self._skills.get(name)
         if skill is None:
             _logger.warning(
@@ -362,7 +345,6 @@ class SkillRegistry:
             return candidates[0]
         if decision == "miss":
             return None
-        # 模糊地带：先让向量层试，再让 LLM 兜底
         m = self._route_vector(query, candidates, query_emb)
         if m:
             return m

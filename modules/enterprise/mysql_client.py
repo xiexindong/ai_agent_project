@@ -35,20 +35,19 @@ class MySQLClient:
             password=s.mysql_password,
             database=s.mysql_database,
             charset="utf8mb4",
-            autocommit=True,          # 权限库都是单行写入，无需显式事务
+            autocommit=True,
             connect_timeout=5,
             read_timeout=10,
         )
         self._conn = None
 
-    # ==================== 连接管理 ====================
 
     def _get_conn(self):
         """取连接；未连接或已断开则重建（最多重试一次）。"""
         try:
             import pymysql
             from pymysql.cursors import DictCursor
-        except ImportError as e:            # pragma: no cover - 依赖未装
+        except ImportError as e:
             raise RuntimeError("未安装 PyMySQL，请执行: pip install pymysql") from e
 
         if self._conn is None:
@@ -56,7 +55,7 @@ class MySQLClient:
             return self._conn
 
         try:
-            self._conn.ping(reconnect=True)     # MySQL 8 小时断连的经典坑
+            self._conn.ping(reconnect=True)
         except Exception:
             _logger.warning("MySQL 连接已断开，尝试重连")
             self._conn = pymysql.connect(cursorclass=DictCursor, **self._conn_args)
@@ -71,7 +70,6 @@ class MySQLClient:
             _logger.warning(f"MySQL 不可用: {e}")
             return False
 
-    # ==================== 查询 ====================
 
     def query_all(self, sql: str, args: tuple = ()) -> list:
         conn = self._get_conn()

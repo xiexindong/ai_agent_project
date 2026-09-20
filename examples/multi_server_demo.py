@@ -14,10 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# ⚠ Windows 必加：管道里的子进程默认用系统 locale（GBK/cp936）写 stdout，
-# 而 MCPClient 的 Popen 里写死了 encoding="utf-8"，读到中文会 UnicodeDecodeError。
-# 这个环境变量会被 Popen 的子进程继承，强制它用 UTF-8 输出。
-# （这是本项目在中文 Windows 上的一个真实缺陷，见 学习知识点/06 第 5 节）
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
 from modules.mcp.mcp_client import MCPClient  # noqa: E402

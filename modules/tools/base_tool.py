@@ -71,7 +71,6 @@ class BaseTool(ABC):
     def __init__(self, name: str, description: str, parameters: dict):
         self.name = name
         self.description = description
-        # OpenAI Function Calling 格式的参数 schema
         self.parameters_schema = {
             "type": "object",
             "properties": parameters.get("properties", {}),

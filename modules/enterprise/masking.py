@@ -14,7 +14,6 @@
 """
 from typing import Any
 
-# 字段名 → 脱敏类别
 _FIELD_KIND = {
     "id_card": "id",
     "idcard": "id",

@@ -11,7 +11,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# ---- JSON-RPC 2.0 标准错误码 ----
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601

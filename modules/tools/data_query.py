@@ -20,7 +20,6 @@ from typing import Dict
 from modules.tools.base_tool import BaseTool, ToolResult
 from modules.enterprise.masking import mask_record
 
-# 模拟内部数据库（owner / owner_dept 是行级权限的判定依据）
 _MOCK_DATA = {
     "users": {
         "U001": {"name": "张三", "dept": "技术部", "dept_code": "D_TECH", "level": "高级",
@@ -44,7 +43,6 @@ _MOCK_DATA = {
         "O1003": {"customer": "王五", "amount": 899.00, "status": "待付款", "date": "2026-09-10",
                   "owner": "U003", "owner_dept": "D_FINANCE"},
     },
-    # 库存是全公司共享数据，owner_dept 置空 = 不受部门域限制
     "inventory": {
         "SKU-001": {"name": "笔记本电脑", "stock": 45, "price": 5999.00, "owner": "", "owner_dept": ""},
         "SKU-002": {"name": "无线鼠标", "stock": 230, "price": 89.00, "owner": "", "owner_dept": ""},
@@ -94,7 +92,6 @@ class DataQueryTool(BaseTool):
             },
         )
 
-    # ==================== 行级权限 ====================
 
     @staticmethod
     def _visible_records(dataset: Dict[str, dict], scope: str, dept_code: str, user_code: str) -> Dict[str, dict]:
@@ -126,7 +123,6 @@ class DataQueryTool(BaseTool):
                 error=f"不支持的数据类型: {data_type}，可选: {list(_MOCK_DATA.keys())}",
             )
 
-        # 数据域按数据类型取（_scopes 由服务端按 RBAC 注入：{"users":"dept", ...}）
         scopes = kwargs.get("_scopes") or {}
         scope = scopes.get(data_type) or kwargs.get("_data_scope", "all") or "all"
         dept_code = kwargs.get("_dept_code", "") or ""
@@ -140,7 +136,6 @@ class DataQueryTool(BaseTool):
         visible = self._visible_records(dataset, scope, dept_code, user_code)
 
         if not record_id:
-            # 列表模式：只回 ID 清单，避免全量字段撑爆上下文
             return ToolResult(success=True, result={
                 "type": data_type,
                 "total": len(visible),
@@ -150,7 +145,6 @@ class DataQueryTool(BaseTool):
 
         if record_id not in visible:
             if record_id in dataset:
-                # 存在但越权：明确告知"无权"，阻止模型继续探测
                 return ToolResult(
                     success=False,
                     error=f"无权访问该记录: {data_type}/{record_id}（你的数据范围: {scope}）",
@@ -158,6 +152,5 @@ class DataQueryTool(BaseTool):
             return ToolResult(success=False, error=f"记录不存在: {data_type}/{record_id}")
 
         record = visible[record_id]
-        # 字段级脱敏：明文不进 LLM 上下文（会进摘要、进记忆、进审计）
         safe_record = mask_record(record, mask_level)
         return ToolResult(success=True, result={"id": record_id, **safe_record})

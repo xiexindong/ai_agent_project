@@ -85,7 +85,6 @@ class ReActAgent:
                        决定本次请求能看哪些知识库、能调哪些工具、能看多少数据。
                        None = 未启用权限（CLI 调试场景），按不放宽也不加严处理。
         """
-        # 边界6：Prompt注入检测
         if check_prompt_injection(query):
             return AgentState(
                 session_id=session_id,
@@ -97,7 +96,6 @@ class ReActAgent:
                 error="prompt_injection_blocked",
             )
 
-        # 输入清洗
         clean_query = sanitize_input(query)
         state = AgentState(
             session_id=session_id,
@@ -107,14 +105,8 @@ class ReActAgent:
             principal=principal,
         )
 
-        # Skill 技能意图匹配 —— 三级路由，命中即停：
-        #   L1 关键词路由：得分 >= 0.6 直接命中 / < 0.1 直接放弃（零成本，覆盖大多数问句）
-        #   L2 向量语义路由：识别「换了个说法」的问句（相似度 >= 0.75 才算命中）
-        #   L3 LLM兜底路由：把问句 + 候选技能清单丢给模型分类，校验通过才采信
-        # 三层都判不中 → 不激活技能，走通用助手流程（active_skill 留空）
         if self.skill_registry:
             try:
-                # 传 query_emb 可让 L2 省一次向量调用；这里没提前算，交给 L2 按需自行编码
                 matched_skill, skill_ctx = self.skill_registry.build_skill_context(clean_query)
                 if matched_skill:
                     state.active_skill = matched_skill.name
@@ -124,11 +116,9 @@ class ReActAgent:
                 state.active_skill = ""
                 state.skill_context = ""
 
-        # 记忆召回（短期+长期）
         if self.memory:
             try:
                 query_emb = None
-                # 复用 embedding 避免重复计算
                 from modules.memory.embedding_service import get_embedding_service
                 query_emb = get_embedding_service().embed(clean_query)
                 mem_ctx = self.memory.build_context(
@@ -138,15 +128,11 @@ class ReActAgent:
                 state.long_term_memory = mem_ctx["long_term_memory"]
                 state.short_term_memory = mem_ctx["short_term_memory"]
                 state.memory_compressed = mem_ctx["compressed"]
-                # 注意：字段名 summary_embedding 是历史包袱，这里存的其实是【问句】的向量
-                # （下一行 embed 的是 clean_query）。它在 graph._save_node 里被复用，
-                # 落库到 chat_history.query_embedding 列，作为长期记忆的主检索向量。
-                state.summary_embedding = query_emb  # 暂存query向量
+                state.summary_embedding = query_emb
             except Exception as e:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
                 state.memory_context = ""
 
-        # RAG 知识库召回（带权限隔离：只在本用户可见的 kb_code 范围内检索）
         if self.rag:
             try:
                 expr = self._kb_expr(principal)
@@ -161,7 +147,6 @@ class ReActAgent:
 
         return state
 
-    # ==================== 权限辅助 ====================
 
     @staticmethod
     def _kb_expr(principal) -> Optional[str]:
@@ -278,9 +263,6 @@ class ReActAgent:
         state.iteration += 1
         _logger.info(f"ReAct循环 iteration={state.iteration}/{state.max_iterations}")
 
-        # 构建 Reason Prompt
-        # ★ 权限过滤在这里生效：未授权的工具不进入 schema，模型无从调用。
-        #   这比"调用时再拒绝"好——不会浪费一轮 ReAct，也不会把工具名泄露给模型。
         tools_schema = []
         tools_desc = "（无可用工具）"
         if self.tool_registry:
@@ -311,7 +293,6 @@ class ReActAgent:
             tools_desc=tools_desc,
         )
 
-        # 调用 LLM（带工具）
         result = self.llm.invoke_with_tools(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT.format(max_iter=self._max_iter)},
@@ -323,16 +304,13 @@ class ReActAgent:
         state.reasoning = result["content"] or ""
         tool_calls = result.get("tool_calls")
 
-        # 判断是否需要工具
         if tool_calls and state.iteration < state.max_iterations:
             state.need_tool_call = True
-            state.action = tool_calls[0]  # 取第一个工具调用
+            state.action = tool_calls[0]
         else:
-            # 不需要工具，直接作为最终答案
             state.need_tool_call = False
             state.final_answer = result["content"] or "抱歉，我暂时无法回答这个问题。"
 
-        # 最大循环次数拦截（边界3）
         if state.iteration >= state.max_iterations and state.need_tool_call:
             _logger.warning(f"达到最大循环次数{state.max_iterations}，强制终止ReAct循环")
             state.need_tool_call = False
@@ -348,12 +326,10 @@ class ReActAgent:
 
         _logger.info(f"工具调用: {tool_name} | args={arguments}")
 
-        # 通过 ToolRegistry 统一调度（本地+MCP）
         if not self.tool_registry:
             state.observation = "工具注册器未初始化，无法调用工具"
             return state
 
-        # 服务端注入私有参数（数据域/脱敏强度）：模型不可见，也无从伪造
         result = self.tool_registry.execute_tool(
             name=tool_name,
             params=arguments,
@@ -361,10 +337,8 @@ class ReActAgent:
             context=self._tool_context(state.principal),
         )
 
-        # 企业审计：工具调用留痕（失败也记，越权尝试是重点审计对象）
         self._audit_tool_call(state.principal, tool_name, arguments, result)
 
-        # 记录工具调用日志
         log_entry = {
             "name": tool_name,
             "arguments": arguments,
@@ -381,17 +355,14 @@ class ReActAgent:
             state.observation = f"工具执行失败: {result.error}"
             _logger.warning(f"工具执行失败: {tool_name} | {result.error}")
 
-        # 重置 action，准备下一轮
         state.action = {}
         return state
 
     def generate_answer(self, state: AgentState) -> AgentState:
         """生成最终完整答案。"""
         if state.final_answer and not state.need_tool_call:
-            # Reason 步骤已生成答案
             pass
         else:
-            # 基于所有观察生成最终答案
             prompt = (
                 f"## 用户提问\n{state.user_query}\n\n"
                 f"## 知识库参考\n{state.rag_context or '无'}\n\n"
@@ -411,13 +382,11 @@ class ReActAgent:
         """生成精简摘要（用于向量入库）。"""
         if not state.final_answer:
             return state.user_query[:50]
-        # 提取已有的摘要标签，或重新生成
         if "【摘要】" in state.final_answer:
             import re
             m = re.search(r'【摘要】(.+?)(?:$|\n)', state.final_answer, re.S)
             if m:
                 return m.group(1).strip()[:100]
-        # 调用 LLM 生成摘要
         if self.memory:
             try:
                 summary = self.memory.summary_generator.generate_summary(
@@ -426,5 +395,4 @@ class ReActAgent:
                 return summary
             except Exception as e:
                 _logger.warning(f"摘要生成降级: {e}")
-        # 兜底
         return state.user_query[:50]

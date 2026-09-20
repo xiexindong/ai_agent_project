@@ -14,7 +14,6 @@ modules/mcp/mcp_server.py 是"项目自研的 Server"：用类、用 get_logger�
 import sys
 import json
 
-# 这个 Server 只提供 1 个工具，跟项目自带的 3 个完全不同
 TOOLS = [{
     "name": "string_reverse",
     "description": "把字符串倒过来写。",
@@ -46,7 +45,7 @@ for line in sys.stdin:
             "serverInfo": {"name": "wild-server", "version": "0.1"},
         })
     elif method == "notifications/initialized":
-        continue  # 通知不需要响应
+        continue
     elif method == "tools/list":
         out = reply(req_id, {"tools": TOOLS})
     elif method == "tools/call":

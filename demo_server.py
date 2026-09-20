@@ -22,17 +22,14 @@ from starlette.responses import JSONResponse, FileResponse, PlainTextResponse, S
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
-# ---- 配置（自包含，不依赖 config.py，避免引入 loguru/pydantic-dotenv）----
 APP_HOST = os.environ.get("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.environ.get("APP_PORT", "8000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 _logger = logging.getLogger("web-demo")
 
-# ---- 静态文件目录 ----
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# ---- Mock 用户与 API Key ----
 MOCK_USERS = {
     "sk-user-normal-001": {"user_id": "U001", "name": "张三", "level": "normal"},
     "sk-user-advanced-002": {"user_id": "U002", "name": "李四", "level": "advanced"},
@@ -76,7 +73,6 @@ async def ingest(request):
     user, err = _auth(request)
     if err:
         return err
-    # 解析 multipart 文件上传
     form = await request.form()
     file = form.get("file")
     filename = file.filename if file else "unknown"
@@ -101,11 +97,9 @@ async def chat(request):
 
     async def event_generator():
         """SSE 事件生成器：分阶段流式输出。"""
-        # 阶段1：思考中
         yield _sse_event("status", {"message": "Agent 正在思考...", "phase": "thinking"})
         await asyncio.sleep(0.8)
 
-        # 阶段2：工具调用（如果有）
         if tool_calls:
             for tc in tool_calls:
                 yield _sse_event("tool_start", {"name": tc["name"], "arguments": tc["arguments"]})
@@ -113,18 +107,15 @@ async def chat(request):
                 yield _sse_event("tool_end", {"name": tc["name"], "result": tc["result"], "success": tc["success"]})
                 await asyncio.sleep(0.3)
 
-        # 阶段3：逐字流式输出答案（打字机效果）
         yield _sse_event("answer_start", {"iterations": iterations})
         chars = list(answer)
-        step = 2  # 每次输出2个字符
+        step = 2
         for i in range(0, len(chars), step):
             chunk = "".join(chars[i:i + step])
             yield _sse_event("answer_chunk", {"content": chunk})
-            # 不同字符速度略有差异，更自然
             delay = 0.02 if i % 10 != 0 else 0.04
             await asyncio.sleep(delay)
 
-        # 阶段4：完成
         yield _sse_event("answer_end", {"summary": query[:30]})
         yield _sse_event("done", {})
 
@@ -168,7 +159,6 @@ async def pending_reviews(request):
 
 def _generate_mock_response(query: str):
     """根据查询内容生成不同的 Mock 回答，演示前端渲染效果。"""
-    # 数学计算 → 触发计算器工具
     if any(op in query for op in ["+", "-", "*", "/", "计算", "sqrt", "sin", "cos"]):
         answer = (
             "这是一个数学计算任务。\n\n"
@@ -188,7 +178,6 @@ def _generate_mock_response(query: str):
         }]
         return answer, tool_calls, 2
 
-    # 数据查询 → 触发数据查询工具
     if any(kw in query for kw in ["用户", "订单", "库存", "查询", "order", "user", "sku"]):
         answer = (
             "已为你查询到相关业务数据。\n\n"
@@ -207,7 +196,6 @@ def _generate_mock_response(query: str):
         }]
         return answer, tool_calls, 2
 
-    # 网络搜索 → 触发 MCP 工具
     if any(kw in query for kw in ["搜索", "search", "最新", "新闻", "联网"]):
         answer = (
             "通过网络搜索获取最新信息。\n\n"
@@ -227,7 +215,6 @@ def _generate_mock_response(query: str):
         }]
         return answer, tool_calls, 2
 
-    # 默认：知识库问答
     answer = (
         "已基于知识库和历史记忆为你解答。\n\n"
         "## 回答\n"
@@ -260,7 +247,6 @@ def create_demo_app() -> Starlette:
         Route("/tools/logs", tool_logs),
         Route("/reviews/pending", pending_reviews),
     ]
-    # 挂载静态文件
     if STATIC_DIR.is_dir():
         routes.append(Mount("/static", app=StaticFiles(directory=str(STATIC_DIR)), name="static"))
         _logger.info(f"静态文件目录: {STATIC_DIR}")

@@ -15,7 +15,7 @@ _logger = get_logger("doc_loader")
 class Document:
     """文档数据结构：内容 + 元数据。"""
     content: str
-    metadata: dict  # source, file_type, created_at, doc_id
+    metadata: dict
 
 
 class DocumentLoader:

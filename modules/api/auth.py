@@ -18,9 +18,9 @@ _logger = get_logger("auth")
 
 class UserLevel(str, Enum):
     """用户权限等级。"""
-    NORMAL = "normal"      # 普通用户：基础问答 + 本地工具
-    ADVANCED = "advanced" # 高级用户：含 MCP 远程工具、数据查询
-    ADMIN = "admin"       # 管理员：知识库管理、审核、审计
+    NORMAL = "normal"
+    ADVANCED = "advanced"
+    ADMIN = "admin"
 
 
 class AuthManager:
@@ -29,7 +29,6 @@ class AuthManager:
     生产环境应对接 JWT/OAuth，此处用 API Key 演示完整鉴权链路。
     """
 
-    # API Key → 用户映射（生产应存DB，此处演示）
     _API_KEYS = {
         "sk-user-normal-001": {"user_id": "U001", "name": "张三", "level": UserLevel.NORMAL},
         "sk-user-advanced-002": {"user_id": "U002", "name": "李四", "level": UserLevel.ADVANCED},
@@ -70,7 +69,7 @@ class AuthManager:
         """
         try:
             state = pg_manager.get_session_state(session_id, user_id)
-            return True  # get_session_state 已做 user_id 过滤
+            return True
         except Exception:
             return False
 
@@ -97,7 +96,7 @@ class RateLimiter:
     def __init__(self, max_requests: int = 20, window_seconds: int = 60):
         self._max = max_requests
         self._window = window_seconds
-        self._records: dict = defaultdict(list)  # user_id → [timestamps]
+        self._records: dict = defaultdict(list)
 
     def check(self, user_id: str) -> bool:
         """
@@ -112,7 +111,6 @@ class RateLimiter:
         """
         now = time.time()
         records = self._records[user_id]
-        # 清理过期记录（保留窗口内的）
         records[:] = [t for t in records if now - t < self._window]
         if len(records) >= self._max:
             _logger.warning(
@@ -124,10 +122,8 @@ class RateLimiter:
         return True
 
 
-# ---- 全局限流器实例 ----
 _rate_limiter = RateLimiter(max_requests=20, window_seconds=60)
 
-# ---- API Key Header 定义 ----
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
@@ -160,7 +156,6 @@ async def get_current_user(api_key: str = Security(_api_key_header)) -> dict:
 
     result = get_rbac_service().resolve(api_key)
     if not result.ok:
-        # 统一 403：不区分"Key 不存在/被吊销/已过期"，避免被拿来枚举有效 Key
         raise HTTPException(status_code=403, detail=result.message or "API Key 无效或已失效")
 
     p = result.principal
@@ -168,14 +163,14 @@ async def get_current_user(api_key: str = Security(_api_key_header)) -> dict:
         raise HTTPException(status_code=429, detail="请求频次超限，请稍后重试")
 
     return {
-        "user_id": p.user_code,        # 兼容旧字段：工号即 user_id
+        "user_id": p.user_code,
         "name": p.real_name,
         "level": p.user_level,
-        "principal": p,                 # ★ 权限载体，后续全链路透传
+        "principal": p,
         "dept_code": p.dept_code,
         "dept_name": p.dept_name,
         "roles": p.roles,
-        "source": p.source,             # mysql / memory（降级时排障用）
+        "source": p.source,
     }
 
 

@@ -107,7 +107,6 @@ class BGEReranker:
             term_hits = sum(1 for t in query_terms if t in content)
             term_score = term_hits / max(len(query_terms), 1)
             vec_score = doc.get("score", 0.5)
-            # 向量权重0.7 + 关键词权重0.3
             doc["rerank_score"] = round(vec_score * 0.7 + term_score * 0.3, 4)
         documents.sort(key=lambda x: x["rerank_score"], reverse=True)
         result = documents[:top_k]

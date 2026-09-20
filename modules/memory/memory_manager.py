@@ -83,15 +83,12 @@ class MemoryManager:
             边界8 - 相似度过滤：长期召回结果低于 similarity_threshold 舍弃，
                     避免"用户问天气、召回到股票"的误匹配
         """
-        # ---- 长期记忆：摘要向量语义召回 ----
         long_term = self._recall_long_term(query, user_id, query_embedding)
 
-        # ---- 短期记忆：最近N轮完整对话 ----
         short_term = self.pg.get_short_term_history(
             session_id, user_id, self._short_rounds
         )
 
-        # ---- 上下文 token 检查与压缩 ----
         context_text = self._format_context(long_term, short_term, query)
         compressed = False
         if check_token_overflow(context_text, self._max_history_tokens):
@@ -139,44 +136,11 @@ class MemoryManager:
         if query_embedding is None:
             query_embedding = self.embedding_service.embed(query)
 
-        # 这行代码的作用就是：拿着刚才生成的"问题向量"，去 PostgreSQL 数据库里搜出最相关的记忆片段。
-        # self.pg 你封装好的 PostgreSQL 数据库客户端对象（装了 pgvector 插件）
-        # .search_memory_by_vector(...)	自定义方法，意思是"按向量搜记忆"
-        # query_embedding	刚才用 embedding 模型把用户问题转成的那串数字（向量）
-		# user_id	用户 ID，这里是"cli-user"
-        # top_k=5	 只返回最相关的前5条
-        # results	搜出来的结果，通常是列表，每条包含记忆内容+相似度分数
 
-        # 3. 返回结果大概长这样
-        # results = [
-        #     {"content": "项目A后端开发已完成80%", "similarity": 0.92},
-        #     {"content": "项目A前端页面还在调试", "similarity": 0.87},
-        #     {"content": "下周要开项目评审会", "similarity": 0.81},
-        #     {"content": "数据库迁移计划推迟了", "similarity": 0.76},
-        #     {"content": "测试环境部署遇到问题", "similarity": 0.72},
-        # ]
 
         results = self.pg.search_memory_by_vector(
             query_embedding, user_id, top_k=5
         )
-        # ------------------------------------------------------------------
-        # 【为什么召回后还要再滤一道（边界8）】
-        #   向量搜索没有"不相关就返回空"的逻辑：只要库里还有别的记录，
-        #   它就一定凑满 top_k=5 条，哪怕相似度只有 0.2。所以 pg 返回的是
-        #   "最像的 5 条"，不等于"相关的 5 条"——这一步才把"最像"筛成"够像"。
-        #
-        # 【>= 是闭区间】恰好等于阈值的记录【保留】。想严格大于是 >，
-        #   改阈值时要留意这半分开的差别：0.65 时打 0.65 分的记录会留下。
-        #
-        # 【顺序不变】pg 那边已按 similarity 倒序返回，过滤不重排，
-        #   所以 filtered[0] 依然是最相关的一条（后面 _format_context 按此顺序拼）。
-        #
-        # 【空结果无需特判】results 为空（该用户没有历史）时这里直接得 []，
-        #   不报错；下面那段的告警专门盯"有召回但全被滤掉"这种更可疑的情况。
-        #
-        # 【阈值从哪来】self._similarity_threshold ← config.py:71，
-        #   默认 0.65，可用 .env 的 SIMILARITY_THRESHOLD 覆盖。调小 → 召得更宽但噪声多。
-        # ------------------------------------------------------------------
         filtered = [
             r for r in results
             if r["similarity"] >= self._similarity_threshold
@@ -198,7 +162,6 @@ class MemoryManager:
         merged = self.summary_generator.merge_summaries(summaries)
         if not merged:
             return long_term
-        # 合并后保留1条
         return [{
             "summary": merged,
             "query": query,

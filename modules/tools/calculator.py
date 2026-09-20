@@ -23,7 +23,6 @@ import operator
 from typing import Dict
 from modules.tools.base_tool import BaseTool, ToolResult
 
-# 安全的数学运算符映射（禁止执行任意代码）
 _SAFE_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -36,7 +35,6 @@ _SAFE_OPS = {
     ast.FloorDiv: operator.floordiv,
 }
 
-# 安全的函数白名单
 _SAFE_FUNCS = {
     "sin": math.sin, "cos": math.cos, "tan": math.tan,
     "asin": math.asin, "acos": math.acos, "atan": math.atan,

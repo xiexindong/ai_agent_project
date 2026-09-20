@@ -72,19 +72,14 @@ class AgentGraph:
         """
         workflow = StateGraph(AgentStateDict)
 
-        # ---- 定义节点 ----
         workflow.add_node("prepare", self._prepare_node)
         workflow.add_node("reason", self._reason_node)
         workflow.add_node("act", self._act_node)
         workflow.add_node("answer", self._answer_node)
         workflow.add_node("save", self._save_node)
 
-        # ---- 定义边 ----
         workflow.set_entry_point("prepare")
         workflow.add_edge("prepare", "reason")
-        # 条件分支：reason 后判断是否需要工具
-        # path_map 显式写出 {"act":"act","answer":"answer"} —— 即使 key==node 名，
-        # 也保留键值对写法，便于 LangGraph 校验/可视化导出（项目工程约定）
         workflow.add_conditional_edges(
             "reason",
             self._should_continue,
@@ -93,7 +88,6 @@ class AgentGraph:
                 "answer": "answer",
             },
         )
-        # act 执行后回到 reason（ReAct 循环）
         workflow.add_edge("act", "reason")
         workflow.add_edge("answer", "save")
         workflow.add_edge("save", END)
@@ -102,13 +96,11 @@ class AgentGraph:
         _logger.info("LangGraph 图构建完成: prepare → reason → [act → reason 循环] → answer → save")
         return compiled
 
-    # ==================== 节点实现 ====================
 
     def _prepare_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
 
-        # 如果是首轮调用，需要初始化状态
         if not state.get("prepared"):
             full_state = self.agent.prepare_state(
                 query=state.get("user_query", ""),
@@ -118,7 +110,6 @@ class AgentGraph:
             )
             updates = full_state.to_dict()
             updates["prepared"] = True
-            # 合并到现有 state
             return updates
         return {}
 
@@ -160,7 +151,6 @@ class AgentGraph:
         agent_state = AgentState.from_dict(state)
         _logger.info("节点[answer]: 生成最终答案")
         updated = self.agent.generate_answer(agent_state)
-        # 生成摘要
         summary = self.agent.generate_summary(updated)
         return {
             "final_answer": updated.final_answer,
@@ -176,22 +166,16 @@ class AgentGraph:
 
         if self.agent.memory and session_id and user_id:
             try:
-                # 生成摘要向量
                 summary = state.get("llm_summary", "")
                 from modules.memory.embedding_service import get_embedding_service
                 svc = get_embedding_service()
                 summary_emb = svc.embed(summary) if summary else None
 
-                # 生成【问句向量】：长期记忆的主检索列（问句 vs 历史问句，对称检索更准）
-                # 优先复用 perceive 阶段已算好的那个（react_agent.py 里 embed(clean_query)，
-                # 暂存在 state.summary_embedding 字段里——注意它存的其实是问句向量，字段名有历史包袱），
-                # 复用可以省一次 embedding 调用；拿不到才现场算
                 user_query = state.get("user_query", "")
                 query_emb = state.get("summary_embedding") or (
                     svc.embed(user_query) if user_query else None
                 )
 
-                # 四数据落库（原文+摘要+摘要向量+问句向量，缺一不可）
                 self.agent.memory.save_turn(
                     session_id=session_id,
                     user_id=user_id,
@@ -207,7 +191,6 @@ class AgentGraph:
                     ],
                 )
 
-                # Agent 状态持久化（断点续跑）
                 from modules.agent.state import AgentState
                 agent_state = AgentState.from_dict(state)
                 self.agent.memory.pg.update_session_state(
@@ -246,7 +229,6 @@ class AgentGraph:
             return "act"
         return "answer"
 
-    # ==================== 执行入口 ====================
 
     def run(
         self,
@@ -267,7 +249,6 @@ class AgentGraph:
             f"Agent执行: session={session_id} | user={user_id} | "
             f"权限={'已加载' if principal else '未启用'} | query='{query[:50]}'"
         )
-        # 标注 AgentStateDict：LangGraph invoke 期待状态 TypedDict，纯 dict 会被类型检查器拒收
         initial_state: AgentStateDict = {
             "session_id": session_id,
             "user_id": user_id,
@@ -275,7 +256,6 @@ class AgentGraph:
             "principal": principal,
             "prepared": False,
         }
-    # recursion_limit 递归深度限制，防止死循环
         result: dict[str, Any] | Any = self._graph.invoke(initial_state, {"recursion_limit": 30})
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "

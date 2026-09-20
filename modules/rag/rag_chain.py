@@ -57,7 +57,7 @@ class RAGChain:
         _logger.info(f"批量入库完成: 共 {total} 分片")
         return total
 
-    def retrieve(self, query: str, top_k: Optional[int] = None, expr: str = None) -> List[dict]:
+    def retrieve(self, query: str, top_k: Optional[int] = None, expr: Optional[str] = None) -> List[dict]:
         """
         知识库检索：Milvus向量召回 → BGE精排过滤。
         返回精排后的 top_k 相关文档列表。
@@ -68,16 +68,14 @@ class RAGChain:
                   而不是召回后再剔除——后者等于把机密内容送进了模型上下文。
         """
         k = top_k or self._top_k
-        # 第一步：Milvus 向量召回（带权限过滤）
         candidates = self.vector_store.search(query, top_k=k, expr=expr)
         if not candidates:
             _logger.warning(f"RAG无结果，触发兜底（边界1）: query='{query[:50]}'")
             return []
-        # 第二步：BGE 精排
         reranked = self.reranker.rerank(query, candidates, top_k=self._rerank_top_k)
         return reranked if reranked else []
 
-    def build_context(self, query: str, top_k: Optional[int] = None, expr: str = None) -> str:
+    def build_context(self, query: str, top_k: Optional[int] = None, expr: Optional[str] = None) -> str:
         """
         检索知识库并拼接为上下文文本，供LLM问答使用。
         无结果时返回空字符串，禁止模型幻觉编造。

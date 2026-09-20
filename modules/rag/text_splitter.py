@@ -42,7 +42,6 @@ class TextSplitter:
 
         chunks = []
         self._recursive_split(text, chunks)
-        # 重叠合并：相邻分片之间保留 chunk_overlap 字符重叠
         if self.chunk_overlap > 0 and len(chunks) > 1:
             chunks = self._add_overlap(chunks)
         return chunks
@@ -54,7 +53,6 @@ class TextSplitter:
                 chunks.append(text.strip())
             return
         if depth >= len(self.separators):
-            # 所有分隔符都切不开，按字符硬切
             for i in range(0, len(text), self.chunk_size):
                 piece = text[i:i + self.chunk_size].strip()
                 if piece:
@@ -63,7 +61,6 @@ class TextSplitter:
 
         sep = self.separators[depth]
         if sep == "":
-            # 硬切兜底
             for i in range(0, len(text), self.chunk_size):
                 piece = text[i:i + self.chunk_size].strip()
                 if piece:
@@ -79,7 +76,6 @@ class TextSplitter:
             else:
                 if current.strip():
                     chunks.append(current.strip())
-                # 当前 part 本身超长，递归用下一级分隔符
                 if len(part) > self.chunk_size:
                     self._recursive_split(part, chunks, depth + 1)
                     current = ""
