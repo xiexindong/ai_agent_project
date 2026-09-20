@@ -16,6 +16,7 @@ JavaScript 类比：
     并加了「单例 + axios-retry + try/catch 统一抛错」三件套。
 """
 import json
+import time
 from typing import Optional, List, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 from modules.common.logger import get_logger
@@ -24,6 +25,13 @@ from modules.common.validator import repair_json
 from config import get_settings
 
 _logger = get_logger("llm")
+
+
+def _llm_retry():
+    return retry(
+        stop=stop_after_attempt(max(1, get_settings().llm_max_attempts)),
+        wait=wait_exponential(min=1, max=8),
+    )
 
 
 class LLMClient:
@@ -79,11 +87,57 @@ class LLMClient:
                     base_url=s.deepseek_base_url,
                 )
                 self._model: str = s.deepseek_model
+                self.usage_context: dict = {}
                 _logger.info(f"LLM客户端初始化: model={self._model}")
             except Exception as e:
                 raise LLMException("LLM客户端初始化失败", str(e))
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
+    def set_usage_context(self, user_code: str = "", dept_code: str = "", session_id: str = ""):
+        """设置本次调用的归属上下文，供 token 用量按人/部门归集。"""
+        self.usage_context = {
+            "user_code": user_code,
+            "dept_code": dept_code,
+            "session_id": session_id,
+        }
+
+    def _chat(self, **kwargs):
+        """统一出口：超时 + 备用模型降级 + token 用量的落库入口。"""
+        s = get_settings()
+        started = time.time()
+        try:
+            resp = self._chat( timeout=s.llm_timeout_seconds, **kwargs
+            )
+        except Exception as e:
+            fb = s.fallback_model
+            if not fb or fb == self._model:
+                raise
+            _logger.warning(f"主模型 {self._model} 调用失败，降级备用模型 {fb}: {e}")
+            resp = self._client.chat.completions.create(
+                model=fb, timeout=s.llm_timeout_seconds, **kwargs
+            )
+        self._log_usage(resp, int((time.time() - started) * 1000))
+        return resp
+
+    def _log_usage(self, resp, latency_ms: int):
+        usage = getattr(resp, "usage", None)
+        if not usage or not get_settings().rbac_enabled:
+            return
+        try:
+            from modules.enterprise.audit import log_llm_usage
+            ctx = getattr(self, "usage_context", {}) or {}
+            log_llm_usage(
+                user_code=ctx.get("user_code", ""),
+                model=getattr(resp, "model", self._model),
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                latency_ms=latency_ms,
+                dept_code=ctx.get("dept_code", ""),
+                session_id=ctx.get("session_id", ""),
+            )
+        except Exception as e:
+            _logger.debug(f"用量上报失败: {e}")
+
+    @_llm_retry()
     def invoke(
         self,
         prompt: str,
@@ -106,12 +160,12 @@ class LLMClient:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         try:
-            resp = self._client.chat.completions.create(
-                model=self._model,
+            resp = self._chat(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            return (resp.choices[0].message.content or "").strip()
 
 
 
@@ -120,7 +174,7 @@ class LLMClient:
             _logger.error(f"LLM调用失败: {e}")
             raise LLMException("LLM调用失败", str(e))
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
+    @_llm_retry()
     def invoke_with_tools(
         self,
         messages: list,
@@ -162,8 +216,7 @@ class LLMClient:
             不强制调工具。auto 让模型基于上下文判断"现在该不该用工具"。
         """
         try:
-            resp = self._client.chat.completions.create(
-                model=self._model,
+            resp = self._chat(
                 messages=messages,
                 tools=tools if tools else None,
                 tool_choice="auto" if tools else None,
@@ -191,7 +244,7 @@ class LLMClient:
             _logger.error(f"LLM工具调用失败: {e}")
             raise LLMException("LLM工具调用失败", str(e))
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
+    @_llm_retry()
     def invoke_structured(
         self,
         prompt: str,
@@ -208,8 +261,7 @@ class LLMClient:
         full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
         full_prompt += '\n\n请严格以JSON格式输出，不要包含额外文本。'
         try:
-            resp = self._client.chat.completions.create(
-                model=self._model,
+            resp = self._chat(
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=temperature,
                 max_tokens=2048,

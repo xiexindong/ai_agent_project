@@ -6,6 +6,7 @@
 - 长期记忆：PG pgvector 摘要向量语义召回（跨会话历史匹配）
 覆盖边界4（上下文溢出自动压缩）、边界8（记忆召回阈值过滤）。
 """
+import re
 from typing import List, Optional
 from modules.common.logger import get_logger
 from modules.common.exceptions import handle_exception
@@ -29,6 +30,7 @@ class MemoryManager:
         self._max_history_tokens = s.max_history_tokens
         self._short_rounds = s.short_memory_rounds
         self._similarity_threshold = s.similarity_threshold
+        self._low_confidence = False
 
     def save_turn(
         self,
@@ -102,6 +104,7 @@ class MemoryManager:
             "short_term_memory": short_term,
             "context_text": context_text,
             "compressed": compressed,
+            "low_confidence": self._low_confidence,
         }
 
     @handle_exception(default=[], log_msg="长期记忆召回异常")
@@ -149,8 +152,36 @@ class MemoryManager:
             _logger.info(
                 f"历史记忆召回{len(results)}条但全部低于阈值{self._similarity_threshold}，已舍弃"
             )
+
+        self._low_confidence = False
+        if filtered and get_settings().memory_keyword_check:
+            checked = [
+                r for r in filtered
+                if self._has_keyword_overlap(query, r.get("summary", "") or r.get("query", ""))
+            ]
+            if checked:
+                if len(checked) < len(filtered):
+                    _logger.info(
+                        f"记忆关键词二次校验: 丢弃 {len(filtered) - len(checked)} 条无字面重合的召回"
+                    )
+                filtered = checked
+            else:
+                self._low_confidence = True
+                _logger.info("记忆召回字面完全不重合，标记为低置信（触发人工审核）")
+
         _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")
         return filtered
+
+    @staticmethod
+    def _has_keyword_overlap(query: str, text: str) -> bool:
+        """关键词二次校验：中文按 2-gram、英文按词，判定问句与历史摘要是否有字面重合。"""
+        def grams(s: str) -> set:
+            s = re.sub(r"\s+", "", s.lower())
+            if re.search(r"[\u4e00-\u9fff]", s):
+                return {s[i:i + 2] for i in range(len(s) - 1)}
+            return set(re.findall(r"[a-z0-9]+", s))
+
+        return bool(grams(query) & grams(text))
 
     def _compress_long_term(self, long_term: list, user_id: str, query: str) -> list:
         """

@@ -32,8 +32,10 @@ LangGraph 图构建模块
 from typing import Annotated, Any
 from langgraph.graph import StateGraph, END
 from modules.common.logger import get_logger
+from modules.common.validator import check_sensitive
 from modules.agent.state import AgentStateDict
 from modules.agent.react_agent import ReActAgent
+from config import get_settings
 
 _logger = get_logger("graph")
 
@@ -43,6 +45,7 @@ class AgentGraph:
 
     def __init__(self, react_agent: ReActAgent):
         self.agent = react_agent
+        self._checkpointer = None
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -79,7 +82,14 @@ class AgentGraph:
         workflow.add_node("save", self._save_node)
 
         workflow.set_entry_point("prepare")
-        workflow.add_edge("prepare", "reason")
+        workflow.add_conditional_edges(
+            "prepare",
+            self._after_prepare,
+            {
+                "reason": "reason",
+                "answer": "answer",
+            },
+        )
         workflow.add_conditional_edges(
             "reason",
             self._should_continue,
@@ -92,7 +102,17 @@ class AgentGraph:
         workflow.add_edge("answer", "save")
         workflow.add_edge("save", END)
 
-        compiled = workflow.compile()
+        if get_settings().checkpoint_enabled:
+            try:
+                from langgraph.checkpoint.memory import MemorySaver
+                self._checkpointer = MemorySaver()
+            except Exception as e:
+                _logger.warning(f"checkpoint 不可用（断点续跑关闭）: {e}")
+        try:
+            compiled = workflow.compile(checkpointer=self._checkpointer)
+        except TypeError:
+            compiled = workflow.compile()
+            self._checkpointer = None
         _logger.info("LangGraph 图构建完成: prepare → reason → [act → reason 循环] → answer → save")
         return compiled
 
@@ -176,7 +196,7 @@ class AgentGraph:
                     svc.embed(user_query) if user_query else None
                 )
 
-                self.agent.memory.save_turn(
+                history_id = self.agent.memory.save_turn(
                     session_id=session_id,
                     user_id=user_id,
                     user_query=user_query,
@@ -196,10 +216,64 @@ class AgentGraph:
                 self.agent.memory.pg.update_session_state(
                     session_id, agent_state.to_dict()
                 )
+                self._save_tool_logs(state)
+                self._auto_review(state, history_id)
                 _logger.info("对话记忆 + Agent状态 已持久化")
             except Exception as e:
                 _logger.error(f"记忆保存异常: {e}")
         return {}
+
+    def _save_tool_logs(self, state: dict) -> None:
+        """工具调用全量落 tool_call_log 表（审计依据，与 chat_history 的 JSONB 互补）。"""
+        for tc in state.get("tool_call_logs", []):
+            self.agent.memory.pg.save_tool_log(
+                state.get("session_id", ""),
+                state.get("user_id", ""),
+                tc.get("name", ""),
+                tc.get("type", "local"),
+                tc.get("arguments", {}) or {},
+                str(tc.get("result", ""))[:2000],
+                "success" if tc.get("success", True) else "error",
+                tc.get("duration_ms", 0),
+            )
+
+    def _auto_review(self, state: dict, history_id) -> None:
+        """自动初审：命中四类风险之一即挂人工复核（合规留痕 + 数据反哺）。
+
+        四类触发：sensitive（注入/敏感词）> tool_fail（工具失败）> low_sim（记忆低置信）> no_rag（无知识库依据）
+        只入队优先级最高的一类，避免同一轮对话刷出多条待办。
+        """
+        if not get_settings().review_auto_enabled or not history_id:
+            return
+        query = state.get("user_query", "")
+        reasons = []
+        if state.get("error") == "prompt_injection_blocked" or check_sensitive(query):
+            reasons.append(("sensitive", query))
+        if any(not tc.get("success", True) for tc in state.get("tool_call_logs", [])):
+            reasons.append(("tool_fail", "本轮存在工具调用失败"))
+        if state.get("memory_low_confidence"):
+            reasons.append(("low_sim", "长期记忆召回低置信"))
+        if self.agent.rag and not state.get("rag_sources"):
+            reasons.append(("no_rag", query))
+
+        if not reasons:
+            return
+        review_type, content = reasons[0]
+        self.agent.memory.pg.add_to_review_queue(
+            state.get("session_id", ""), state.get("user_id", ""),
+            history_id, content[:500], review_type,
+        )
+        _logger.info(f"自动初审入队: type={review_type} history_id={history_id}")
+
+    def _after_prepare(self, state: dict) -> str:
+        """prepare 之后的路由：注入拦截/异常直接收尾，否则进 ReAct 循环。
+
+        没有这条边时，prepare 里置的 finished 会被 reason 节点的 LLM 输出覆盖，
+        注入拦截话术实际发不出去（守卫形同虚设）。
+        """
+        if state.get("error") or (state.get("finished") and state.get("final_answer")):
+            return "answer"
+        return "reason"
 
     def _should_continue(self, state: dict) -> str:
         """
@@ -236,6 +310,7 @@ class AgentGraph:
         session_id: str,
         user_id: str,
         principal=None,
+        resume: bool = True,
     ) -> dict[str, Any]:
         """
         执行完整 Agent 流程。
@@ -256,7 +331,18 @@ class AgentGraph:
             "principal": principal,
             "prepared": False,
         }
-        result: dict[str, Any] | Any = self._graph.invoke(initial_state, {"recursion_limit": 30})
+        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 30}
+
+        if resume and self._checkpointer is not None:
+            try:
+                snapshot = self._graph.get_state(config)
+                if snapshot and getattr(snapshot, "next", None):
+                    _logger.warning(f"检测到未完成任务，断点续跑: session={session_id} next={snapshot.next}")
+                    return self._graph.invoke(None, config)
+            except Exception as e:
+                _logger.warning(f"断点恢复失败，按新任务执行: {e}")
+
+        result: dict[str, Any] | Any = self._graph.invoke(initial_state, config)
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "
             f"tool_calls={len(result.get('tool_call_logs', []))} | "

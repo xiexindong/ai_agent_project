@@ -32,6 +32,7 @@ class AgentStateDict(TypedDict, total=False):
     long_term_memory: list
     short_term_memory: list
     memory_compressed: bool
+    memory_low_confidence: bool
 
     iteration: int
     max_iterations: int
@@ -73,6 +74,7 @@ class AgentState:
     long_term_memory: list = field(default_factory=list)
     short_term_memory: list = field(default_factory=list)
     memory_compressed: bool = False
+    memory_low_confidence: bool = False
 
     iteration: int = 0
     max_iterations: int = 10
@@ -123,6 +125,7 @@ class AgentState:
             "long_term_memory": self.long_term_memory,
             "short_term_memory": self.short_term_memory,
             "memory_compressed": self.memory_compressed,
+            "memory_low_confidence": self.memory_low_confidence,
             "iteration": self.iteration,
             "max_iterations": self.max_iterations,
             "reasoning": self.reasoning,
@@ -170,6 +173,7 @@ class AgentState:
             long_term_memory=d.get("long_term_memory", []),
             short_term_memory=d.get("short_term_memory", []),
             memory_compressed=d.get("memory_compressed", False),
+            memory_low_confidence=d.get("memory_low_confidence", False),
             iteration=d.get("iteration", 0),
             max_iterations=d.get("max_iterations", 10),
             reasoning=d.get("reasoning", ""),

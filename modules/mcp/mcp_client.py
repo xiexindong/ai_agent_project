@@ -17,6 +17,7 @@ from modules.mcp.protocol import (
     create_request, parse_message,
     create_error, INTERNAL_ERROR, METHOD_NOT_FOUND,
 )
+from config import get_settings
 
 _logger = get_logger("mcp_client")
 
@@ -40,8 +41,9 @@ class MCPClient:
         return self._req_id
 
     @handle_exception(default=None, log_msg="MCP连接异常", reraise=True)
-    def connect(self, timeout: float = 15.0) -> bool:
+    def connect(self, timeout: Optional[float] = None) -> bool:
         """启动 MCP Server 子进程并完成握手初始化。"""
+        timeout = timeout or get_settings().tool_timeout_seconds
         try:
             self._process = subprocess.Popen(
                 self._server_command,
@@ -88,8 +90,9 @@ class MCPClient:
             self._stderr_queue.put(line.rstrip())
             _logger.debug(f"[{self._name}] stderr: {line.rstrip()}")
 
-    def _send_request(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+    def _send_request(self, method: str, params: dict, timeout: Optional[float] = None) -> dict:
         """发送 JSON-RPC 请求并等待响应。"""
+        timeout = timeout or get_settings().tool_timeout_seconds
         if not self._process or not self._process.stdin:
             raise MCPException("MCP Server 未连接", "")
         req_id = self._next_id()
@@ -131,8 +134,9 @@ class MCPClient:
         return tools
 
     @handle_exception(default=None, log_msg="MCP工具调用异常")
-    def call_tool(self, tool_name: str, arguments: dict, timeout: float = 60.0) -> dict:
+    def call_tool(self, tool_name: str, arguments: dict, timeout: Optional[float] = None) -> dict:
         """调用 MCP 远程工具（tools/call）。"""
+        timeout = timeout or get_settings().tool_timeout_seconds
         resp = self._send_request("tools/call", {
             "name": tool_name,
             "arguments": arguments,

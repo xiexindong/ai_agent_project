@@ -64,6 +64,18 @@ def check_prompt_injection(text: str) -> bool:
     return False
 
 
+def check_sensitive(text: str) -> bool:
+    """敏感内容检测：命中敏感词库的输入/输出需要挂人工审核（合规留痕）。"""
+    if not text:
+        return False
+    low = text.lower()
+    hit = [w for w in _SENSITIVE_WORDS if w in low]
+    if hit:
+        _logger.warning(f"命中敏感词: {hit}")
+        return True
+    return False
+
+
 def sanitize_input(text: str, max_length: int = 5000) -> str:
     """
     清洗用户输入：去控制字符 + 截断超长 + 敏感词标记。

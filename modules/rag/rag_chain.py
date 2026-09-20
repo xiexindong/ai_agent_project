@@ -5,6 +5,7 @@ RAG 链路模块
 覆盖边界1（RAG无结果/低相关降级处理）。
 """
 from typing import List, Optional
+from datetime import datetime
 from modules.common.logger import get_logger
 from modules.common.exceptions import RAGException
 from modules.rag.document_loader import DocumentLoader, Document
@@ -30,6 +31,8 @@ class RAGChain:
         self.reranker = BGEReranker()   
         self._rerank_top_k = get_settings().rerank_top_k
         self._top_k = get_settings().rag_top_k
+        self._keyword_fallback = get_settings().rag_keyword_fallback
+        self._recency_boost = get_settings().rag_recency_boost
 
     def ingest_document(self, file_path: str) -> int:
         """
@@ -69,11 +72,34 @@ class RAGChain:
         """
         k = top_k or self._top_k
         candidates = self.vector_store.search(query, top_k=k, expr=expr)
+
+        if not candidates and self._keyword_fallback:
+            candidates = self.vector_store.keyword_search(query, top_k=k, expr=expr)
+            if candidates:
+                _logger.info(f"边界1降级：向量无结果，关键词检索补充命中 {len(candidates)} 条")
+
         if not candidates:
             _logger.warning(f"RAG无结果，触发兜底（边界1）: query='{query[:50]}'")
             return []
+
+        if self._recency_boost:
+            self._apply_recency_boost(candidates)
+
         reranked = self.reranker.rerank(query, candidates, top_k=self._rerank_top_k)
         return reranked if reranked else []
+
+    @staticmethod
+    def _apply_recency_boost(candidates: list) -> None:
+        """边界5：按文档更新时间加权，30天内 +0.05、90天内 +0.02，避免旧版文档压过新版。"""
+        now = datetime.now()
+        for c in candidates:
+            try:
+                days = (now - datetime.strptime(c.get("updated_at", ""), "%Y-%m-%d %H:%M:%S")).days
+            except Exception:
+                continue
+            bonus = 0.05 if days <= 30 else (0.02 if days <= 90 else 0.0)
+            if bonus:
+                c["score"] = round(c.get("score", 0.0) + bonus, 4)
 
     def build_context(self, query: str, top_k: Optional[int] = None, expr: Optional[str] = None) -> str:
         """

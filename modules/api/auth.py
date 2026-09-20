@@ -68,8 +68,7 @@ class AuthManager:
             边界9.5 的会话权限管控。
         """
         try:
-            state = pg_manager.get_session_state(session_id, user_id)
-            return True
+            return bool(pg_manager.get_session_state(session_id, user_id))
         except Exception:
             return False
 

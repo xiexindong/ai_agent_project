@@ -4,7 +4,7 @@ Milvus 向量存储模块
 静态知识库向量库：文档向量化、入库、相似度召回。
 覆盖边界1（RAG无结果降级）、边界5（知识库过期管理）。
 """
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 from modules.common.logger import get_logger
 from modules.common.exceptions import RAGException, handle_exception
@@ -166,6 +166,41 @@ class MilvusVectorStore:
             f"向量召回: query='{query[:30]}...' | 命中={len(hits)}/{k} | "
             f"知识库过滤={'有' if expr else '无'}"
         )
+        return hits
+
+    @handle_exception(default=[], log_msg="Milvus关键词降级检索异常")
+    def keyword_search(self, query: str, top_k: Optional[int] = None, expr: Optional[str] = None) -> list[dict]:
+        """边界1降级通道：向量无结果时，用 Milvus 的 like 表达式做关键词粗召回。
+
+        命中结果的 score 统一置为 threshold，交给下游 reranker 用关键词分重排，
+        避免"降级结果分数为 0 又被阈值过滤掉"的二次丢失。
+        """
+        import re
+        keywords = [
+            w for w in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}", query)
+        ]
+        if not keywords:
+            return []
+        keywords.sort(key=len, reverse=True)
+        keywords = keywords[:3]
+
+        conds = " or ".join(f'content like "%{kw}%"' for kw in keywords)
+        final_expr = f"({conds})" + (f" and {expr}" if expr else "")
+        rows = self._collection.query(
+            expr=final_expr,
+            output_fields=["chunk_id", "doc_id", "content", "source", "file_name", "updated_at"],
+            limit=top_k or self._top_k,
+        )
+        hits = [{
+            "content": r.get("content", ""),
+            "source": r.get("source", ""),
+            "file_name": r.get("file_name", ""),
+            "doc_id": r.get("doc_id", ""),
+            "updated_at": r.get("updated_at", ""),
+            "score": self._threshold,
+            "recall_type": "keyword",
+        } for r in rows]
+        _logger.info(f"关键词降级召回: 关键词={keywords} | 命中={len(hits)}")
         return hits
 
     def _search_once(self, query_vec: list, k: int, expr: str, output_fields: list):

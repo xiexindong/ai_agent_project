@@ -727,6 +727,60 @@ class PGManager:
             for r in self._cur.fetchall()
         ]
 
+    @handle_exception(default=False, log_msg="审核处置异常")
+    def update_review_status(
+        self, review_id: int, status: str, reviewer: str, note: str = ""
+    ) -> bool:
+        """人工审核处置：把 pending 置为 approved / rejected，并记录审核人与意见。"""
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """UPDATE review_queue
+               SET status=%s, reviewer=%s, review_note=%s, reviewed_at=CURRENT_TIMESTAMP
+               WHERE id=%s AND status='pending'""",
+            (status, reviewer, note, review_id),
+        )
+        self._conn.commit()
+        return self._cur.rowcount > 0
+
+    @handle_exception(default=None, log_msg="标准答案入库异常")
+    def add_standard_answer(
+        self, question: str, answer: str, source_review_id: int | None = None
+    ) -> int | None:
+        """审核沉淀：把人工修正后的标准答案写入标准答案库，反哺 Few-shot。"""
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """INSERT INTO standard_answers (question, answer, source_review_id)
+               VALUES (%s, %s, %s) RETURNING id""",
+            (question, answer, source_review_id),
+        )
+        new_id = self._cur.fetchone()[0]
+        self._conn.commit()
+        _logger.info(f"标准答案入库: id={new_id} source_review={source_review_id}")
+        return new_id
+
+    @handle_exception(default=[], log_msg="标准答案召回异常")
+    def match_standard_answers(self, query: str, limit: int = 2) -> list:
+        """关键词匹配标准答案库，命中后作为 Few-shot 投喂模型（人工审核沉淀反哺）。
+
+        PG 的 simple 全文配置对中文不分词，故这里用 ILIKE 做关键词粗匹配。
+        """
+        import re
+        kws = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}", query)
+        kws.sort(key=len, reverse=True)
+        kws = kws[:3]
+        if not kws:
+            return []
+        self._reconnect_if_needed()
+        where = " OR ".join(["question ILIKE %s"] * len(kws))
+        self._cur.execute(
+            f"SELECT id, question, answer FROM standard_answers WHERE {where} LIMIT %s",
+            (*[f"%{k}%" for k in kws], limit),
+        )
+        return [
+            {"id": r[0], "question": r[1], "answer": r[2]}
+            for r in self._cur.fetchall()
+        ]
+
     def close(self):
         """关闭连接（合上笔记本、锁门）。
 

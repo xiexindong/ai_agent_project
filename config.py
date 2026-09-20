@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     langsmith_project: str = Field(default="ai-agent-prod", alias="LANGSMITH_PROJECT")
     langchain_tracing_v2: bool = Field(default=False, alias="LANGCHAIN_TRACING_V2")
 
+    llm_timeout_seconds: float = Field(default=30.0, alias="LLM_TIMEOUT_SECONDS")
+    llm_max_attempts: int = Field(default=3, alias="LLM_MAX_ATTEMPTS")
+    fallback_model: str = Field(default="", alias="FALLBACK_MODEL")
+    tool_timeout_seconds: float = Field(default=30.0, alias="TOOL_TIMEOUT_SECONDS")
+
+    rag_keyword_fallback: bool = Field(default=True, alias="RAG_KEYWORD_FALLBACK")
+    rag_recency_boost: bool = Field(default=True, alias="RAG_RECENCY_BOOST")
+    memory_keyword_check: bool = Field(default=True, alias="MEMORY_KEYWORD_CHECK")
+    review_auto_enabled: bool = Field(default=True, alias="REVIEW_AUTO_ENABLED")
+    checkpoint_enabled: bool = Field(default=True, alias="CHECKPOINT_ENABLED")
+
     max_react_iterations: int = Field(default=10, alias="MAX_REACT_ITERATIONS")
     max_history_tokens: int = Field(default=4000, alias="MAX_HISTORY_TOKENS")
     short_memory_rounds: int = Field(default=3, alias="SHORT_MEMORY_ROUNDS")
@@ -80,6 +91,8 @@ class Settings(BaseSettings):
     skill_llm_route_enabled: bool = Field(default=True, alias="SKILL_LLM_ROUTE_ENABLED")
     skill_llm_top_n: int = Field(default=3, alias="SKILL_LLM_TOP_N")
     skill_llm_confidence: float = Field(default=0.5, alias="SKILL_LLM_CONFIDENCE")
+
+    cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
 
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")

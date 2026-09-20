@@ -16,7 +16,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from modules.common.logger import get_logger
-from modules.api.auth import get_current_user, RequirePermission, RequirePerm, UserLevel
+from modules.api.auth import (
+    get_current_user,
+    RequirePermission,
+    RequirePerm,
+    UserLevel,
+    AuthManager,
+)
 from modules.agent.graph import AgentGraph
 from modules.agent.react_agent import ReActAgent
 from modules.agent.llm import LLMClient
@@ -48,6 +54,13 @@ class SessionResponse(BaseModel):
     created_at: str
 
 
+class ReviewRequest(BaseModel):
+    action: str
+    question: str = ""
+    standard_answer: str = ""
+    note: str = ""
+
+
 class AppContext:
     """应用全局上下文（单例组件）。"""
     llm: LLMClient = None
@@ -63,9 +76,10 @@ def create_app() -> FastAPI:
     """创建 FastAPI 应用实例。"""
     app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0")
 
+    origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins or ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -142,7 +156,35 @@ class APIServer:
 
         @app.get("/health")
         async def health():
-            return {"status": "ok", "service": "ai-agent"}
+            """真探活：逐项探测 PG / MySQL / Milvus，核心依赖不可用即 503。
+
+            硬编码返回 ok 的探针是假健康——依赖全挂容器也不会重启，等于没有探针。
+            """
+            checks = {}
+            try:
+                ctx.pg._reconnect_if_needed()
+                ctx.pg._cur.execute("SELECT 1")
+                checks["postgres"] = "ok"
+            except Exception as e:
+                checks["postgres"] = f"down: {e}"
+
+            if get_settings().rbac_enabled:
+                try:
+                    from modules.enterprise.mysql_client import get_mysql_client
+                    get_mysql_client().query_one("SELECT 1")
+                    checks["mysql"] = "ok"
+                except Exception as e:
+                    checks["mysql"] = f"down: {e}"
+            else:
+                checks["mysql"] = "disabled"
+
+            checks["milvus"] = "ok" if ctx.rag else "down: RAG模块未启用"
+
+            degraded = any(v != "ok" and v != "disabled" for v in checks.values())
+            payload = {"status": "degraded" if degraded else "ok", "service": "ai-agent", "checks": checks}
+            if checks["postgres"] != "ok":
+                raise HTTPException(status_code=503, detail=payload)
+            return payload
 
         @app.get("/me")
         async def me(user: dict = Depends(get_current_user)):
@@ -213,10 +255,15 @@ class APIServer:
 
             if is_new_session:
                 ctx.pg.create_session(session_id, user_id, title=req.query[:50])
-            elif not ctx.pg.get_session_state(session_id, user_id):
+            elif not AuthManager.check_session_owner(user_id, session_id, ctx.pg):
                 raise HTTPException(status_code=403, detail="无权访问该会话")
 
             ctx.tool_registry.reset_session(session_id)
+            ctx.llm.set_usage_context(
+                user_code=user_id,
+                dept_code=user.get("dept_code", ""),
+                session_id=session_id,
+            )
 
             def sse_event(event: str, data: dict) -> str:
                 """按 SSE 协议拼一个事件帧：event/data 两行，事件间以空行分隔。"""
@@ -271,6 +318,8 @@ class APIServer:
             user: dict = Depends(get_current_user),
         ):
             """获取会话历史（会话隔离）。"""
+            if not AuthManager.check_session_owner(user["user_id"], session_id, ctx.pg):
+                raise HTTPException(status_code=403, detail="无权访问该会话")
             rows = ctx.pg.get_short_term_history(session_id, user["user_id"], limit)
             return {"session_id": session_id, "history": rows}
 
@@ -321,6 +370,27 @@ class APIServer:
         ):
             """待人工审核列表（管理员权限）。"""
             return {"reviews": ctx.pg.get_pending_reviews()}
+
+        @app.post("/reviews/{review_id}/review")
+        async def submit_review(
+            review_id: int,
+            req: ReviewRequest,
+            user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
+        ):
+            """人工审核处置：approved / rejected，审核通过的标准答案反哺标准答案库（Few-shot 来源）。"""
+            if req.action not in ("approved", "rejected"):
+                raise HTTPException(status_code=400, detail="action 只能是 approved 或 rejected")
+            if not ctx.pg.update_review_status(review_id, req.action, user["user_id"], req.note):
+                raise HTTPException(status_code=404, detail="待审核项不存在或已处理")
+
+            answer_id = None
+            if req.action == "approved" and req.standard_answer.strip():
+                answer_id = ctx.pg.add_standard_answer(
+                    question=req.question.strip(),
+                    answer=req.standard_answer.strip(),
+                    source_review_id=review_id,
+                )
+            return {"review_id": review_id, "action": req.action, "standard_answer_id": answer_id}
 
     def run(self):
         """启动 API 服务。"""

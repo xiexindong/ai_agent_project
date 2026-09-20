@@ -128,6 +128,7 @@ class ReActAgent:
                 state.long_term_memory = mem_ctx["long_term_memory"]
                 state.short_term_memory = mem_ctx["short_term_memory"]
                 state.memory_compressed = mem_ctx["compressed"]
+                state.memory_low_confidence = mem_ctx.get("low_confidence", False)
                 state.summary_embedding = query_emb
             except Exception as e:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
@@ -144,6 +145,21 @@ class ReActAgent:
             except Exception as e:
                 _logger.warning(f"RAG召回异常降级: {e}")
                 state.rag_context = ""
+
+        if self.memory and self.memory.pg:
+            try:
+                stds = self.memory.pg.match_standard_answers(clean_query, limit=2)
+                if stds:
+                    std_text = "\n".join(
+                        f"【标准答案{i + 1}】问：{s['question']}\n答：{s['answer']}"
+                        for i, s in enumerate(stds)
+                    )
+                    state.rag_context = (
+                        f"【人工审核确认的标准答案（优先采信）】\n{std_text}\n\n{state.rag_context}"
+                    )
+                    _logger.info(f"标准答案库命中 {len(stds)} 条，已注入 Few-shot")
+            except Exception as e:
+                _logger.debug(f"标准答案匹配失败: {e}")
 
         return state
 
@@ -325,6 +341,23 @@ class ReActAgent:
         arguments = action.get("arguments", {})
 
         _logger.info(f"工具调用: {tool_name} | args={arguments}")
+
+        if not isinstance(arguments, dict) or not arguments:
+            """边界2兜底：JSON 修复后仍无有效参数时不再硬调工具，改为向用户追问缺失参数。"""
+            _logger.warning(f"工具 {tool_name} 参数缺失，触发需求澄清（边界2）")
+            state.tool_call_logs.append({
+                "name": tool_name,
+                "arguments": arguments if isinstance(arguments, dict) else {},
+                "result": "参数缺失，已中断调用并向用户追问",
+                "success": False,
+                "duration_ms": 0,
+            })
+            state.observation = (
+                f"工具 {tool_name} 缺少必要参数，本轮不执行。"
+                "请直接向用户追问缺失的参数，不要用猜测的默认值调用。"
+            )
+            state.action = {}
+            return state
 
         if not self.tool_registry:
             state.observation = "工具注册器未初始化，无法调用工具"
