@@ -33,6 +33,10 @@
     # 前端预览（不依赖数据库，全 Mock 数据）
     python main.py web-demo
 
+    # 离职数据处置（跨库对账：MySQL 离职名单 → PG 会话归档/清理）
+    python main.py offboard
+    python main.py offboard --apply
+
 环境要求：
     1. PostgreSQL + pgvector（docker run） — 存对话记忆与业务表
     2. Milvus（docker standalone）          — 存知识库文档向量
@@ -221,6 +225,42 @@ def cmd_stats(args):
         _logger.error(f"RAG不可用: {e}")
 
 
+def cmd_offboard(args):
+    """离职数据处置：默认只预览，加 --apply 才真正归档与清理。"""
+    import json
+    from modules.enterprise import lifecycle
+
+    if not args.apply:
+        print(json.dumps(lifecycle.preview(args.tenant), ensure_ascii=False, indent=2))
+        print("\n以上为预览，加 --apply 才会真正归档与清理。")
+        return
+    print(json.dumps(
+        lifecycle.run_once(args.days or None, args.tenant), ensure_ascii=False, indent=2
+    ))
+
+
+def cmd_reconcile(args):
+    """跨库对账：按 task_id 比对 MySQL 与 PG，列出单边缺失的号。"""
+    import json
+    from modules.enterprise.reconcile import reconcile
+
+    print(json.dumps(reconcile(args.hours), ensure_ascii=False, indent=2))
+
+
+def cmd_archive(args):
+    """冷热分离：超期会话导出归档文件（--apply 才从 PG 删除）。"""
+    import json
+    from modules.memory.archiver import archive_session, archive_expired
+
+    if args.session:
+        print(archive_session(args.session) or "（该会话没有可归档数据）")
+        return
+    if not args.apply:
+        print("归档后会删除 PG 数据，加 --apply 才执行；先不加 --apply 确认范围。")
+        return
+    print(json.dumps(archive_expired(args.days or 0), ensure_ascii=False, indent=2))
+
+
 def cmd_mcp_server(args):
     """
     独立启动 MCP Server。
@@ -307,6 +347,26 @@ def main():
 
     p_skills.add_argument("--query", "-q", default="", help="输入一句提问，测试技能意图匹配")
 
+    p_offboard = sub.add_parser("offboard", help="离职数据处置（默认预览，--apply 执行）")
+
+    p_offboard.add_argument("--apply", action="store_true", help="真正执行归档与清理")
+
+    p_offboard.add_argument("--days", type=int, default=0, help="保留天数，默认取 DATA_RETENTION_DAYS")
+
+    p_offboard.add_argument("--tenant", default="", help="租户编码，留空表示全部租户")
+
+    p_reconcile = sub.add_parser("reconcile", help="跨库对账（按 task_id 比对两库）")
+
+    p_reconcile.add_argument("--hours", type=int, default=24, help="回看时间窗（小时）")
+
+    p_archive = sub.add_parser("archive", help="冷热分离：超期会话导出归档文件")
+
+    p_archive.add_argument("--apply", action="store_true", help="导出后从 PG 删除")
+
+    p_archive.add_argument("--days", type=int, default=0, help="保留天数，默认取 SESSION_HOT_DAYS")
+
+    p_archive.add_argument("--session", default="", help="只导出这一个会话，不删库")
+
 
     args = parser.parse_args()
 
@@ -318,6 +378,9 @@ def main():
         "mcp-server": cmd_mcp_server,
         "web-demo": cmd_web_demo,
         "skills": cmd_skills,
+        "offboard": cmd_offboard,
+        "reconcile": cmd_reconcile,
+        "archive": cmd_archive,
     }
 
     if args.command in commands:

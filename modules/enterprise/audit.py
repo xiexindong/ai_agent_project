@@ -16,13 +16,19 @@
 import json
 from typing import Optional
 from modules.common.logger import get_logger
-from modules.enterprise.mysql_client import get_mysql_client
+from modules.common import context as req_ctx
+from modules.enterprise.mysql_client import get_mysql_client, get_mysql_ro_client
 
 _logger = get_logger("audit")
 
 
 def _client():
     return get_mysql_client()
+
+
+def _ro_client():
+    """只读连接：账单与对账这类纯查询走它，代码层禁止写语句。"""
+    return get_mysql_ro_client()
 
 
 def log_audit(
@@ -34,12 +40,21 @@ def log_audit(
     detail: Optional[dict] = None,
     ip: str = "",
     tenant_id: Optional[int] = None,
+    session_id: str = "",
+    task_id: str = "",
 ):
-    """写一条审计日志；失败只告警。"""
+    """写一条审计日志；失败只告警。
+
+    session_id / task_id 是跨库串联键：MySQL 审计与 PG 的 chat_history、
+    tool_call_log 靠它们对齐同一次会话，否则排障只能按 user_code + 时间范围
+    模糊匹配。两者都可由请求上下文自动补齐，调用方不用层层透传。
+    """
+    session_id = session_id or req_ctx.get_session_id()
+    task_id = task_id or req_ctx.get_task_id()
     try:
         _client().execute(
-            "INSERT INTO sys_audit_log (tenant_id, user_code, dept_code, action, resource, result, detail, ip) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO sys_audit_log (tenant_id, user_code, dept_code, action, resource, result, detail, ip, session_id, task_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 tenant_id,
                 user_code or "anonymous",
@@ -49,6 +64,8 @@ def log_audit(
                 result,
                 json.dumps(detail, ensure_ascii=False) if detail else None,
                 ip,
+                session_id,
+                task_id,
             ),
         )
     except Exception as e:
@@ -65,17 +82,21 @@ def log_llm_usage(
     latency_ms: int = 0,
     dept_code: str = "",
     session_id: str = "",
+    task_id: str = "",
 ):
     """记录一次 LLM 调用的 token 消耗，用于部门账单与预算控制。"""
+    session_id = session_id or req_ctx.get_session_id()
+    task_id = task_id or req_ctx.get_task_id()
     try:
         _client().execute(
-            "INSERT INTO sys_llm_usage (user_code, dept_code, session_id, model, "
+            "INSERT INTO sys_llm_usage (user_code, dept_code, session_id, task_id, model, "
             "prompt_tokens, completion_tokens, total_tokens, latency_ms) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 user_code or "anonymous",
                 dept_code,
                 session_id,
+                task_id,
                 model,
                 prompt_tokens,
                 completion_tokens,
@@ -87,10 +108,28 @@ def log_llm_usage(
         _logger.warning(f"用量写入失败: {e}")
 
 
+def list_task_ids_since(hours: int = 24, limit: int = 5000) -> list:
+    """取最近 N 小时落过库的 task_id（审计 ∪ 用量），供跨库对账比对。
+
+    输入 hours=24 → 输出 ["T-20260920-3f9c1a2b", "T-20260920-91ad44e0", ...]
+    没配 MySQL 时抛异常，由 reconcile 上层决定是告警还是跳过。
+    """
+    rows = _ro_client().query_all(
+        "SELECT task_id FROM sys_audit_log "
+        "WHERE task_id <> '' AND created_at >= NOW() - INTERVAL %s HOUR "
+        "UNION "
+        "SELECT task_id FROM sys_llm_usage "
+        "WHERE task_id <> '' AND created_at >= NOW() - INTERVAL %s HOUR "
+        "LIMIT %s",
+        (int(hours), int(hours), int(limit)),
+    )
+    return [r["task_id"] for r in rows if r.get("task_id")]
+
+
 def dept_token_bill(dept_code: str) -> Optional[dict]:
     """按部门汇总 token 消耗（管理员账单接口的数据源）。"""
     try:
-        row = _client().query_one(
+        row = _ro_client().query_one(
             "SELECT COUNT(*) AS calls, SUM(total_tokens) AS tokens "
             "FROM sys_llm_usage WHERE dept_code=%s",
             (dept_code,),

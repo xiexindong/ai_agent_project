@@ -1,0 +1,16 @@
+# ====================================================================
+# 可选依赖（加分项）：默认不随主依赖安装
+# 安装：pip install -r requirements-extras.txt
+# 不装的后果：RAG_BACKEND=llamaindex / MULTIAGENT_BACKEND=crewai 会自动降级
+#             为自研实现，主流程完全不受影响（适配层已做 import 保护）。
+# ====================================================================
+
+# ---- llama-index：文档 RAG / 知识库检索（可选后端）----
+# 注意：0.10 之后包结构改为 llama_index.core，代码里已按新 API 编写，
+#       老版本（<0.10）走不到，会由适配层报"版本过旧"并降级。
+llama-index-core>=0.12.0
+
+# ---- crewai：多角色多 Agent 编排（可选后端）----
+# 注意：crewai 通过 litellm 调模型，不吃本项目自研的 LLMClient，
+#       需要另配模型环境变量（如 OPENAI_API_KEY 或 litellm 识别的 DEEPSEEK 形式）。
+crewai>=1.0.0

@@ -135,9 +135,13 @@ CREATE TABLE IF NOT EXISTS sys_audit_log (
     result     VARCHAR(16)  NOT NULL COMMENT 'allow / deny / error',
     detail     JSON         NULL COMMENT '入参、命中的权限、拒绝原因等',
     ip         VARCHAR(64)  DEFAULT '',
+    session_id VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '会话ID，跨库串联 PG 的 chat_history/tool_call_log',
+    task_id    VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '业务流水号，一轮对话的唯一号，跨库对账主键',
     created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_user_time (user_code, created_at),
-    KEY idx_action (action, created_at)
+    KEY idx_action (action, created_at),
+    KEY idx_session (session_id),
+    KEY idx_task (task_id)
 ) ENGINE=InnoDB COMMENT='审计日志表';
 
 -- 10. LLM 用量（成本按人/部门归集，预算控制的数据源）
@@ -146,6 +150,7 @@ CREATE TABLE IF NOT EXISTS sys_llm_usage (
     user_code         VARCHAR(64) NOT NULL,
     dept_code         VARCHAR(64) DEFAULT '',
     session_id        VARCHAR(64) DEFAULT '',
+    task_id           VARCHAR(64) DEFAULT '' COMMENT '业务流水号，与审计表/PG同轮对话同一个号',
     model             VARCHAR(64) NOT NULL,
     prompt_tokens     INT         NOT NULL DEFAULT 0,
     completion_tokens INT         NOT NULL DEFAULT 0,
@@ -155,6 +160,68 @@ CREATE TABLE IF NOT EXISTS sys_llm_usage (
     KEY idx_dept_time (dept_code, created_at),
     KEY idx_user_time (user_code, created_at)
 ) ENGINE=InnoDB COMMENT='LLM 用量表';
+
+-- ==========================================================================
+-- 老库升级：已存在的库不会重跑 CREATE TABLE，用 information_schema 判断后
+-- 动态补列/补索引（MySQL 没有 ADD COLUMN IF NOT EXISTS，只能走 PREPARE）
+-- 可重复执行
+-- ==========================================================================
+SET @col_exist := (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_audit_log' AND COLUMN_NAME = 'session_id'
+);
+SET @sql := IF(@col_exist = 0,
+    'ALTER TABLE sys_audit_log ADD COLUMN session_id VARCHAR(64) NOT NULL DEFAULT '''' AFTER ip',
+    'DO 0');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @idx_exist := (
+    SELECT COUNT(*) FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_audit_log' AND INDEX_NAME = 'idx_session'
+);
+SET @sql2 := IF(@idx_exist = 0,
+    'CREATE INDEX idx_session ON sys_audit_log (session_id)',
+    'DO 0');
+PREPARE stmt2 FROM @sql2;
+EXECUTE stmt2;
+DEALLOCATE PREPARE stmt2;
+
+-- sys_audit_log 补 task_id 列 + 索引
+SET @col_exist := (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_audit_log' AND COLUMN_NAME = 'task_id'
+);
+SET @sql := IF(@col_exist = 0,
+    'ALTER TABLE sys_audit_log ADD COLUMN task_id VARCHAR(64) NOT NULL DEFAULT '''' AFTER session_id',
+    'DO 0');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @idx_exist := (
+    SELECT COUNT(*) FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_audit_log' AND INDEX_NAME = 'idx_task'
+);
+SET @sql2 := IF(@idx_exist = 0,
+    'CREATE INDEX idx_task ON sys_audit_log (task_id)',
+    'DO 0');
+PREPARE stmt2 FROM @sql2;
+EXECUTE stmt2;
+DEALLOCATE PREPARE stmt2;
+
+-- sys_llm_usage 补 task_id 列
+SET @col_exist := (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_llm_usage' AND COLUMN_NAME = 'task_id'
+);
+SET @sql := IF(@col_exist = 0,
+    'ALTER TABLE sys_llm_usage ADD COLUMN task_id VARCHAR(64) NOT NULL DEFAULT '''' AFTER session_id',
+    'DO 0');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- ==========================================================================
 -- 演示数据：1 个租户 / 4 个部门 / 8 个用户 / 6 个角色
@@ -284,3 +351,25 @@ INSERT IGNORE INTO sys_api_key (user_id, key_hash, key_name, status, expires_at)
 --   部门账单：SELECT dept_code, SUM(total_tokens) FROM sys_llm_usage GROUP BY dept_code;
 --   越权审计：SELECT * FROM sys_audit_log WHERE result='deny' ORDER BY id DESC LIMIT 50;
 -- ==========================================================================
+
+-- ==========================================================================
+-- AI 只读账号（大厂做法：AI 服务对业务库只有 SELECT，没有写权限）
+--   代码侧已用 MySQLClient(read_only=True) 拦了一道（只放行 SELECT/SHOW/EXPLAIN），
+--   这里是数据库侧的最后一道防线，两层都要有：
+--     只靠 GRANT  → 本地/测试环境常图省事用同一个高权限账号，等于没拦
+--     只靠代码   → 换个人改代码、换个 SDK 就绕过去了
+--   按需取消注释执行，密码按实际环境改；审计与用量表要写，所以不给 ai_ro，
+--   那两处走主账号（MYSQL_USER）。
+-- ==========================================================================
+-- CREATE USER 'ai_ro'@'%' IDENTIFIED BY '换成强密码';
+-- GRANT SELECT ON ai_agent_enterprise.sys_tenant  TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_dept    TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_user    TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_api_key TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_role    TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_user_role       TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_permission      TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_role_permission TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_kb             TO 'ai_ro'@'%';
+-- GRANT SELECT ON ai_agent_enterprise.sys_kb_grant       TO 'ai_ro'@'%';
+-- FLUSH PRIVILEGES;

@@ -92,6 +92,44 @@ class Settings(BaseSettings):
     skill_llm_top_n: int = Field(default=3, alias="SKILL_LLM_TOP_N")
     skill_llm_confidence: float = Field(default=0.5, alias="SKILL_LLM_CONFIDENCE")
 
+    mysql_readonly_user: str = Field(default="", alias="MYSQL_READONLY_USER")
+    mysql_readonly_password: str = Field(default="", alias="MYSQL_READONLY_PASSWORD")
+    rbac_fail_closed: bool = Field(default=True, alias="RBAC_FAIL_CLOSED")
+    reconcile_interval_hours: int = Field(default=24, alias="RECONCILE_INTERVAL_HOURS")
+    session_hot_days: int = Field(default=90, alias="SESSION_HOT_DAYS")
+    archive_enabled: bool = Field(default=True, alias="ARCHIVE_ENABLED")
+    archive_dir: str = Field(default="archives", alias="ARCHIVE_DIR")
+    data_retention_days: int = Field(default=180, alias="DATA_RETENTION_DAYS")
+    offboard_archive_enabled: bool = Field(default=True, alias="OFFBOARD_ARCHIVE_ENABLED")
+
+    # ---- 多模态（Vision 视觉模型）----
+    vision_enabled: bool = Field(default=False, alias="VISION_ENABLED")
+    vision_base_url: str = Field(default="https://api.openai.com/v1", alias="VISION_BASE_URL")
+    vision_api_key: str = Field(default="", alias="VISION_API_KEY")
+    vision_model: str = Field(default="gpt-4o-mini", alias="VISION_MODEL")
+    vision_temperature: float = Field(default=0.2, alias="VISION_TEMPERATURE")
+    vision_max_tokens: int = Field(default=2048, alias="VISION_MAX_TOKENS")
+    vision_timeout_seconds: float = Field(default=60.0, alias="VISION_TIMEOUT_SECONDS")
+    vision_max_image_mb: int = Field(default=5, alias="VISION_MAX_IMAGE_MB")
+    vision_max_images: int = Field(default=4, alias="VISION_MAX_IMAGES")
+    vision_max_file_chars: int = Field(default=8000, alias="VISION_MAX_FILE_CHARS")
+
+    # ---- 多 Agent 团队 ----
+    multiagent_enabled: bool = Field(default=True, alias="MULTIAGENT_ENABLED")
+    multiagent_max_workers: int = Field(default=4, alias="MULTIAGENT_MAX_WORKERS")
+    multiagent_max_steps: int = Field(default=3, alias="MULTIAGENT_MAX_STEPS")
+    multiagent_max_total_steps: int = Field(default=30, alias="MULTIAGENT_MAX_TOTAL_STEPS")
+    multiagent_timeout_seconds: float = Field(default=120.0, alias="MULTIAGENT_TIMEOUT_SECONDS")
+    multiagent_review_enabled: bool = Field(default=True, alias="MULTIAGENT_REVIEW_ENABLED")
+
+    # ---- 可选框架桥接（未安装也照常跑，装了按开关切换）----
+    # 两个后端都不设为默认：llama-index 用独立索引（切过去旧知识库就空了），
+    # crewai 走自己的 litellm 模型配置（与 DEEPSEEK_API_KEY 不是一套）。
+    # 后端切换属于数据/模型迁移级别的操作，必须显式配置，不能靠默认值悄悄发生。
+    rag_backend: str = Field(default="native", alias="RAG_BACKEND")                 # native|llamaindex
+    multiagent_backend: str = Field(default="native", alias="MULTIAGENT_BACKEND")   # native|crewai
+    llamaindex_persist_dir: str = Field(default="storage/llamaindex", alias="LLAMAINDEX_PERSIST_DIR")
+
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
 
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")

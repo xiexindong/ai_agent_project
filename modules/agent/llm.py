@@ -92,21 +92,46 @@ class LLMClient:
             except Exception as e:
                 raise LLMException("LLM客户端初始化失败", str(e))
 
-    def set_usage_context(self, user_code: str = "", dept_code: str = "", session_id: str = ""):
-        """设置本次调用的归属上下文，供 token 用量按人/部门归集。"""
+    def set_usage_context(
+        self,
+        user_code: str = "",
+        dept_code: str = "",
+        session_id: str = "",
+        task_id: str = "",
+    ):
+        """设置本次调用的归属上下文，供 token 用量按人/部门归集。
+
+        task_id 是跨库对账的主键：PG 的 chat_history 与 MySQL 的 sys_llm_usage
+        靠它指向同一轮对话，缺省时从请求上下文（modules.common.context）取。
+        """
         self.usage_context = {
             "user_code": user_code,
             "dept_code": dept_code,
             "session_id": session_id,
+            "task_id": task_id,
         }
 
     def _chat(self, **kwargs):
         """统一出口：超时 + 备用模型降级 + token 用量的落库入口。"""
         s = get_settings()
         started = time.time()
+        # ------------------------------------------------------------------
+        # 【model 必须由这里兜底传入】
+        #   上层三个 invoke* 方法都只传 messages/temperature，没人传 model，
+        #   OpenAI SDK 新版会在入口强校验并抛：
+        #     Missing required arguments; Expected either ('messages' and 'model')...
+        #
+        # 【不这么写会怎样】
+        #   每次调用都失败 → tenacity 重试耗尽（默认 3 次、指数退避 1~8 秒）
+        #   → 单次对话耗时被拉到 3~4 秒且答案为空。接口仍返回 200，
+        #     所以只看 HTTP 状态码的压测会显示"全部成功"，是最难发现的静默故障。
+        #
+        # 【为什么用 setdefault】上面的降级分支会显式传 model=备用模型，
+        #   不能覆盖它，只在没指定时才填主模型。
+        # ------------------------------------------------------------------
+        kwargs.setdefault("model", self._model)
         try:
-            resp = self._chat( timeout=s.llm_timeout_seconds, **kwargs
-            )
+            resp = self._client.chat.completions.create(timeout=s.llm_timeout_seconds, **kwargs)
         except Exception as e:
             fb = s.fallback_model
             if not fb or fb == self._model:
@@ -124,6 +149,7 @@ class LLMClient:
             return
         try:
             from modules.enterprise.audit import log_llm_usage
+            from modules.common import context as req_ctx
             ctx = getattr(self, "usage_context", {}) or {}
             log_llm_usage(
                 user_code=ctx.get("user_code", ""),
@@ -133,6 +159,7 @@ class LLMClient:
                 latency_ms=latency_ms,
                 dept_code=ctx.get("dept_code", ""),
                 session_id=ctx.get("session_id", ""),
+                task_id=ctx.get("task_id", "") or req_ctx.get_task_id(),
             )
         except Exception as e:
             _logger.debug(f"用量上报失败: {e}")

@@ -16,10 +16,15 @@ CREATE TABLE IF NOT EXISTS chat_session (
     title        VARCHAR(256) DEFAULT '',
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    archived     SMALLINT DEFAULT 0,       -- 0正常 1已归档（离职员工数据保留期计时中）
     agent_state  JSONB DEFAULT '{}'::jsonb  -- Agent任务状态、待办、已完成任务、关键结果
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_user ON chat_session (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_archived ON chat_session (archived, updated_at DESC);
+
+-- 【老库升级】已存在的库不会重跑 CREATE TABLE，需幂等补列
+ALTER TABLE chat_session ADD COLUMN IF NOT EXISTS archived SMALLINT DEFAULT 0;
 
 -- ====================================================================
 -- 2. 对话记忆表 chat_history（核心向量记忆表）
@@ -29,6 +34,7 @@ CREATE TABLE IF NOT EXISTS chat_history (
     id                 BIGSERIAL PRIMARY KEY,
     session_id         VARCHAR(64) NOT NULL REFERENCES chat_session(session_id) ON DELETE CASCADE,
     user_id            VARCHAR(64) NOT NULL,
+    task_id            VARCHAR(64) DEFAULT '',                -- 业务流水号（跨库串联 MySQL 审计/用量）
     user_query         TEXT NOT NULL,
     llm_full_answer    TEXT,                              -- 完整详细答案（溯源）
     llm_summary        TEXT,                               -- 精简摘要（上下文投喂）
@@ -65,6 +71,10 @@ WITH (lists = 100);
 -- 【老库升级】如果 chat_history 表在本次改动前已存在，上面的 CREATE TABLE 不会生效，
 -- 需对已有库手工补一列（幂等，可重复执行）：
 ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS query_embedding vector(1024);
+ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
+
+-- 按 task_id 反查"这一轮对话"：跨库对账与排障的入口索引
+CREATE INDEX IF NOT EXISTS idx_history_task ON chat_history (task_id);
 
 -- 会话+用户联合索引（多用户隔离查询加速）
 CREATE INDEX IF NOT EXISTS idx_history_session_user
@@ -77,6 +87,7 @@ CREATE TABLE IF NOT EXISTS tool_call_log (
     id           BIGSERIAL PRIMARY KEY,
     session_id   VARCHAR(64),
     user_id      VARCHAR(64),
+    task_id      VARCHAR(64) DEFAULT '',                  -- 与 chat_history 同一轮的业务流水号
     tool_name    VARCHAR(128) NOT NULL,
     tool_type    VARCHAR(32) DEFAULT 'local',             -- local / mcp
     tool_input   JSONB,
@@ -88,6 +99,10 @@ CREATE TABLE IF NOT EXISTS tool_call_log (
 
 CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_call_log (session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_log_user ON tool_call_log (user_id, created_at DESC);
+
+-- 【老库升级】tool_call_log 补 task_id 列（幂等）
+ALTER TABLE tool_call_log ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_tool_log_task ON tool_call_log (task_id);
 
 -- ====================================================================
 -- 4. 人工审核队列表 review_queue（人机协同治理）

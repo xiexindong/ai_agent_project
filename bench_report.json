@@ -1,0 +1,25 @@
+{
+  "url": "http://127.0.0.1:8000/chat",
+  "requests": 28,
+  "concurrency": 7,
+  "success": 28,
+  "throttled_429": 0,
+  "failed": 0,
+  "error_rate": 0.0,
+  "wall_seconds": 37.26,
+  "qps": 0.75,
+  "latency_ms": {
+    "avg": 7516.1,
+    "p50": 7071,
+    "p90": 10137,
+    "p95": 13703,
+    "p99": 14161,
+    "max": 14161
+  },
+  "ttfb_ms": {
+    "p50": 13,
+    "p95": 173
+  },
+  "biz_failed": 0,
+  "errors_sample": []
+}

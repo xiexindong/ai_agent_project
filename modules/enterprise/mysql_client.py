@@ -12,6 +12,13 @@ MySQL 访问层
     query_one  查单行 → dict | None
     execute    写操作 → 影响行数
 
+【两种连接：读写 / 只读】
+    get_mysql_client()    读写，只给审计与用量落库用
+    get_mysql_ro_client() 只读，权限/知识库授权/账单/对账查询用它，
+                          并且代码层只放行 SELECT/SHOW/EXPLAIN（见 _guard）。
+    对应大厂的"AI 只读账号访问业务库"：数据库 GRANT 是底线，
+    代码层闸门保证换环境（用同一个高权限账号自测）时也不会失效。
+
 【降级设计】
     所有方法在连接不可用时 raise，由上层（RBACService / audit）决定是否降级，
     本层不做静默吞异常——静默吞会让"权限系统挂了"伪装成"没权限"，非常危险。
@@ -26,13 +33,17 @@ _logger = get_logger("mysql")
 class MySQLClient:
     """带自动重连的 MySQL 客户端（单例使用，见 get_mysql_client）。"""
 
-    def __init__(self):
+    def __init__(self, read_only: bool = False):
         s = get_settings()
+        self._read_only = read_only
+        user, password = s.mysql_user, s.mysql_password
+        if read_only and s.mysql_readonly_user:
+            user, password = s.mysql_readonly_user, s.mysql_readonly_password
         self._conn_args = dict(
             host=s.mysql_host,
             port=s.mysql_port,
-            user=s.mysql_user,
-            password=s.mysql_password,
+            user=user,
+            password=password,
             database=s.mysql_database,
             charset="utf8mb4",
             autocommit=True,
@@ -71,19 +82,43 @@ class MySQLClient:
             return False
 
 
+    _READ_OK = ("SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN")
+
+    def _guard(self, sql: str) -> None:
+        """只读闸门：只放行 SELECT/SHOW/EXPLAIN，其余一律拒绝（代码层兜底）。
+
+        【为什么要代码层再拦一道】
+            数据库账号的 GRANT 是最后一道防线，但本地/测试环境常常图省事用同一个
+            高权限账号，GRANT 形同虚设。代码层拦一道，换环境也不会失效。
+
+        【输入 → 输出对照】
+            _guard("SELECT * FROM sys_user")        → 放行（不抛）
+            _guard("INSERT INTO sys_user ...")      → PermissionError: 只读账号禁止执行 INSERT 语句
+            _guard("UPDATE sys_user SET status=0")  → PermissionError: 只读账号禁止执行 UPDATE 语句
+        """
+        if not self._read_only:
+            return
+        stripped = sql.strip()
+        head = stripped.lstrip("(").split()[0].upper() if stripped else ""
+        if head not in self._READ_OK:
+            raise PermissionError(f"只读账号禁止执行 {head or '空'} 语句: {stripped[:60]}")
+
     def query_all(self, sql: str, args: tuple = ()) -> list:
+        self._guard(sql)
         conn = self._get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, args)
             return cur.fetchall()
 
     def query_one(self, sql: str, args: tuple = ()) -> Optional[dict]:
+        self._guard(sql)
         conn = self._get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, args)
             return cur.fetchone()
 
     def execute(self, sql: str, args: tuple = ()) -> int:
+        self._guard(sql)
         conn = self._get_conn()
         with conn.cursor() as cur:
             return cur.execute(sql, args)
@@ -98,11 +133,24 @@ class MySQLClient:
 
 
 _client: Optional[MySQLClient] = None
+_ro_client: Optional[MySQLClient] = None
 
 
 def get_mysql_client() -> MySQLClient:
-    """全局单例客户端（懒连接，未用到就不建连接）。"""
+    """全局读写单例（懒连接，未用到就不建连接）：审计与用量落库走它。"""
     global _client
     if _client is None:
         _client = MySQLClient()
     return _client
+
+
+def get_mysql_ro_client() -> MySQLClient:
+    """全局只读单例：权限、知识库授权、账单与对账查询一律走它。
+
+    AI 服务读业务数据（用户/角色/权限/知识库授权）只应该 SELECT，
+    用只读客户端 + 代码层闸门，等价于"AI 只能看不能改业务库"。
+    """
+    global _ro_client
+    if _ro_client is None:
+        _ro_client = MySQLClient(read_only=True)
+    return _ro_client

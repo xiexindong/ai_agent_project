@@ -187,14 +187,23 @@ class PGManager:
                 title        VARCHAR(256) DEFAULT '',
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived     SMALLINT DEFAULT 0,
                 agent_state  JSONB DEFAULT '{{}}'::jsonb
             );
+            """,
+            """
+            ALTER TABLE chat_session ADD COLUMN IF NOT EXISTS archived SMALLINT DEFAULT 0;
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_archived
+            ON chat_session (archived, updated_at DESC);
             """,
             f"""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id                 BIGSERIAL PRIMARY KEY,
                 session_id         VARCHAR(64) NOT NULL REFERENCES chat_session(session_id) ON DELETE CASCADE,
                 user_id            VARCHAR(64) NOT NULL,
+                task_id            VARCHAR(64) DEFAULT '',
                 user_query         TEXT NOT NULL,
                 llm_full_answer    TEXT,
                 llm_summary        TEXT,
@@ -223,11 +232,18 @@ class PGManager:
             CREATE INDEX IF NOT EXISTS idx_history_session_user
             ON chat_history (session_id, user_id, created_at DESC);
             """,
+            """
+            ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_history_task ON chat_history (task_id);
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS tool_call_log (
                 id           BIGSERIAL PRIMARY KEY,
                 session_id   VARCHAR(64),
                 user_id      VARCHAR(64),
+                task_id      VARCHAR(64) DEFAULT '',
                 tool_name    VARCHAR(128) NOT NULL,
                 tool_type    VARCHAR(32) DEFAULT 'local',
                 tool_input   JSONB,
@@ -236,6 +252,12 @@ class PGManager:
                 duration_ms  INTEGER DEFAULT 0,
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            """,
+            """
+            ALTER TABLE tool_call_log ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_tool_log_task ON tool_call_log (task_id);
             """,
             f"""
             CREATE TABLE IF NOT EXISTS review_queue (
@@ -251,6 +273,19 @@ class PGManager:
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 reviewed_at  TIMESTAMP
             );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS standard_answers (
+                id               BIGSERIAL PRIMARY KEY,
+                question         TEXT NOT NULL,
+                answer           TEXT NOT NULL,
+                source_review_id BIGINT,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_std_answer_question
+            ON standard_answers USING gin (to_tsvector('simple', question));
             """,
         ]
         for sql in ddl:
@@ -369,6 +404,7 @@ class PGManager:
         tool_call_log: list | None = None,
         rag_sources: list | None = None,
         query_embedding: list | None = None,
+        task_id: str = "",
     ) -> int | None:
         """
         保存一轮对话到 chat_history 表（四数据落库）。
@@ -384,6 +420,7 @@ class PGManager:
         【落库前后的数据变化】
             输入参数：
                 session_id="abc123", user_id="cli-user",
+                task_id="T-20260920-3f9c1a2b",   （跨库业务流水号，留空则自动取请求上下文）
                 user_query="3*7 等于多少",
                 llm_full_answer="3*7 等于 21...",   （长文本）
                 llm_summary="数学计算:3*7=21",       （一句话）
@@ -406,13 +443,21 @@ class PGManager:
         import numpy as np
         emb = np.array(summary_embedding, dtype=np.float32) if summary_embedding else None
         q_emb = np.array(query_embedding, dtype=np.float32) if query_embedding else None
+        # ------------------------------------------------------------------
+        # 【task_id 从哪来】显式传了就用显式值，没传就从请求上下文取。
+        #   它是跨库对账的主键：MySQL 的 sys_audit_log / sys_llm_usage 与
+        #   PG 的 chat_history 必须落同一个号，否则定时对账会判定为"单边缺失"。
+        #   取不到就是空串——宁可空着，也不要造一个假号（假号比空号更难查）。
+        # ------------------------------------------------------------------
+        from modules.common import context as req_ctx
+        task_id = task_id or req_ctx.get_task_id()
         self._cur.execute(
             """INSERT INTO chat_history
-               (session_id, user_id, user_query, llm_full_answer, llm_summary,
+               (session_id, user_id, task_id, user_query, llm_full_answer, llm_summary,
                 summary_embedding, query_embedding, tool_call_log, rag_sources)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
             (
-                session_id, user_id, user_query,
+                session_id, user_id, task_id, user_query,
                 llm_full_answer, llm_summary, emb, q_emb,
                 json.dumps(tool_call_log or [], ensure_ascii=False),
                 json.dumps(rag_sources or [], ensure_ascii=False),
@@ -617,6 +662,7 @@ class PGManager:
         tool_name: str, tool_type: str,
         tool_input: dict, tool_output: str,
         status: str, duration_ms: int,
+        task_id: str = "",
     ) -> None:
         """全量记录工具调用入参、出参、耗时、状态（审计依据）。
 
@@ -642,13 +688,15 @@ class PGManager:
             ② 性能优化：duration_ms 能看出哪个工具慢，拖慢整体响应
             ③ 安全审计：谁在什么时间调用了什么，事后可追溯（企业级合规要求）
         """
+        from modules.common import context as req_ctx
+        task_id = task_id or req_ctx.get_task_id()
         self._reconnect_if_needed()
         self._cur.execute(
             """INSERT INTO tool_call_log
-               (session_id, user_id, tool_name, tool_type, tool_input, tool_output, status, duration_ms)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+               (session_id, user_id, task_id, tool_name, tool_type, tool_input, tool_output, status, duration_ms)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
-                session_id, user_id, tool_name, tool_type,
+                session_id, user_id, task_id, tool_name, tool_type,
                 json.dumps(tool_input, ensure_ascii=False),
                 tool_output, status, duration_ms,
             ),
@@ -780,6 +828,167 @@ class PGManager:
             {"id": r[0], "question": r[1], "answer": r[2]}
             for r in self._cur.fetchall()
         ]
+
+    @handle_exception(default={}, log_msg="活跃会话统计异常")
+    def count_active_sessions(self, user_codes: list) -> dict:
+        """统计指定用户未归档的会话数（离职对账用，只读不写）。
+
+        输入 ["U001","U005"] → {"U001": 3, "U005": 0}
+        """
+        if not user_codes:
+            return {}
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """SELECT user_id, COUNT(*) FROM chat_session
+               WHERE user_id = ANY(%s) AND archived = 0 GROUP BY user_id""",
+            (list(user_codes),),
+        )
+        return {r[0]: r[1] for r in self._cur.fetchall()}
+
+    @handle_exception(default=0, log_msg="会话归档异常")
+    def archive_user_sessions(self, user_codes: list) -> int:
+        """把指定用户的会话标记为归档（离职处置第一步，只打标不删数据）。
+
+        输入 user_codes=["U001","U005"] → 返回被标记的会话行数（已归档的不重复计）。
+        """
+        if not user_codes:
+            return 0
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """UPDATE chat_session
+               SET archived = 1, updated_at = CURRENT_TIMESTAMP
+               WHERE user_id = ANY(%s) AND archived = 0""",
+            (list(user_codes),),
+        )
+        n = self._cur.rowcount
+        self._conn.commit()
+        if n:
+            _logger.info(f"会话归档: users={len(user_codes)} sessions={n}")
+        return n
+
+    @handle_exception(default=[], log_msg="归档用户查询异常")
+    def list_archived_users(self, limit: int = 100) -> list:
+        """列出已被归档的用户及其会话数（保留期清理前的对账视图）。"""
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """SELECT user_id, COUNT(*) AS sessions, MAX(updated_at) AS archived_at
+               FROM chat_session WHERE archived = 1
+               GROUP BY user_id ORDER BY archived_at DESC LIMIT %s""",
+            (limit,),
+        )
+        rows = self._cur.fetchall()
+        return [{"user_id": r[0], "sessions": r[1], "archived_at": str(r[2])} for r in rows]
+
+    @handle_exception(default=None, log_msg="过期数据清理异常")
+    def purge_archived_data(self, retention_days: int) -> dict:
+        """删除归档且超过保留期的会话数据（离职处置第二步，真正落删）。
+
+        chat_history 外键带 ON DELETE CASCADE，删 session 会连带删除对话页；
+        tool_call_log 无外键，需单独删。review_queue 属治理证据，保留不删。
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "DELETE FROM tool_call_log WHERE session_id IN "
+            "(SELECT session_id FROM chat_session WHERE archived = 1 "
+            " AND updated_at < CURRENT_TIMESTAMP - make_interval(days => %s))",
+            (int(retention_days),),
+        )
+        tool_rows = self._cur.rowcount
+        self._cur.execute(
+            "DELETE FROM chat_session WHERE archived = 1 "
+            " AND updated_at < CURRENT_TIMESTAMP - make_interval(days => %s)",
+            (int(retention_days),),
+        )
+        session_rows = self._cur.rowcount
+        self._conn.commit()
+        if session_rows:
+            _logger.info(f"过期数据清理: sessions={session_rows} tool_logs={tool_rows}")
+        return {"retention_days": retention_days, "sessions_deleted": session_rows,
+                "tool_logs_deleted": tool_rows}
+
+    @handle_exception(default=[], log_msg="task_id 列表查询异常")
+    def list_task_ids_since(self, hours: int = 24, limit: int = 5000) -> list:
+        """取最近 N 小时写入的 task_id（chat_history ∪ tool_call_log），供跨库对账。
+
+        输入 hours=24 → ["T-20260920-3f9c1a2b", "T-20260920-91ad44e0"]
+        空 task_id 的行不参与（对账只比有号的，老数据没有号是已知的债）。
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "SELECT task_id FROM chat_history "
+            "WHERE task_id <> '' AND created_at >= CURRENT_TIMESTAMP - make_interval(hours => %s) "
+            "UNION "
+            "SELECT task_id FROM tool_call_log "
+            "WHERE task_id <> '' AND created_at >= CURRENT_TIMESTAMP - make_interval(hours => %s) "
+            "LIMIT %s",
+            (int(hours), int(hours), int(limit)),
+        )
+        return [r[0] for r in self._cur.fetchall() if r[0]]
+
+    @handle_exception(default=[], log_msg="待归档会话查询异常")
+    def list_archived_session_ids(self, retention_days: int, limit: int = 500) -> list:
+        """列出已归档且超保留期的 session_id（冷热分离/清理前的目标清单）。"""
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "SELECT session_id FROM chat_session WHERE archived = 1 "
+            "AND updated_at < CURRENT_TIMESTAMP - make_interval(days => %s) LIMIT %s",
+            (int(retention_days), int(limit)),
+        )
+        return [r[0] for r in self._cur.fetchall()]
+
+    @handle_exception(default=[], log_msg="过期会话查询异常")
+    def list_expired_session_ids(self, retention_days: int, limit: int = 500) -> list:
+        """列出超过热数据保留期的 session_id（冷热分离用，不看 archived 标记）。
+
+        输入 retention_days=90 → ["s-1", "s-2"]（90 天内有更新的会话不在此列）
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "SELECT session_id FROM chat_session "
+            "WHERE updated_at < CURRENT_TIMESTAMP - make_interval(days => %s) LIMIT %s",
+            (int(retention_days), int(limit)),
+        )
+        return [r[0] for r in self._cur.fetchall()]
+
+    @handle_exception(default=[], log_msg="会话历史导出异常")
+    def fetch_history_by_session(self, session_id: str) -> list:
+        """导出一个会话的全部对话页（归档用，不删数据）。"""
+        self._reconnect_if_needed()
+        cols = ["id", "session_id", "user_id", "task_id", "user_query", "llm_full_answer",
+                "llm_summary", "tool_call_log", "rag_sources", "created_at"]
+        self._cur.execute(
+            f"SELECT {', '.join(cols)} FROM chat_history WHERE session_id = %s ORDER BY id",
+            (session_id,),
+        )
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+
+    @handle_exception(default=[], log_msg="工具日志导出异常")
+    def fetch_tool_logs_by_session(self, session_id: str) -> list:
+        """导出一个会话的全部工具流水（归档用）。"""
+        self._reconnect_if_needed()
+        cols = ["id", "session_id", "user_id", "task_id", "tool_name", "tool_type",
+                "tool_input", "tool_output", "status", "duration_ms", "created_at"]
+        self._cur.execute(
+            f"SELECT {', '.join(cols)} FROM tool_call_log WHERE session_id = %s ORDER BY id",
+            (session_id,),
+        )
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+
+    @handle_exception(default=0, log_msg="会话删除异常")
+    def delete_sessions(self, session_ids: list) -> int:
+        """按 session_id 批量删除（工具流水 + 会话，对话页靠外键级联删除）。"""
+        if not session_ids:
+            return 0
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "DELETE FROM tool_call_log WHERE session_id = ANY(%s)", (list(session_ids),)
+        )
+        self._cur.execute(
+            "DELETE FROM chat_session WHERE session_id = ANY(%s)", (list(session_ids),)
+        )
+        n = self._cur.rowcount
+        self._conn.commit()
+        return n
 
     def close(self):
         """关闭连接（合上笔记本、锁门）。

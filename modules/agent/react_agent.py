@@ -222,8 +222,11 @@ class ReActAgent:
         }
 
     @staticmethod
-    def _audit_tool_call(principal, tool_name: str, arguments: dict, result):
-        """工具调用审计：成功记 allow，失败记 error，并带上入参与耗时。"""
+    def _audit_tool_call(principal, tool_name: str, arguments: dict, result, session_id: str = ""):
+        """工具调用审计：成功记 allow，失败记 error，并带上入参与耗时。
+
+        session_id 随审计一起落 MySQL，用于把 PG 侧的工具流水与审计记录对齐。
+        """
         if principal is None:
             return
         try:
@@ -234,6 +237,7 @@ class ReActAgent:
                 f"tool:{tool_name}",
                 "allow" if result.success else "error",
                 dept_code=principal.dept_code,
+                session_id=session_id,
                 detail={
                     "arguments": arguments,
                     "duration_ms": getattr(result, "duration_ms", 0),
@@ -321,6 +325,34 @@ class ReActAgent:
         tool_calls = result.get("tool_calls")
 
         if tool_calls and state.iteration < state.max_iterations:
+            # ------------------------------------------------------------------
+            # 【重复动作强制收敛】模型拿到工具结果后仍反复调同一个工具时的刹车
+            #   判定：本次动作与「最近一次成功调用」的工具名与参数完全一致
+            #   处理：不再执行，把上次结果写回 observation，直接进入回答环节
+            #
+            # 【为什么不只靠 max_iterations=10】
+            #   那个上限只是最后一道刹车，在此之前会白跑 9 轮 LLM。
+            #   实测：同一句"3*7"，模型连续调了 9 次计算器，
+            #   单次对话被拖到 14 秒、token 约为正常 10 倍。
+            #   命中重复立刻收尾，同样的问题从 14 秒降到 1 轮内解决。
+            #
+            # 【输入输出对照】
+            #   输入：tool_calls[0] = {'name':'calculator','arguments':{'expression':'3*7'}}
+            #         history 里已有同名同参且成功的一条（result='21'）
+            #   输出：need_tool_call=False，observation='...结果如下...21'
+            # ------------------------------------------------------------------
+            repeated = self._last_same_success_call(state, tool_calls[0])
+            if repeated is not None:
+                _logger.warning(
+                    f"检测到重复工具调用，强制收敛: {tool_calls[0].get('name')}"
+                )
+                state.need_tool_call = False
+                state.observation = (
+                    f"工具 {repeated.get('name', '')} 已用相同参数执行过，"
+                    f"结果如下（不要重复调用，直接据此作答）：\n{repeated.get('result', '')}"
+                )
+                state.final_answer = ""
+                return state
             state.need_tool_call = True
             state.action = tool_calls[0]
         else:
@@ -333,6 +365,24 @@ class ReActAgent:
             state.final_answer = result["content"] or "已达到最大推理次数，基于当前信息给出最佳答案。"
 
         return state
+
+    @staticmethod
+    def _last_same_success_call(state: AgentState, call: dict) -> Optional[dict]:
+        """在历史里找与本次动作完全相同（工具名+参数）且执行成功过的那次记录。
+
+        Args:
+            state: 当前 Agent 状态，读它的 tool_calls_history
+            call:  本次模型产出的动作，形如 {'name': 'calculator', 'arguments': {...}}
+
+        Returns:
+            命中的历史记录 dict（含 result）；没有完全相同的成功记录则返回 None。
+        """
+        name = call.get("name", "")
+        args = call.get("arguments", {})
+        for log in reversed(getattr(state, "tool_calls_history", []) or []):
+            if log.get("success") and log.get("name") == name and log.get("arguments") == args:
+                return log
+        return None
 
     def act_step(self, state: AgentState) -> AgentState:
         """ReAct Action 步骤：执行工具调用（本地 or MCP）。"""
@@ -370,7 +420,7 @@ class ReActAgent:
             context=self._tool_context(state.principal),
         )
 
-        self._audit_tool_call(state.principal, tool_name, arguments, result)
+        self._audit_tool_call(state.principal, tool_name, arguments, result, state.session_id)
 
         log_entry = {
             "name": tool_name,

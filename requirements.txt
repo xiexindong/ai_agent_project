@@ -45,3 +45,12 @@ loguru>=0.7.0                # 日志封装
 # ---- 工具类 ----
 requests>=2.31.0             # HTTP请求
 numpy>=1.24.0                # 向量计算
+
+# ---- 测试与度量 ----
+pytest>=7.4.0                # 单元测试（tests/ 全用例不依赖数据库/密钥/网络）
+
+# ---- 可选框架桥接（默认不装，避免牵动上面 langchain/pydantic 版本树）----
+# llama-index（文档RAG）与 crewai（多角色编排）在本项目中都是"可插拔后端"：
+#   装了 → 配 RAG_BACKEND / MULTIAGENT_BACKEND 切换
+#   没装 → 自动降级为自研实现，主流程不受影响
+# 需要时单独安装：pip install -r requirements-extras.txt

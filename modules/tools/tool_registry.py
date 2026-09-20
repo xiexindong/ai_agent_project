@@ -38,6 +38,19 @@ class ToolRegistry:
         self._tools: Dict[str, BaseTool] = {}
         self._call_records: Dict[str, set] = defaultdict(set)
         self._call_counts: Dict[str, int] = defaultdict(int)
+        # ------------------------------------------------------------------
+        # 【结果缓存】会话ID → {去重键: 上次成功的 ToolResult}
+        #   只缓存成功结果，用途是「同参数再次调用」时把上次答案直接回传。
+        #
+        # 【不这么写会怎样】去重只回一句"拒绝重复执行"，模型拿到的是失败信号，
+        #   于是换个说法继续调同一个工具 —— 实测 ReAct 会跑满 10 轮、
+        #   同一个计算器重复调 9 次，单次对话被拖到 13 秒（约 10 倍 token）。
+        #
+        # 【输入输出对照】
+        #   第二次输入：calculator({'expression': '3*7'})
+        #   第二次输出：success=True, result='21'（不再真的执行第二次）
+        # ------------------------------------------------------------------
+        self._result_cache: Dict[str, dict] = defaultdict(dict)
         self._max_calls_per_tool = 5
 
     def register(self, tool: BaseTool):
@@ -174,6 +187,12 @@ class ToolRegistry:
         param_key = self._hash_params(params)
         dedup_key = f"{name}:{param_key}"
         if dedup_key in self._call_records.get(session_id, set()):
+            cached = self._result_cache.get(session_id, {}).get(dedup_key)
+            if cached is not None and cached.success:
+                # 【为什么要回传而不是报错】报错会让模型以为"工具坏了"从而继续重试，
+                #   把答案原样返回，模型才有依据收尾（既省一轮 LLM，也省 10 倍 token）。
+                _logger.info(f"工具重复调用命中缓存，直接回传上次结果: {dedup_key}")
+                return ToolResult(success=True, result=cached.result, duration_ms=0)
             _logger.warning(f"工具重复调用拦截: {dedup_key} session={session_id}")
             return ToolResult(
                 success=False,
@@ -188,6 +207,10 @@ class ToolRegistry:
         self._call_counts[name] += 1
         if session_id:
             self._call_records[session_id].add(dedup_key)
+            # 【为什么只缓存成功的】失败结果被回传会让模型误以为"答案就是这样"，
+            #   失败必须让它看到错误，才有机会改参数重试。
+            if result.success:
+                self._result_cache[session_id][dedup_key] = result
 
         return result
 
@@ -220,6 +243,9 @@ class ToolRegistry:
         """
         if session_id in self._call_records:
             del self._call_records[session_id]
+        # 结果缓存必须与去重账本一起清，否则新一轮拿到的是上一轮的旧答案
+        if session_id in self._result_cache:
+            del self._result_cache[session_id]
         self._call_counts.clear()
 
     def get_default_tools(self) -> List[BaseTool]:

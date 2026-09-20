@@ -1,0 +1,33 @@
+# ====================================================================
+# 工程化配置：包元信息 + pytest 配置
+#   依赖仍以 requirements.txt 为准（可选框架见 requirements-extras.txt），
+#   这里不重复声明，避免两处版本打架。
+#
+# 常用命令：
+#   pip install pytest          # 装测试框架
+#   pytest                      # 跑全部用例（不需要数据库 / 密钥 / 网络）
+#   pytest tests/test_harness.py -v
+# ====================================================================
+[project]
+name = "enterprise-ai-agent"
+version = "0.1.0"
+description = "企业级 AI Agent 智能助手平台（ReAct + RAG + Memory + 多Agent + 企业级治理）"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["modules*"]
+
+# 【测试配置】
+#   pythonpath = ["."]  → pytest 从项目根导入 modules.*，无需先 pip install -e .
+#   testpaths           → 直接敲 pytest 就跑 tests/，不会去扫 .venv
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

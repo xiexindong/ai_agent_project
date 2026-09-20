@@ -14,10 +14,15 @@ RBAC 权限服务
     明文 API Key 不进内存快照、不进日志、不进 trace。这里缓存键取 sha256 前 16 位，
     出问题时凭摘要到库里反查是哪把 Key，而不是让明文在进程里到处留痕。
 
-【降级策略】
-    RBAC_ENABLED=False 或 MySQL 不可用时，回退到内存鉴权（沿用旧的三把 demo Key），
-    权限取"宽松集"：保证 Agent 照常可用，同时在 Principal.source 标记 'memory'，
-    让排障时能一眼看出这次请求走的是降级路径。
+【降级策略（fail-closed）】
+    RBAC_ENABLED=False（显式关闭权限）时走内存鉴权，方便本地演示。
+    已启用 RBAC 但 MySQL 不可用时，默认拒绝服务（RBAC_FAIL_CLOSED=True）：
+    权限库是唯一的跨库鉴权入口，放行进内存里的三把 demo Key 等于权限裸奔。
+    确需"权限挂了也要能聊"的场景，显式设 RBAC_FAIL_CLOSED=False 才会降级。
+
+【历史行为（已废弃）】
+    曾经 MySQL 不可用一律降级放行进内存 Key，权限取宽松集，仅在
+    Principal.source 标记 'memory'——这在双库架构下等于权限裸奔，已改为 fail-closed。
 """
 import time
 import hashlib
@@ -26,7 +31,7 @@ from dataclasses import dataclass
 from typing import Optional
 from modules.common.logger import get_logger
 from modules.enterprise.models import Principal
-from modules.enterprise.mysql_client import get_mysql_client
+from modules.enterprise.mysql_client import get_mysql_ro_client
 from modules.enterprise import audit
 
 _logger = get_logger("rbac")
@@ -60,6 +65,7 @@ class RBACService:
         self._enabled = bool(s.rbac_enabled)
         self._ttl = int(s.rbac_cache_ttl)
         self._kb_acl = bool(s.kb_acl_enabled)
+        self._fail_closed = bool(s.rbac_fail_closed)
         self._cache: dict = {}
         self._available: Optional[bool] = None
 
@@ -69,7 +75,7 @@ class RBACService:
         if not self._enabled:
             return False
         if self._available is None:
-            self._available = get_mysql_client().ping()
+            self._available = get_mysql_ro_client().ping()
             _logger.info(f"MySQL 权限库可用性: {self._available}")
         return self._available
 
@@ -90,17 +96,27 @@ class RBACService:
         return result
 
     def _resolve_uncached(self, api_key: str) -> AuthResult:
+        if not self._enabled:
+            return self._from_memory(api_key)
+
         if self.available():
             try:
                 return self._from_db(api_key)
             except Exception as e:
-                _logger.error(f"MySQL 鉴权异常，降级到内存鉴权: {e}")
+                _logger.error(f"MySQL 鉴权异常: {e}")
                 audit.log_audit("system", "auth", "mysql", "error", detail={"error": str(e)})
+                if self._fail_closed:
+                    return AuthResult(
+                        False, None, "mysql_unavailable", "权限库不可用，已拒绝本次请求"
+                    )
+        elif self._fail_closed:
+            return AuthResult(False, None, "mysql_unavailable", "权限库不可用，已拒绝本次请求")
+
         return self._from_memory(api_key)
 
 
     def _from_db(self, api_key: str) -> AuthResult:
-        db = get_mysql_client()
+        db = get_mysql_ro_client()
 
         row = db.query_one(
             "SELECT u.id AS user_id, u.user_code, u.real_name, u.job_title, u.user_level, u.status AS user_status,"
