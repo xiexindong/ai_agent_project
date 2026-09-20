@@ -21,6 +21,7 @@ zhipuai>=2.0.0                # 智谱 embedding-2
 pymilvus>=2.4.0               # Milvus 静态知识库
 psycopg2-binary>=2.9.0       # PostgreSQL 驱动
 pgvector>=0.3.0              # pgvector 向量扩展支持
+PyMySQL>=1.1.0               # MySQL 驱动（企业身份与权限库 RBAC）
 
 # ---- RAG 文档处理 ----
 pypdf>=4.0.0                 # PDF文档加载

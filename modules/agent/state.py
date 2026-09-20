@@ -19,6 +19,11 @@ class AgentStateDict(TypedDict, total=False):
     user_id: str
     user_query: str
 
+    # ---- 权限载体（Principal）----
+    # 入口解析一次，全链路只读判定：工具过滤、知识库 expr、数据域、脱敏都靠它。
+    # 不进 to_dict 的持久化内容（AgentState.to_dict 会带上它，但不落库）。
+    principal: Any
+
     # ---- 消息历史（LangGraph MessagesState 兼容）----
     messages: list
 
@@ -69,6 +74,9 @@ class AgentState:
     user_id: str = ""
     user_query: str = ""
 
+    # 权限载体：None 表示未做权限校验（如 CLI 模式），此时按最小权限处理
+    principal: Any = None
+
     messages: list = field(default_factory=list)
     rag_context: str = ""
     rag_sources: list = field(default_factory=list)
@@ -118,6 +126,7 @@ class AgentState:
             "session_id": self.session_id,
             "user_id": self.user_id,
             "user_query": self.user_query,
+            "principal": self.principal,
             "messages": self.messages,
             "rag_context": self.rag_context,
             "rag_sources": self.rag_sources,
@@ -164,6 +173,7 @@ class AgentState:
             session_id=d.get("session_id", ""),
             user_id=d.get("user_id", ""),
             user_query=d.get("user_query", ""),
+            principal=d.get("principal"),
             messages=d.get("messages", []),
             rag_context=d.get("rag_context", ""),
             rag_sources=d.get("rag_sources", []),

@@ -57,6 +57,21 @@ class Settings(BaseSettings):
     milvus_port: int = Field(default=19530, alias="MILVUS_PORT")
     milvus_collection: str = Field(default="knowledge_base", alias="MILVUS_COLLECTION")
 
+    # ---- MySQL 企业身份与权限库（RBAC）----
+    mysql_host: str = Field(default="localhost", alias="MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
+    mysql_user: str = Field(default="root", alias="MYSQL_USER")
+    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")
+    mysql_database: str = Field(default="ai_agent_enterprise", alias="MYSQL_DATABASE")
+    # 权限开关：False 时跳过 MySQL，回退到内存鉴权（本地无 MySQL 也能跑）
+    rbac_enabled: bool = Field(default=True, alias="RBAC_ENABLED")
+    # 权限缓存秒数：同一 API Key 在有效期内不再查库（改权限最多延迟这么多秒生效）
+    rbac_cache_ttl: int = Field(default=60, alias="RBAC_CACHE_TTL")
+    # 知识库隔离开关：False 时不做 kb_code 过滤（等价于旧行为）
+    kb_acl_enabled: bool = Field(default=True, alias="KB_ACL_ENABLED")
+    # 敏感字段脱敏开关
+    mask_enabled: bool = Field(default=True, alias="MASK_ENABLED")
+
     # ---- LangSmith 追踪 ----
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
     langsmith_project: str = Field(default="ai-agent-prod", alias="LANGSMITH_PROJECT")

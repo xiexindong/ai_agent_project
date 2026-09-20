@@ -135,30 +135,48 @@ async def get_current_user(api_key: str = Security(_api_key_header)) -> dict:
     """
     FastAPI 依赖注入主入口：API Key 鉴权 + 限流检查一锅端。
 
-    【一次请求的三层校验】
-        1. 缺 API Key 头      → 401（未登录）
-        2. API Key 不存在/失效 → 403（鉴权失败）
-        3. 鉴权通过但限流触发 → 429（请求太频繁）
+    【企业级改造点】身份不再来自内存字典，而是走 MySQL 的 RBAC：
+        X-API-Key → SHA2 哈希查 sys_api_key → 校验有效期/吊销/在职状态
+                  → 装配角色、权限码、数据域、知识库可见范围 → Principal
 
-    【三种响应对比】
-        ✓ 正常请求（key=sk-admin-003，未超频）→ 返回 user dict，下游路由拿到
-        ✗ 缺 X-API-Key 头    → HTTP 401 "缺少 API Key..."
-        ✗ key=sk-fake-999   → HTTP 403 "API Key 无效或已失效"
-        ✗ key 合法但 1 分钟发了 21 次 → HTTP 429 "请求频次超限"
+    【一次请求的四层校验】
+        1. 缺 API Key 头        → 401（未登录）
+        2. Key 无效/吊销/过期   → 403（鉴权失败，且不区分原因避免信息泄露）
+        3. 账号停用（离职）      → 403
+        4. 鉴权通过但限流触发    → 429（请求太频繁）
+
+    【返回的 user dict 新增字段】
+        user_id    工号（U001），与 PG 会话表的 user_id 对齐
+        level      normal/advanced/admin，兼容旧代码
+        principal  Principal 对象，Agent 全链路的权限载体（新增，核心）
 
     Returns:
-        鉴权通过的 user dict（含 user_id/name/level）
-        鉴权失败时 raise HTTPException，函数本身不会返回 None
+        鉴权通过的 user dict；失败时 raise HTTPException，本身不会返回 None
     """
+    from modules.enterprise.rbac_service import get_rbac_service
+
     if not api_key:
         raise HTTPException(status_code=401, detail="缺少 API Key，请在请求头携带 X-API-Key")
-    user = AuthManager.authenticate(api_key)
-    if not user:
-        raise HTTPException(status_code=403, detail="API Key 无效或已失效")
-    # 限流检查
-    if not _rate_limiter.check(user["user_id"]):
+
+    result = get_rbac_service().resolve(api_key)
+    if not result.ok:
+        # 统一 403：不区分"Key 不存在/被吊销/已过期"，避免被拿来枚举有效 Key
+        raise HTTPException(status_code=403, detail=result.message or "API Key 无效或已失效")
+
+    p = result.principal
+    if not _rate_limiter.check(p.user_code):
         raise HTTPException(status_code=429, detail="请求频次超限，请稍后重试")
-    return user
+
+    return {
+        "user_id": p.user_code,        # 兼容旧字段：工号即 user_id
+        "name": p.real_name,
+        "level": p.user_level,
+        "principal": p,                 # ★ 权限载体，后续全链路透传
+        "dept_code": p.dept_code,
+        "dept_name": p.dept_name,
+        "roles": p.roles,
+        "source": p.source,             # mysql / memory（降级时排障用）
+    }
 
 
 def RequirePermission(required_level: UserLevel):
@@ -195,3 +213,39 @@ def RequirePermission(required_level: UserLevel):
             )
         return user
     return dependency
+
+
+def RequirePerm(perm_code: str):
+    """
+    细粒度权限依赖工厂（RBAC 真正在用的那把锁）。
+
+    与 RequirePermission 的区别：
+        RequirePermission(UserLevel.ADMIN)  —— 一维分级，只能表达"等级够不够"
+        RequirePerm("api:admin:*")          —— 权限码，能表达"能不能做这件事"
+
+    企业级接口应当用后者：等级是给人看的属性，权限码才是给系统判定的契约。
+
+    用法：
+        @app.get("/admin/audit")
+        async def audit_log(user=Depends(RequirePerm("api:audit:*"))): ...
+    """
+    async def dependency(user: dict = Security(get_current_user)) -> dict:
+        principal = user.get("principal")
+        allowed = principal is not None and principal.can(perm_code)
+        from modules.enterprise import audit
+        audit.log_audit(
+            principal.user_code if principal else "anonymous",
+            "api",
+            perm_code,
+            "allow" if allowed else "deny",
+            dept_code=principal.dept_code if principal else "",
+        )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="权限不足")
+        return user
+    return dependency
+
+
+async def get_principal(user: dict = Security(get_current_user)):
+    """直接拿 Principal 的依赖（Agent 链路专用，省一层取值）。"""
+    return user["principal"]

@@ -129,6 +129,10 @@ class MilvusVectorStore:
                 self._FieldSchema(name="source", dtype=self._DataType.VARCHAR, max_length=512),
                 self._FieldSchema(name="file_name", dtype=self._DataType.VARCHAR, max_length=256),
                 self._FieldSchema(name="updated_at", dtype=self._DataType.VARCHAR, max_length=32),
+                # 知识库隔离字段：kb_code 对应 sys_kb.kb_code，检索时按用户可见范围做 expr 过滤
+                # dept_code 冗余一份归口部门，便于按部门维度下线/审计
+                self._FieldSchema(name="kb_code", dtype=self._DataType.VARCHAR, max_length=64),
+                self._FieldSchema(name="dept_code", dtype=self._DataType.VARCHAR, max_length=64),
                 self._FieldSchema(name="embedding", dtype=self._DataType.FLOAT_VECTOR, dim=self._dim),
             ]
             schema = self._CollectionSchema(fields, description="企业知识库RAG向量索引")
@@ -145,6 +149,13 @@ class MilvusVectorStore:
             _logger.info(f"Milvus集合创建: {self._collection_name}")
         self._collection = self._Collection(self._collection_name)
         self._collection.load()
+        # 兼容老集合：升级前建的集合没有 kb_code/dept_code 字段，
+        # 插入与检索都要按"有没有这个字段"走不同分支，避免直接报错。
+        try:
+            self._has_kb_field = any(f.name == "kb_code" for f in self._collection.schema.fields)
+        except Exception:
+            self._has_kb_field = False
+        _logger.info(f"Milvus集合就绪: {self._collection_name} | 知识库隔离字段={self._has_kb_field}")
 
     def insert_chunks(self, chunks: List[TextChunk]):
         """将文本分片向量化后入库。"""
@@ -160,18 +171,27 @@ class MilvusVectorStore:
             [c.metadata.get("source", "") for c in chunks],
             [c.metadata.get("file_name", "") for c in chunks],
             [now] * len(chunks),
-            vectors,
         ]
+        if getattr(self, "_has_kb_field", False):
+            # 未显式标注 kb_code 的一律归入 public（公司通用制度）
+            data.append([c.metadata.get("kb_code", "public") for c in chunks])
+            data.append([c.metadata.get("dept_code", "") for c in chunks])
+        data.append(vectors)
         result = self._collection.insert(data)
         self._collection.flush()
         _logger.info(f"向量入库完成: {len(chunks)} 条分片")
         return len(chunks)
 
     @handle_exception(default=None, log_msg="Milvus向量召回异常", reraise=False)
-    def search(self, query: str, top_k: int = None) -> list[dict]:
+    def search(self, query: str, top_k: int = None, expr: str = None) -> list[dict]:
         """
         向量相似度召回，返回 [{content, source, file_name, score, ...}]。
         相似度低于 threshold 的结果会被过滤。
+
+        Args:
+            expr: Milvus 标量过滤表达式，用于知识库权限隔离。
+                  例：'kb_code in ["public","finance"]' → 只在财务+公开库里搜。
+                  None = 不限制（保持旧行为）。老集合无 kb_code 字段时会自动回退。
         """
         emb_service = get_embedding_service()
         query_vec = emb_service.embed(text=query)
@@ -202,28 +222,17 @@ class MilvusVectorStore:
         #   nprobe 的上限就是 nlist=128：填 200 无意义，填 1 只搜 1/128 的表，
         #   召回率明显下降却不报错——这是静默降质，不是崩溃，日志里看不出来。
         # ------------------------------------------------------------------
-        results = self._collection.search(
-            # 【data】要查的向量，必须是「二维」：外层是 batch，内层是那 1024 个 float。
-            #   写成 [query_vec] 而不是 query_vec，少一层会报 DataNotMatchException。
-            data=[query_vec],
-            # 【anns_field】在哪个字段上比向量。anns = Approximate Nearest Neighbor Search。
-            #   必须填建集合时那个 FLOAT_VECTOR 字段名（_ensure_collection 里 name="embedding"），
-            #   名字写错会报 field not exist。
-            anns_field="embedding",
-            # 【param】检索参数，两层字典，不能写平：
-            #   "metric_type"       : 距离度量。COSINE = 余弦相似度，只看方向不看长度，
-            #                         所以长句和短句只要语义接近也能拿高分。
-            #   "params": {"nprobe"}: 只搜 128 个聚类桶里最像的 16 个（16/128 = 12.5%），
-            #                         用召回率换速度；改成 128 等于全表暴力搜（慢但最准）。
-            param={"metric_type": "COSINE", "params": {"nprobe": 16}},
-            # 【limit】最多返回几条候选，默认 5（config.py RAG_TOP_K ← .env）。
-            #   这是「召回上限」不是最终条数：这 5 条还得过下面的 0.65 阈值过滤。
-            limit=k,
-            # 【output_fields】除了向量，还要把哪些标量字段一起取回来。
-            #   不写就只剩 id + score，下面取 content/file_name 会全是空字符串。
-            #   chunk_id 是主键，不写也能用 hit.id 取；这里写了但下游组装 hits 时没用到它。
-            output_fields=["chunk_id", "doc_id", "content", "source", "file_name", "updated_at"],
-        )
+        base_fields = ["chunk_id", "doc_id", "content", "source", "file_name", "updated_at"]
+        extra_fields = ["kb_code", "dept_code"] if getattr(self, "_has_kb_field", False) else []
+        try:
+            results = self._search_once(query_vec, k, expr, base_fields + extra_fields)
+        except Exception as e:
+            if not expr:
+                raise
+            # 老集合缺少 kb_code 字段时 expr 会执行失败：宁可放开检索也不能让对话失败，
+            # 但要留 warning —— 这是"权限隔离失效"的信号，必须能被监控发现。
+            _logger.warning(f"知识库过滤失败，回退无过滤检索（疑似集合缺 kb_code 字段）: {e}")
+            results = self._search_once(query_vec, k, None, base_fields)
 
         hits = []
         for hit in results[0]:
@@ -239,8 +248,24 @@ class MilvusVectorStore:
                 "updated_at": hit.entity.get("updated_at", ""),
                 "score": round(score, 4),
             })
-        _logger.info(f"向量召回: query='{query[:30]}...' | 命中={len(hits)}/{k}")
+        _logger.info(
+            f"向量召回: query='{query[:30]}...' | 命中={len(hits)}/{k} | "
+            f"知识库过滤={'有' if expr else '无'}"
+        )
         return hits
+
+    def _search_once(self, query_vec: list, k: int, expr: str, output_fields: list):
+        """执行一次 ANN 检索；expr 为空时不下过滤条件（兼容老集合）。"""
+        kwargs = dict(
+            data=[query_vec],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            limit=k,
+            output_fields=output_fields,
+        )
+        if expr:
+            kwargs["expr"] = expr
+        return self._collection.search(**kwargs)
 
     @handle_exception(default=False, log_msg="Milvus文档下线异常")
     def remove_by_doc_id(self, doc_id: str) -> bool:

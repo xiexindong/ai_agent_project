@@ -114,6 +114,7 @@ class AgentGraph:
                 query=state.get("user_query", ""),
                 session_id=state.get("session_id", ""),
                 user_id=state.get("user_id", ""),
+                principal=state.get("principal"),
             )
             updates = full_state.to_dict()
             updates["prepared"] = True
@@ -125,7 +126,6 @@ class AgentGraph:
         """推理节点：LLM ReAct 分析，判断是否调用工具。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
-        breakpoint()  # 【调试断点】图节点[reason]入口：可看 agent_state（含 observation 上轮结果）
         _logger.info(
             f"节点[reason]: iteration={agent_state.iteration + 1} "
             f"query='{agent_state.user_query[:30]}...'"
@@ -145,7 +145,6 @@ class AgentGraph:
         """执行节点：调用工具（本地 or MCP）。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
-        breakpoint()  # 【调试断点】图节点[act]入口：可看 agent_state.action（要调的工具）
         _logger.info(f"节点[act]: tool={agent_state.action.get('name', '')}")
         updated = self.agent.act_step(agent_state)
         return {
@@ -159,7 +158,6 @@ class AgentGraph:
         """答案节点：生成完整答案 + 精简摘要。"""
         from modules.agent.state import AgentState
         agent_state = AgentState.from_dict(state)
-        breakpoint()  # 【调试断点】图节点[answer]入口：可看 agent_state（最终状态）
         _logger.info("节点[answer]: 生成最终答案")
         updated = self.agent.generate_answer(agent_state)
         # 生成摘要
@@ -174,7 +172,6 @@ class AgentGraph:
         """保存节点：记忆入库（原文+摘要+向量），Agent状态持久化。"""
         session_id = state.get("session_id", "")
         user_id = state.get("user_id", "")
-        breakpoint()  # 【调试断点】图节点[save]入口：可看 state.final_answer / state.llm_summary / tool_call_logs
         _logger.info(f"节点[save]: session={session_id}")
 
         if self.agent.memory and session_id and user_id:
@@ -243,7 +240,6 @@ class AgentGraph:
 
         【一句话记忆】"答完了走 answer，要调工具且没出错走 act，出错也走 answer"
         """
-        breakpoint()  # 【调试断点】条件路由：可看 state.need_tool_call / state.finished（决定走 act 还是 answer）
         if state.get("finished"):
             return "answer"
         if state.get("need_tool_call") and not state.get("error"):
@@ -257,15 +253,26 @@ class AgentGraph:
         query: str,
         session_id: str,
         user_id: str,
+        principal=None,
     ) -> dict[str, Any]:
-        """执行完整 Agent 流程。"""
-        _logger.info(f"Agent执行: session={session_id} | query='{query[:50]}'")
-        breakpoint()  # 【调试断点】Agent图执行入口：可看 query / session_id / user_id
+        """
+        执行完整 Agent 流程。
+
+        Args:
+            principal: 权限载体（Principal），由 API 入口解析后透传。
+                       它决定本次会话能看哪些知识库、能调哪些工具、能看多少数据。
+                       None = 未启用权限（CLI 调试）。
+        """
+        _logger.info(
+            f"Agent执行: session={session_id} | user={user_id} | "
+            f"权限={'已加载' if principal else '未启用'} | query='{query[:50]}'"
+        )
         # 标注 AgentStateDict：LangGraph invoke 期待状态 TypedDict，纯 dict 会被类型检查器拒收
         initial_state: AgentStateDict = {
             "session_id": session_id,
             "user_id": user_id,
             "user_query": query,
+            "principal": principal,
             "prepared": False,
         }
     # recursion_limit 递归深度限制，防止死循环

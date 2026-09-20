@@ -91,24 +91,32 @@ class ToolRegistry:
         """
         return list(self._tools.values())
 
-    def get_openai_tools_schema(self, user_level: str = "normal") -> list:
+    def get_openai_tools_schema(self, user_level: str = "normal", allowed: list = None) -> list:
         """
         生成 OpenAI Function Calling 格式的工具说明书（JSON Schema 列表）。
 
         这份 schema 会作为 tools 参数发给 DeepSeek，LLM 据此决定"能调哪些工具、
-        每个工具要什么参数"。权限在此处做源头过滤：普通用户拿到的说明书里
-        根本没有 MCP 工具，模型自然无法发起越权调用。
+        每个工具要什么参数"。权限在此处做源头过滤：模型看不到的工具，就不可能调用。
 
         Args:
             user_level: 用户权限等级，"normal"（普通）/ "advanced"（高级）/ "admin"。
+            allowed:    RBAC 判定通过的工具集合（工具实例 list 或工具名 list）。
+                        传入时以它为准（细粒度权限优先）；
+                        为 None 时回退到按 user_level 的一维过滤（向后兼容旧行为）。
 
         Returns:
             可直接传给 OpenAI 兼容接口的 tools 数组（list[dict]）。
         """
+        allowed_names = None
+        if allowed is not None:
+            allowed_names = {t if isinstance(t, str) else getattr(t, "name", "") for t in allowed}
         schemas = []
         for tool in self._tools.values():
-            # 权限检查：普通用户跳过 MCP 远程工具（仅保留本地基础工具）
-            if user_level == "normal" and tool.tool_type == "mcp":
+            if allowed_names is not None:
+                if tool.name not in allowed_names:
+                    _logger.debug(f"工具未授权，不暴露给模型: {tool.name}")
+                    continue
+            elif user_level == "normal" and tool.tool_type == "mcp":
                 continue
             schemas.append(tool.to_openai_format())
         return schemas
@@ -118,6 +126,7 @@ class ToolRegistry:
         name: str,
         params: dict,
         session_id: str = "",
+        context: dict = None,
     ) -> ToolResult:
         """
         执行工具调用（工具调度的核心入口）。
@@ -145,6 +154,9 @@ class ToolRegistry:
             name:       LLM 通过 Function Calling 指定的工具名。
             params:     LLM 生成的调用参数（JSON 已解析为 dict）。
             session_id: 当前会话ID，用于会话级去重隔离；为空时跳过去重记录。
+            context:    服务端注入的私有参数（如 _data_scope/_dept_code/_user_code/_mask_level），
+                        与模型生成的 params 合并后传给工具。这些参数不出现在 schema 里，
+                        因此模型无法伪造——权限判定必须由服务端完成，不能交给模型。
 
         Returns:
             ToolResult: 统一结果对象（success/result/error/duration_ms）。
@@ -177,7 +189,11 @@ class ToolRegistry:
             )
 
         # ④ 真正执行：BaseTool.run() 内部还会做必填参数校验并统一捕获异常
-        result = tool.run(params)
+        #    context 里的私有参数在此合并（数据域、脱敏强度等服务端判定结果）
+        call_params = dict(params or {})
+        if context:
+            call_params.update(context)
+        result = tool.run(call_params)
 
         # ⑤ 记账：累计次数 + 记录参数指纹（仅在执行后记录，失败不占配额）
         self._call_counts[name] += 1

@@ -38,6 +38,7 @@ class ReActAgent:
     REASON_PROMPT = (
         "## 用户提问\n{query}\n\n"
         "## 激活技能（SOP作业流程）\n{skill_context}\n\n"
+        "## 权限边界（硬性约束，越界即违规）\n{permission_context}\n\n"
         "## 知识库参考\n{rag_context}\n\n"
         "## 历史记忆\n{memory_context}\n\n"
         "## 历史工具调用\n{tool_history}\n\n"
@@ -73,10 +74,16 @@ class ReActAgent:
         session_id: str,
         user_id: str,
         user_level: str = "normal",
+        principal=None,
     ) -> AgentState:
         """
         初始化 Agent 状态：输入清洗 → Prompt注入检测 → 记忆召回 → RAG召回。
         覆盖边界6（Prompt注入防护）。
+
+        Args:
+            principal: 权限载体（Principal）。由入口解析一次后透传，
+                       决定本次请求能看哪些知识库、能调哪些工具、能看多少数据。
+                       None = 未启用权限（CLI 调试场景），按不放宽也不加严处理。
         """
         # 边界6：Prompt注入检测
         if check_prompt_injection(query):
@@ -84,6 +91,7 @@ class ReActAgent:
                 session_id=session_id,
                 user_id=user_id,
                 user_query=query,
+                principal=principal,
                 finished=True,
                 final_answer="检测到潜在的指令注入，已拦截。请使用正常方式提问。",
                 error="prompt_injection_blocked",
@@ -96,6 +104,7 @@ class ReActAgent:
             user_id=user_id,
             user_query=clean_query,
             max_iterations=self._max_iter,
+            principal=principal,
         )
 
         # Skill 技能意图匹配 —— 三级路由，命中即停：
@@ -137,17 +146,101 @@ class ReActAgent:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
                 state.memory_context = ""
 
-        # RAG 知识库召回
+        # RAG 知识库召回（带权限隔离：只在本用户可见的 kb_code 范围内检索）
         if self.rag:
             try:
-                rag_ctx = self.rag.build_context(clean_query)
+                expr = self._kb_expr(principal)
+                rag_ctx = self.rag.build_context(clean_query, expr=expr)
                 state.rag_context = rag_ctx
-                state.rag_sources = self.rag.retrieve(clean_query) if rag_ctx else []
+                state.rag_sources = self.rag.retrieve(clean_query, expr=expr) if rag_ctx else []
+                if expr:
+                    _logger.info(f"知识库权限过滤已生效: {expr}")
             except Exception as e:
                 _logger.warning(f"RAG召回异常降级: {e}")
                 state.rag_context = ""
 
         return state
+
+    # ==================== 权限辅助 ====================
+
+    @staticmethod
+    def _kb_expr(principal) -> Optional[str]:
+        """生成知识库过滤表达式；生成失败返回 None（宁可放开检索也不能让对话失败）。"""
+        if principal is None:
+            return None
+        try:
+            from modules.enterprise.rbac_service import get_rbac_service
+            return get_rbac_service().kb_expr(principal)
+        except Exception as e:
+            _logger.warning(f"知识库权限表达式生成失败（按不限制处理）: {e}")
+            return None
+
+    @staticmethod
+    def _allowed_tools(principal, tools: list) -> list:
+        """按权限过滤工具；principal 为空时返回原样（CLI 调试场景）。"""
+        if principal is None or not tools:
+            return tools
+        try:
+            from modules.enterprise.rbac_service import get_rbac_service
+            return get_rbac_service().allowed_tools(principal, tools)
+        except Exception as e:
+            _logger.warning(f"工具权限过滤失败（按最小权限处理）: {e}")
+            return []
+
+    @staticmethod
+    def _permission_context(principal) -> str:
+        """把权限边界写进 prompt：模型必须先知道自己的边界，才谈得上不越界。"""
+        if principal is None:
+            return "（未启用权限约束）"
+        scope_desc = {"self": "仅本人数据", "dept": "本部门数据", "all": "全公司数据"}
+        return "\n".join([
+            f"- 当前用户：{principal.real_name}（工号 {principal.user_code}，{principal.dept_name}）",
+            f"- 可见知识库：{', '.join(principal.kb_codes) or '全部'}（禁止引用范围外的内容）",
+            f"- 业务数据范围：{scope_desc.get(principal.data_scope, principal.data_scope)}",
+            f"- 敏感字段：{'已按策略脱敏，禁止追问完整值' if principal.mask_level else '未脱敏'}",
+            "- 越权内容一律视为不存在：不得提及、不得暗示其存在",
+        ])
+
+    @staticmethod
+    def _tool_context(principal) -> Optional[dict]:
+        """
+        构造注入工具的私有参数（不在 Function Calling schema 中出现）。
+
+        _scopes     按数据类型的可见范围，由角色的 data_scope 与显式 data:xxx:yyy 权限叠加得出
+        _dept_code  用于部门域过滤
+        _user_code  用于本人域过滤
+        _mask_level 字段脱敏强度
+        """
+        if principal is None:
+            return None
+        return {
+            "_scopes": {dt: principal.scope_for(dt) for dt in ("users", "orders", "inventory")},
+            "_dept_code": principal.dept_code,
+            "_user_code": principal.user_code,
+            "_mask_level": principal.mask_level,
+        }
+
+    @staticmethod
+    def _audit_tool_call(principal, tool_name: str, arguments: dict, result):
+        """工具调用审计：成功记 allow，失败记 error，并带上入参与耗时。"""
+        if principal is None:
+            return
+        try:
+            from modules.enterprise import audit
+            audit.log_audit(
+                principal.user_code,
+                "tool_call",
+                f"tool:{tool_name}",
+                "allow" if result.success else "error",
+                dept_code=principal.dept_code,
+                detail={
+                    "arguments": arguments,
+                    "duration_ms": getattr(result, "duration_ms", 0),
+                    "error": (result.error if not result.success else ""),
+                },
+            )
+        except Exception as e:
+            _logger.warning(f"工具审计写入失败: {e}")
 
     def reason_step(self, state: AgentState) -> AgentState:
         """
@@ -186,14 +279,21 @@ class ReActAgent:
         _logger.info(f"ReAct循环 iteration={state.iteration}/{state.max_iterations}")
 
         # 构建 Reason Prompt
+        # ★ 权限过滤在这里生效：未授权的工具不进入 schema，模型无从调用。
+        #   这比"调用时再拒绝"好——不会浪费一轮 ReAct，也不会把工具名泄露给模型。
         tools_schema = []
         tools_desc = "（无可用工具）"
         if self.tool_registry:
-            tools_schema = self.tool_registry.get_openai_tools_schema()
+            all_tools = self.tool_registry.list_tools()
+            allowed = self._allowed_tools(state.principal, all_tools)
+            user_level = state.principal.user_level if state.principal else "normal"
+            tools_schema = self.tool_registry.get_openai_tools_schema(
+                user_level=user_level, allowed=allowed
+            )
             tools_desc = "\n".join(
                 f"- {t['function']['name']}: {t['function']['description']}"
                 for t in tools_schema
-            )
+            ) or "（无可用工具）"
 
         tool_history = "\n".join(
             f"  - {log.get('name', '')}({log.get('arguments', {})}) → {log.get('result', '')[:100]}"
@@ -202,6 +302,7 @@ class ReActAgent:
 
         prompt = self.REASON_PROMPT.format(
             query=state.user_query,
+            permission_context=self._permission_context(state.principal),
             skill_context=state.skill_context or "（未匹配到专门技能，按通用企业助手流程处理）",
             rag_context=state.rag_context or "（知识库无相关内容）",
             memory_context=state.memory_context or "（无历史记忆）",
@@ -252,11 +353,16 @@ class ReActAgent:
             state.observation = "工具注册器未初始化，无法调用工具"
             return state
 
+        # 服务端注入私有参数（数据域/脱敏强度）：模型不可见，也无从伪造
         result = self.tool_registry.execute_tool(
             name=tool_name,
             params=arguments,
             session_id=state.session_id,
+            context=self._tool_context(state.principal),
         )
+
+        # 企业审计：工具调用留痕（失败也记，越权尝试是重点审计对象）
+        self._audit_tool_call(state.principal, tool_name, arguments, result)
 
         # 记录工具调用日志
         log_entry = {

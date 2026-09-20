@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from modules.common.logger import get_logger
-from modules.api.auth import get_current_user, RequirePermission, UserLevel
+from modules.api.auth import get_current_user, RequirePermission, RequirePerm, UserLevel
 from modules.agent.graph import AgentGraph
 from modules.agent.react_agent import ReActAgent
 from modules.agent.llm import LLMClient
@@ -178,6 +178,42 @@ class APIServer:
         async def health():
             return {"status": "ok", "service": "ai-agent"}
 
+        @app.get("/me")
+        async def me(user: dict = Depends(get_current_user)):
+            """当前登录者的权限快照：排障时先问"我是谁、我有什么权限"。"""
+            p = user.get("principal")
+            return {
+                "user": {k: v for k, v in user.items() if k != "principal"},
+                "permissions": p.to_dict() if p else None,
+            }
+
+        @app.get("/admin/audit")
+        async def audit_log(limit: int = 50, user: dict = Depends(RequirePerm("api:audit:*"))):
+            """审计日志：谁在什么时候对什么资源做了什么，deny 记录是重点。"""
+            from modules.enterprise.mysql_client import get_mysql_client
+            try:
+                rows = get_mysql_client().query_all(
+                    "SELECT user_code, dept_code, action, resource, result, created_at "
+                    "FROM sys_audit_log ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+                return {"total": len(rows), "items": rows}
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"审计库不可用: {e}")
+
+        @app.get("/admin/bill")
+        async def bill(user: dict = Depends(RequirePerm("api:admin:*"))):
+            """按部门汇总 LLM token 消耗：成本治理与预算控制的数据源。"""
+            from modules.enterprise.mysql_client import get_mysql_client
+            try:
+                rows = get_mysql_client().query_all(
+                    "SELECT dept_code, COUNT(*) AS calls, SUM(total_tokens) AS tokens "
+                    "FROM sys_llm_usage GROUP BY dept_code ORDER BY tokens DESC"
+                )
+                return {"items": rows}
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"用量库不可用: {e}")
+
         @app.get("/")
         async def index():
             """前端首页：返回 jQuery 界面。"""
@@ -215,6 +251,9 @@ class APIServer:
                 event: done         全部完成 {session_id}（前端用它确认真实会话ID）
             """
             user_id = user["user_id"]
+            # 权限载体：入口解析一次，后续全链路透传
+            # （工具过滤、知识库隔离、数据域、脱敏都由它决定）
+            principal = user.get("principal")
             is_new_session = not req.session_id
             session_id = req.session_id or str(uuid.uuid4())
 
@@ -310,7 +349,7 @@ class APIServer:
                     #   （简单起见此处不做补偿：单次请求失败不会污染会话状态，
                     #    会话已在上面 223-226 行创建/校验过，工具记录也已在 229 行 reset 清零。）
                     result = await asyncio.to_thread(
-                        ctx.agent_graph.run, req.query, session_id, user_id
+                        ctx.agent_graph.run, req.query, session_id, user_id, principal
                     )
                 except Exception as e:
                     _logger.error(f"Agent推理异常: {e}")
