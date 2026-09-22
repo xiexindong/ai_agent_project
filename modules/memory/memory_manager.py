@@ -174,7 +174,46 @@ class MemoryManager:
 
     @staticmethod
     def _has_keyword_overlap(query: str, text: str) -> bool:
-        """关键词二次校验：中文按 2-gram、英文按词，判定问句与历史摘要是否有字面重合。"""
+        """
+        关键词二次校验：中文按 2-gram、英文按词，判定问句与历史摘要是否有字面重合。
+
+        【作用】向量召回只保证「语义相近」，可能召回「语义像但字面无关」的历史；
+        这里做字面复核，两边字块有交集才放行。调用处见第 157-170 行，开关是
+        memory_keyword_check；若全部被否掉，会把 _low_confidence 置 True 触发人工审核。
+
+        【实跑：输入 → 切分中间值 → 判定】
+
+        ① 中文·有重合（含汉字即走 2-gram：去空白后相邻两字滑窗）
+             query "公司的报销流程是什么" → {公司 司的 的报 报销 销流 流程 程是 是什 什么}
+             text  "报销流程需要提交发票" → {报销 销流 流程 程需 需要 要提 提交 交发 发票}
+             交集 {报销 销流 流程} → True
+
+        ② 中文·无重合
+             text  "今天天气怎么样" → {今天 天天 天气 气怎 怎么 么样}
+             交集 {} → False
+
+        ③ 英文·有重合（无汉字即走分词）
+             注意第 179 行已先删掉所有空白，句子会粘成一整串，分词退化成「整句当一个词」：
+             query "how to reset password"  → {howtoresetpassword}
+             text  "reset your password here" → {resetyourpasswordhere}
+             交集 {} → False     ← 两边都含 reset、password，却判「不重合」
+             只有「去掉空格后完全相同」才为 True，等于退化成整字符串比对。
+
+        ④ 中英混合（只要含一个汉字，整段都走 2-gram）
+             query "Python 怎么读文件" → {py yt th ho on n怎 怎么 么读 读文 文件}
+             ← "Python" 被切成字母对 py/yt/th/ho/on，不再是一个词。
+             同一对英文词，在纯英文句里按词比、在混了汉字的句里按字母对比，两套口径。
+
+        ⑤ 边界情况
+             query "好" → range(len-1) = range(0) → 切出空集合 → 永远 False（单字查询必丢）
+             query "报销，流程" → {报销 销， ，流 流程} → 第 179 行只删空白不删标点，
+                   标点会切断本该命中的 2-gram（此处"销流"被逗号切没了）。
+
+        【结论】③ 的后果最严重：本校验对英文几乎恒为 False。英文提问时召回的记忆
+        会被整批丢弃、并触发人工审核 —— 全程不报错，只是英文用户的长期记忆从不生效。
+        修法两处：先分词再删空白（即调换第 179 与 182 行的顺序），以及中英分开处理，
+        不要「含一个汉字」就整段按 2-gram 切。
+        """
         def grams(s: str) -> set:
             s = re.sub(r"\s+", "", s.lower())
             if re.search(r"[\u4e00-\u9fff]", s):

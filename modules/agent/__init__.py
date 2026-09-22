@@ -8,5 +8,9 @@ from modules.agent.llm import LLMClient
 from modules.agent.state import AgentState, AgentStateDict
 from modules.agent.react_agent import ReActAgent
 from modules.agent.graph import AgentGraph
+from modules.agent.router import AgentRouter, RoutingDecision
 
-__all__ = ["LLMClient", "AgentState", "AgentStateDict", "ReActAgent", "AgentGraph"]
+__all__ = [
+    "LLMClient", "AgentState", "AgentStateDict", "ReActAgent", "AgentGraph",
+    "AgentRouter", "RoutingDecision",
+]

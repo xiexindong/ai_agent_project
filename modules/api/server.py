@@ -5,6 +5,7 @@ FastAPI 后端服务模块
 所有接口统一鉴权、限流、多用户隔离。
 """
 import os
+import sys
 import json
 import uuid
 import time
@@ -85,15 +86,17 @@ class ReviewRequest(BaseModel):
 
 class AppContext:
     """应用全局上下文（单例组件）。"""
-    llm: LLMClient = None
-    memory: MemoryManager = None
-    pg: PGManager = None
-    rag: object = None
-    tool_registry: ToolRegistry = None
-    skill_registry: object = None
-    agent_graph: AgentGraph = None
-    harness: object = None
-    crew_backend: object = None
+    llm: LLMClient = None # 单例 LLM 客户端
+    memory: MemoryManager = None # 单例记忆管理器
+    pg: PGManager = None # 单例 Postgres 管理器
+    rag: object = None # 单例 RAG 链路
+    tool_registry: ToolRegistry = None  # 单例工具注册表
+    skill_registry: object = None # 单例技能注册表
+    gateway: object = None       # MCP 技能网关（多 server 纳管，远程技能不直连 LLM）
+    mcp_client: object = None    # 兼容旧字段：直连模式下的 MCP 客户端（现由网关管理）
+    agent_graph: AgentGraph = None # 单例 Agent 图
+    harness: object = None # 单例多 Agent 运行时
+    crew_backend: object = None # 单例角色扮演编排后端
 
 
 def _reconcile_loop(interval_hours: int):
@@ -146,11 +149,11 @@ def create_app() -> FastAPI:
 class APIServer:
     """API 服务封装：组件初始化 + 路由注册。"""
 
-    def __init__(self):
+    def __init__(self): # self.app: FastAPI
         self.app = create_app()
         self.ctx = AppContext()
-        self._init_components()
-        self._register_routes()
+        self._init_components() # 初始化全局组件
+        self._register_routes() # 注册路由
 
     def _init_components(self):
         """初始化全局组件（LLM、记忆、工具、Agent图）。"""
@@ -169,21 +172,48 @@ class APIServer:
         self.ctx.skill_registry.register_batch(get_default_skills())
         _logger.info(f"技能已加载: {len(self.ctx.skill_registry.list_skills())} 个")
 
+        # ------------------------------------------------------------------
+        # 【MCP 技能网关 + Tool-RAG + 分层路由】与 main.py 同一套装配
+        #   改造前：discover_tools() 全量注册 → 每个请求都把全部工具 schema 发给模型
+        #   改造后：远程技能只进「目录 + 向量索引」，每轮由路由决定带哪几个
+        #
+        #   【启动命令为什么用 sys.executable】写死 "python" 在虚拟环境里可能指向
+        #   别的解释器，MCP 子进程起来后 import 不到本项目模块，握手直接失败。
+        # ------------------------------------------------------------------
+        self.ctx.gateway = None
+        router = None
         try:
-            from modules.mcp.mcp_client import MCPClient, MCPToolAdapter
-            mcp_client = MCPClient(
-                server_command=["python", "-m", "modules.mcp.mcp_server"],
-                name="enterprise-mcp",
+            from modules.mcp.gateway import MCPGateway
+            from modules.tools.tool_rag import ToolRAGIndex
+            from modules.agent.router import AgentRouter
+            from modules.common.circuit_breaker import CircuitBreaker
+
+            if s.mcp_enabled:
+                self.ctx.gateway = MCPGateway.from_settings(
+                    s,
+                    breaker=CircuitBreaker(s.cb_failure_threshold, s.cb_recovery_seconds),
+                    default_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
+                )
+                _logger.info(f"MCP 网关已就绪: servers={self.ctx.gateway.server_names}")
+
+            tool_index = None
+            if s.tool_rag_enabled:
+                tool_index = ToolRAGIndex(top_k=s.tool_rag_top_k, min_score=s.tool_rag_min_score)
+                tool_index.index_tools(self.ctx.tool_registry.list_tools())
+                if self.ctx.gateway:
+                    tool_index.index_tools(self.ctx.gateway.catalog())
+                _logger.info(f"Tool-RAG 索引已建立: {tool_index.stats()}")
+
+            router = AgentRouter(
+                skill_registry=self.ctx.skill_registry,
+                tool_index=tool_index,
+                gateway=self.ctx.gateway,
+                top_k=s.tool_rag_top_k,
+                max_tools=s.max_tools_per_turn,
             )
-            mcp_client.connect()
-            tools = mcp_client.discover_tools()
-            for tool_info in tools:
-                adapter = MCPToolAdapter(mcp_client, tool_info)
-                self.ctx.tool_registry.register(adapter)
-            self.ctx.mcp_client = mcp_client
         except Exception as e:
-            _logger.warning(f"MCP Server 接入降级（本地工具仍可用）: {e}")
-            self.ctx.mcp_client = None
+            _logger.warning(f"技能网关/路由降级（按全部工具运行）: {e}")
+            router = None
 
         # 走工厂而不是直接 new RAGChain：RAG_BACKEND=llamaindex 时接管，
         # 库没装会自动降级回自研链路（降级在工厂里记 warning，这里只兜底异常）
@@ -200,6 +230,7 @@ class APIServer:
             rag_chain=self.ctx.rag,
             memory_manager=self.ctx.memory,
             skill_registry=self.ctx.skill_registry,
+            router=router,
         )
         self.ctx.agent_graph = AgentGraph(react_agent)
 
@@ -588,6 +619,17 @@ class APIServer:
         ):
             """待人工审核列表（管理员权限）。"""
             return {"reviews": ctx.pg.get_pending_reviews()}
+
+        # ------------------------------------------------------------------
+        # 【流水线端点】独立模块（modules/api/pipeline_routes.py），
+        #   注册失败只记日志：流水线是增强能力，不该让主服务起不来。
+        # ------------------------------------------------------------------
+        try:
+            from modules.api.pipeline_routes import register_pipeline_routes
+            register_pipeline_routes(app)
+            _logger.info("流水线端点已注册: POST /pipeline/run, POST /pipeline/tools/index, GET /pipeline/health")
+        except Exception as e:
+            _logger.warning(f"流水线端点注册失败: {e}")
 
         @app.post("/reviews/{review_id}/review")
         async def submit_review(

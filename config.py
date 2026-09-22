@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=30.0, alias="LLM_TIMEOUT_SECONDS")
     llm_max_attempts: int = Field(default=3, alias="LLM_MAX_ATTEMPTS")
     fallback_model: str = Field(default="", alias="FALLBACK_MODEL")
+    # ---- 熔断：下游持续故障时直接跳过，省下每次白等的超时 ----
+    cb_failure_threshold: int = Field(default=5, alias="CB_FAILURE_THRESHOLD")     # 连续失败几次后打开
+    cb_recovery_seconds: float = Field(default=30.0, alias="CB_RECOVERY_SECONDS")  # 打开后多久放探针
     tool_timeout_seconds: float = Field(default=30.0, alias="TOOL_TIMEOUT_SECONDS")
 
     rag_keyword_fallback: bool = Field(default=True, alias="RAG_KEYWORD_FALLBACK")
@@ -78,6 +81,10 @@ class Settings(BaseSettings):
 
     max_react_iterations: int = Field(default=10, alias="MAX_REACT_ITERATIONS")
     max_history_tokens: int = Field(default=4000, alias="MAX_HISTORY_TOKENS")
+    # ---- 提示词装配：上下文（RAG/记忆/技能/工具清单）合计能占多少 token ----
+    #   超了由 PromptBuilder 按优先级裁剪（权限 > 工具 > 观察 > 技能 > RAG > 记忆）。
+    #   注意它管的是 prompt，与上面的 max_history_tokens（记忆召回的窗口）不是一回事。
+    max_prompt_context_tokens: int = Field(default=3000, alias="MAX_PROMPT_CONTEXT_TOKENS")
     short_memory_rounds: int = Field(default=3, alias="SHORT_MEMORY_ROUNDS")
     rag_top_k: int = Field(default=5, alias="RAG_TOP_K")
     rerank_top_k: int = Field(default=3, alias="RERANK_TOP_K")
@@ -91,6 +98,48 @@ class Settings(BaseSettings):
     skill_llm_route_enabled: bool = Field(default=True, alias="SKILL_LLM_ROUTE_ENABLED")
     skill_llm_top_n: int = Field(default=3, alias="SKILL_LLM_TOP_N")
     skill_llm_confidence: float = Field(default=0.5, alias="SKILL_LLM_CONFIDENCE")
+
+    # ---- MCP 技能网关：远程技能统一纳管，不直连 LLM ----
+    #   【为什么不直连】MCP 工具若启动时全部注册进 ToolRegistry，
+    #   ReAct 每轮都会把全部工具的 schema 塞给模型（工具一多，prompt 与选择难度同步膨胀）。
+    #   网关只做「纳管 + 建工具目录」，谁有资格进 prompt 由 AgentRouter 决定。
+    mcp_enabled: bool = Field(default=True, alias="MCP_ENABLED")
+    #   拉取工具目录后是否立刻断开子进程；True = 只有真正调用工具时才重新连
+    mcp_lazy_connect: bool = Field(default=True, alias="MCP_LAZY_CONNECT")
+    #   工具目录落盘缓存：进程重启后直接从缓存建索引，不必先拉起所有 server
+    mcp_catalog_cache: str = Field(default="data/mcp_catalog.json", alias="MCP_CATALOG_CACHE")
+    mcp_connect_retry: int = Field(default=2, alias="MCP_CONNECT_RETRY")
+    #   多 server 配置，JSON 数组：[{"name":"enterprise","command":["python","-m","x"]}]
+    #   留空则回退到 main.py 里的默认单 server（向后兼容）
+    mcp_servers_json: str = Field(default="", alias="MCP_SERVERS_JSON")
+
+    # ---- Tool-RAG：按语义只召回本轮用得上的工具 ----
+    tool_rag_enabled: bool = Field(default=True, alias="TOOL_RAG_ENABLED")
+    tool_rag_top_k: int = Field(default=5, alias="TOOL_RAG_TOP_K")
+    #   【绝对下限】低于该相似度的工具不进 prompt：宁可少给一个，也不塞一堆噪声候选
+    #     0.25 是实测标定的（智谱 embedding-2，1024 维）：
+    #       正确候选的相似度落在 0.28~0.63，无关候选多在 0.14~0.20，
+    #       取 0.25 能把两者分开；取 0.30 会砍掉"上海明天天气怎么样"→city_weather(0.2871)
+    #       这种表述偏长但确实正确的候选。
+    tool_rag_min_score: float = Field(default=0.25, alias="TOOL_RAG_MIN_SCORE")
+    #   【相对下限】候选分数 ≥ 本轮最高分 * 该系数
+    #     不同 embedding 模型的分数区间不同，纯绝对阈值换个模型就要重调；
+    #     加一条相对阈值后，只要"第一名明显领先"就能把尾部噪声自动切掉。
+    tool_rag_relative_ratio: float = Field(default=0.6, alias="TOOL_RAG_RELATIVE_RATIO")
+    #   单轮最多暴露几个工具（技能绑定 + 语义召回合计），最后一道硬上限
+    max_tools_per_turn: int = Field(default=8, alias="MAX_TOOLS_PER_TURN")
+
+    # ---- 请求处理流水线（清洗 → 风控 → Token控制 → 意图识别 → 分支路由）----
+    pipeline_risk_enabled: bool = Field(default=True, alias="PIPELINE_RISK_ENABLED")
+    #   意图识别前允许的最大输入 token：超过就先压缩，避免长文本把分类 prompt 撑爆
+    pipeline_max_input_tokens: int = Field(default=2000, alias="PIPELINE_MAX_INPUT_TOKENS")
+    pipeline_compress_enabled: bool = Field(default=True, alias="PIPELINE_COMPRESS_ENABLED")
+    #   置信度下限：低于此值一律禁止调用任何工具（宁可让模型空手答，也不乱调工具）
+    pipeline_min_confidence: float = Field(default=0.5, alias="PIPELINE_MIN_CONFIDENCE")
+    #   Tool-RAG 召回数量（只召回本轮用得上的候选技能）
+    pipeline_tool_top_k: int = Field(default=3, alias="PIPELINE_TOOL_TOP_K")
+    #   pgvector 工具元数据表名
+    tool_vector_table: str = Field(default="tool_catalog", alias="TOOL_VECTOR_TABLE")
 
     mysql_readonly_user: str = Field(default="", alias="MYSQL_READONLY_USER")
     mysql_readonly_password: str = Field(default="", alias="MYSQL_READONLY_PASSWORD")

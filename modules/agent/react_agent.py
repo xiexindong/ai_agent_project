@@ -12,44 +12,28 @@ from modules.common.exceptions import LLMException, ToolException, handle_except
 from modules.common.validator import sanitize_input, check_prompt_injection, repair_json
 from modules.agent.llm import LLMClient
 from modules.agent.state import AgentState
+from modules.prompt import PromptBuilder, get_registry
 
 _logger = get_logger("react")
 
 
 class ReActAgent:
-    """ReAct 推理引擎（Reason-Action-Observation 循环）。"""
+    """ReAct 推理引擎（Reason-Action-Observation 循环）。
 
-    SYSTEM_PROMPT = (
-        "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"
-        "## 工作流程（ReAct）\n"
-        "1. Reason：分析用户问题，判断是否需要调用工具\n"
-        "2. Action：如需工具，调用对应工具获取信息\n"
-        "3. Observation：观察工具返回结果，决定是否继续调用或给出答案\n\n"
-        "## 核心规则\n"
-        "- 仅基于知识库和工具返回的事实回答，禁止编造\n"
-        "- 知识库无相关内容时，如实告知并尝试工具补充\n"
-        "- 工具调用需确认参数正确性\n"
-        " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"
-        "## 回答要求\n"
-        "- 提供完整详细的答案（包含推理依据、数据来源）\n"
-        "- 末尾附【摘要】标签，用一句话总结本轮对话核心"
-    )
+    【提示词从哪来】不再写死在类里，全部取自 modules/prompt 的注册表：
+        react.role(v1)    角色 + 核心规则 + 回答要求（变量 max_iter）
+        react.reason(v1)  8 个上下文槽位（query/技能/权限/RAG/记忆/工具历史/观察/工具清单）
+        react 策略块      Reason→Action→Observation 流程，由 strategies.py 生成
+    三者在 PromptBuilder 里拼成 system + user 两条消息。
 
-    REASON_PROMPT = (
-        "## 用户提问\n{query}\n\n"
-        "## 激活技能（SOP作业流程）\n{skill_context}\n\n"
-        "## 权限边界（硬性约束，越界即违规）\n{permission_context}\n\n"
-        "## 知识库参考\n{rag_context}\n\n"
-        "## 历史记忆\n{memory_context}\n\n"
-        "## 历史工具调用\n{tool_history}\n\n"
-        "## 工具观察结果\n{observation}\n\n"
-        "## 可用工具（Function Calling）\n{tools_desc}\n\n"
-        "请分析当前情况，决定下一步行动：\n"
-        "- 如果已激活技能，优先遵循该技能的作业流程(SOP)，并优先使用其推荐工具\n"
-        "- 如果已有足够信息回答，直接给出最终答案\n"
-        "- 如果需要更多信息，选择合适的工具调用\n"
-        "- 严格使用 Function Calling 格式输出工具调用"
-    )
+    【为什么要迁走而不是留在类里】
+        留在类里，改一句话要翻本文件，且"换个问法"只能改正文；
+        迁走之后：模板带版本可回滚，问法由 strategy 参数切换，
+        上下文超长由 builder 按预算裁剪（权限 > 工具 > 观察 > 技能 > RAG > 记忆）。
+
+    【旧文案还在吗】在。react.system(v1) 的正文与迁移前的 SYSTEM_PROMPT 逐字
+        一致，react.reason(v1) 与旧 REASON_PROMPT 逐字一致，需要原文时按名取用即可。
+    """
 
     def __init__(
         self,
@@ -58,15 +42,41 @@ class ReActAgent:
         rag_chain=None,
         memory_manager=None,
         skill_registry=None,
+        router=None,
     ):
         self.llm = llm_client or LLMClient()
         self.tool_registry = tool_registry
         self.rag = rag_chain
         self.memory = memory_manager
         self.skill_registry = skill_registry
+        # L0 路由层（可选）：没有它时退化为「全部工具」，行为与改造前一致
+        self.router = router
         from config import get_settings
         s = get_settings()
         self._max_iter = s.max_react_iterations
+
+        # ------------------------------------------------------------------
+        # 【提示词装配在这里定型，之后每轮只重拼 user】
+        #   role  : react.role(v1) 渲染结果，含「末尾附【摘要】标签」
+        #           —— generate_answer 之后靠这个标签抽取摘要，不能改掉
+        #   system: role + react 策略块（流程 + 工具清单），每轮都一样，
+        #           所以这里算一次存成 self.system_prompt，供 generate_answer 复用
+        #
+        # 【max_context_tokens 管什么】
+        #   上下文（权限/工具/观察/技能/RAG/记忆）合计的 token 上限，
+        #   来自配置 MAX_PROMPT_CONTEXT_TOKENS（默认 3000）。
+        #   超了由 builder 裁剪：先截 RAG，再丢记忆，权限边界永远最后才动。
+        #   不设的话，RAG 召回一大段时 prompt 会一路膨胀到把上下文窗口吃满。
+        # ------------------------------------------------------------------
+        role = get_registry().render("react.role", max_iter=self._max_iter)
+        self._builder = PromptBuilder(
+            template_name="react.reason",
+            strategy="react",
+            role=role,
+            max_iter=self._max_iter,
+            max_context_tokens=s.max_prompt_context_tokens,
+        )
+        self.system_prompt = self._builder.system_prompt()
 
     def prepare_state(
         self,
@@ -286,8 +296,35 @@ class ReActAgent:
         tools_schema = []
         tools_desc = "（无可用工具）"
         if self.tool_registry:
-            all_tools = self.tool_registry.list_tools()
-            allowed = self._allowed_tools(state.principal, all_tools)
+            selected = self.tool_registry.list_tools()
+            if self.router:
+                # ------------------------------------------------------------------
+                # 【L0 路由：只在本轮第 1 次算名单，之后沿用】
+                #   每轮都重算要再调一次 embedding，且名单中途变化会让模型困惑
+                #   （上一轮还在的工具这一轮突然没了）。
+                #   沿用同一份名单：工具集稳定，ReAct 才能稳定收敛。
+                #
+                # 【这一步之后远程工具才真正就位】
+                #   网关目录里的工具此刻才连 server、注册进 registry；
+                #   没被召回的远程工具不会起进程，也不会进 prompt。
+                # ------------------------------------------------------------------
+                if not state.routed_tools:
+                    decision = self.router.route(
+                        state.user_query,
+                        registry=self.tool_registry,
+                        skill_name=state.active_skill,
+                    )
+                    state.routed_tools = list(decision.tool_names)
+                selected = [
+                    t for t in self.tool_registry.list_tools()
+                    if t.name in state.routed_tools
+                ]
+                _logger.info(
+                    f"本轮工具名单 {len(selected)}/{len(state.routed_tools or [])} 个"
+                    f"（候选池 {len(self.tool_registry.list_tools())}）: "
+                    + "、".join(t.name for t in selected)
+                )
+            allowed = self._allowed_tools(state.principal, selected)
             user_level = state.principal.user_level if state.principal else "normal"
             tools_schema = self.tool_registry.get_openai_tools_schema(
                 user_level=user_level, allowed=allowed
@@ -302,8 +339,17 @@ class ReActAgent:
             for log in state.tool_calls_history
         ) or "（无）"
 
-        prompt = self.REASON_PROMPT.format(
-            query=state.user_query,
+        # ------------------------------------------------------------------
+        # 【这一行替代了原来的 REASON_PROMPT.format(...)】
+        #   同样的 8 个槽位，多得到三件事：
+        #     1. 变量表由模板自己算出来，少传一个就抛 PromptError，
+        #        不会出现"槽位空着但照样发请求"的静默降质
+        #     2. 上下文按 token 预算裁剪，超长 RAG 不再整段塞进去
+        #     3. 返回值里带 prompt_tokens 与 trimmed，裁剪动作可查（见 debug 日志）
+        #   messages 已经是 [system, user] 两条，system 用 __init__ 里算好的那份。
+        # ------------------------------------------------------------------
+        rec = self._builder.build_record(
+            state.user_query,
             permission_context=self._permission_context(state.principal),
             skill_context=state.skill_context or "（未匹配到专门技能，按通用企业助手流程处理）",
             rag_context=state.rag_context or "（知识库无相关内容）",
@@ -312,12 +358,11 @@ class ReActAgent:
             observation=state.observation or "（初始状态，暂无工具观察）",
             tools_desc=tools_desc,
         )
+        if rec["trimmed"]:
+            _logger.warning(f"提示词上下文超预算已裁剪: {rec['trimmed']}")
 
         result = self.llm.invoke_with_tools(
-            messages=[
-                {"role": "system", "content": self.SYSTEM_PROMPT.format(max_iter=self._max_iter)},
-                {"role": "user", "content": prompt},
-            ],
+            messages=rec["messages"],
             tools=tools_schema,
         )
 
@@ -455,7 +500,7 @@ class ReActAgent:
             )
             state.final_answer = self.llm.invoke(
                 prompt,
-                system_prompt=self.SYSTEM_PROMPT.format(max_iter=self._max_iter),
+                system_prompt=self.system_prompt,
             )
 
         state.finished = True

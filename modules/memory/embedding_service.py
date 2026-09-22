@@ -44,20 +44,119 @@ class EmbeddingService:
             except Exception as e:
                 raise LLMException("Embedding服务初始化失败", str(e))
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    # ------------------------------------------------------------------
+    # 【这个装饰器在干什么】给下面的 API 调用自动套一层「失败重试」
+    #   被装饰后，_embed_batch() 调用失败不会立刻抛错，tenacity 会自动再调几次。
+    #
+    # 【为什么需要重试】
+    #   调智谱 API 是网络请求，失败分两类：
+    #     瞬时故障（值得重试）：网络抖动、429 限流、502/503 服务端抖动
+    #       —— 这类错误隔一两秒再试大概率就成功了
+    #     永久故障（重试无用）：API Key 无效、参数非法、单条文本超长
+    #       —— 这类重试 100 次也一样失败，只是白等、白耗配额
+    #   重试机制只对第一类有效，这是它的能力边界。
+    #
+    # 【次数是怎么被限制的】靠 stop=stop_after_attempt(max_attempt_number=3)
+    #   tenacity 的机制：每次调用失败后，先问一遍所有 stop 条件「要不要停」，
+    #   任意一个返回 True 就停止重试并把异常抛出去。
+    #   参数名 max_attempt_number 直译就是「最多尝试次数」，注意最大的坑：
+    #   它是「总共尝试 3 次」，不是「失败后再重试 3 次」。
+    #       max_attempt_number   1         2         3
+    #       含义                 首次      重试1     重试2（末次，失败即抛错）
+    #   所以实际只会重试 2 次。写成 3 却以为调用 4 次，是常见误解。
+    #
+    # 【间隔是怎么被限制的】靠 wait=wait_exponential(min=1, max=10) 指数退避
+    #   公式：等待秒数 = clamp(multiplier × exp_base^(attempt_number - 1), min, max)
+    #   tenacity 里 multiplier 默认 1、exp_base 默认 2，所以本配置的实际时序是：
+    #       第 1 次失败后等 1 秒（2^0 = 1）再发起第 2 次
+    #       第 2 次失败后等 2 秒（2^1 = 2）再发起第 3 次
+    #       第 3 次失败 → 已到次数上限，不再等待，直接抛错
+    #   即整个过程最多等待 3 秒。用递增间隔而不是固定间隔，是为了避开对方
+    #   服务端的拥塞窗口：你越频繁重试，越容易被继续限流。
+    #
+    # 【察觉不足 1】max=10 在当前配置下是「死参数」，永远不会生效
+    #   触发 max 封顶需要等待秒数 ≥ 10，即 2^(n-1) ≥ 10，n ≥ 5。
+    #   而这里总共只尝试 3 次，最大等待只到 2 秒，永远够不到 10 秒封顶线。
+    #   若哪天把次数调到 5 次以上，max=10 才开始起作用。
+    #
+    # 【察觉不足 2】没有限定异常类型，永久故障也会白重试
+    #   这里没写 retry= 参数，tenacity 默认对所有 Exception 生效。
+    #   于是「API Key 错误」这类永久故障同样会被重试 2 次，白等 3 秒。
+    #   更精确的写法是 retry=retry_if_exception_type((TimeoutError, RateLimitError))
+    #   之类，把重试范围收窄到瞬时故障。
+    #
+    # 【察觉不足 3】重试耗尽后抛的是 RetryError，不是原始异常
+    #   tenacity 默认 reraise=False，会把最后一次的真实异常包进 RetryError 里抛出。
+    #   上层 embed() 里 `except Exception as e: str(e)` 拿到的是
+    #   "<RetryError [<Future at 0x... raised Timeout>]>" 这种几乎没信息量的字符串，
+    #   真正的报错原因被藏住了。要拿到原始异常需 e.last_attempt.exception()，
+    #   或在装饰器上加 reraise=True 直接抛出原始异常。
+    # ------------------------------------------------------------------
+    @retry(stop=stop_after_attempt(max_attempt_number=3), wait=wait_exponential(min=1, max=10))
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """调用智谱API批量生成向量（单次最多64条）。"""
+        """
+        调用智谱API批量生成向量（单次最多64条）。
+
+        【在整条链上的位置】它是全项目唯一真正发网络请求算向量的地方：
+            embed(text)         —— 单条文本，记忆系统存取记忆向量用
+            embed_batch(texts)  —— 自动按 64 条切分，RAG 文档入库用
+                    这两个上层只负责整理参数，最终都调到这里
+                    ↓
+            _embed_batch(batch) ← 唯一碰网络的一层，上面那个 @retry 就挂在它身上
+                    ↓
+                智谱 embedding-2 API
+            好处是「单一出口」：重试、日志、异常处理只需在这一处做，改一处全局生效。
+        """
         s = get_settings()
 
+        # 【举个最简单的例子，一眼看懂这个函数在干什么】
+        #   输入 texts（3 条文本）：
+        #       ["今天天气不错", "明天要下雨", "周末去爬山"]
+        #   输出（3 条向量，与输入一一对应）：
+        #       [
+        #         [ 0.023, -0.011,  0.087, ... 共 1024 个数],   ← 第 1 条文本的「坐标」
+        #         [ 0.015,  0.042, -0.063, ... 共 1024 个数],   ← 第 2 条文本的「坐标」
+        #         [ 0.031,  0.008,  0.052, ... 共 1024 个数],   ← 第 3 条文本的「坐标」
+        #       ]
+        #   一句话概括：把「文字」批量翻译成「数字坐标」。
+        #   为什么坐标有用？因为意思相近的句子，算出来的坐标也相近 —— 之后只要比较
+        #   坐标距离，就能找出「意思最接近」的那几条，这正是向量检索（pgvector）的原理。
+        #   条数规则（要分清是哪一层）：直接调本函数时，传 3 条 ✓、传 64 条 ✓、
+        #   传 65 条 ✗（API 直接报错）；但走上层 embed_batch() 就不用管，
+        #   它会自动切成 64 + 1 两批 —— 实测传 65 条会调用 API 2 次、返回 65 条向量。
+        #
+        # 一次把整批文本发过去，而不是循环发单条：
+        # 64 条一次请求 vs 发 64 次请求，网络往返从 64 次降到 1 次。
+        # 注意「单次最多 64 条」是智谱 API 的硬限制，本函数只写进了文档、
+        # 没有代码校验，所以切分责任实际落在上层 embed_batch() 身上。
+        #
+     
         resp = self._client.embeddings.create(
-            model=self._model,
+            model=self._model,   # 智谱 embedding-2
             input=texts,
         )
+        # 拆包：SDK 返回的是一串对象，每项形如
+        #   {"object": "embedding", "index": 0, "embedding": [0.023, -0.011, ... 共1024个]}
+        # 这里剥成裸数值，让上层完全不依赖 zhipuai 的类型，换供应商只改这个文件。
+        #
+        # 【察觉不足：两处静默错位风险】
+        #   1. 未校验返回条数：API 若只回 3 条而输入 5 条，这里不报错，
+        #      上层 results.extend(vectors) 照常执行 —— 向量数少于文本数，
+        #      之后全部错位，且全程无异常。
+        #   2. 未按 index 排序：每个 item 自带的 index 字段本就是用来对齐顺序的，
+        #      当前直接依赖返回顺序，上游一旦打乱即为静默错位。
+        #      严谨写法：sorted(resp.data, key=lambda x: x.index)
+        # 向量检索里「顺序即语义」，错位等于数据损坏却不抛异常，
+        # 属于「静默全失败」的同类问题。
         return [item.embedding for item in resp.data]
 
     def embed(self, text: str) -> List[float]:
         """生成单条文本的向量。"""
         if not text or not text.strip():
+            # 意思是：把 [0.0] 这个列表，重复 5 次
+            #result = [0.0] * 5
+            # 运行结果：[0.0, 0.0, 0.0, 0.0, 0.0]
+            
             return [0.0] * self._dim
         try:
             vectors = self._embed_batch([text.strip()])

@@ -120,10 +120,75 @@ class PGManager:
 
             self._cur = self._conn.cursor()
 
+            # ------------------------------------------------------------------
+            # 【这一行在做什么】注册 pgvector 扩展，让 PostgreSQL 认识 vector 类型
+            #   CREATE EXTENSION 是 PostgreSQL 的「装插件」语句。vector 不是 PG 内置
+            #   类型，不装的话下面 _init_tables() 里建表时的
+            #       summary_embedding vector(1024)
+            #   会直接报 type "vector" does not exist，程序连启动都过不去。
+            #
+            # 【为什么必须带 IF NOT EXISTS】
+            #   扩展是「数据库级别」的，装一次就永久存在。不带这个条件的话，
+            #   第二次启动程序会报 extension "vector" already exists 直接崩；
+            #   带上就是幂等的：装过就跳过，和 _init_tables() 里的建表一个套路。
+            #
+            # 【依赖警告】与数据库镜像硬绑定
+            #   这行要求镜像里已经编译了 pgvector（本项目用 pgvector/pgvector:pg16）。
+            #   若换成官方 postgres:16 镜像，会报 could not open extension control
+            #   file，属于「换个镜像就炸」的隐性依赖。
+            # ------------------------------------------------------------------
             self._cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
+            # ------------------------------------------------------------------
+            # 【为什么要单独 commit】因为上面关掉了自动提交
+            #   self._conn.autocommit = False 意味着执行过的 SQL 只是留在
+            #   「未提交事务」里，不 commit 就等于没真正落库。
+            #
+            # 【为什么在这里提交，而不是攒着一起提交】
+            #   目的是把「装扩展」和「建表」拆成两个独立事务，缩小失败的影响范围。
+            #     不提交（反例）：扩展创建会一直悬在同一个事务里，后面
+            #       _init_tables() 若某条建表失败并回滚，扩展创建会被一起带走，
+            #       等于白装；而且未结束的事务一直持有锁，第二个进程启动时执行
+            #       同样的 CREATE EXTENSION 只能阻塞等待。
+            #     提交（正例）：扩展一旦 commit 就永久生效，之后建表失败也不会
+            #       把它连带回滚，重跑只需重建表，不用重装扩展。
+            #
+            # 【为什么必须在 register_vector 之前】
+            #   register_vector() 要先去 pg_type 查出 vector 类型的 OID 才能注册
+            #   适配器，所以顺序只能是「先让扩展生效，再注册」，两句不能调换。
+            # ------------------------------------------------------------------
             self._conn.commit()
 
+            # ------------------------------------------------------------------
+            # 【上面这句 + 这两行，三层合起来在干什么】让「存向量」从不可能变成可能
+            #
+            #   第 1 层（上面那句 execute）—— 数据库服务端视角
+            #       CREATE EXTENSION vector：让 PostgreSQL 自己认识 vector 类型。
+            #       不装的话，建表时写 vector(1024) 会报 type "vector" does not exist。
+            #
+            #   第 2 层（本行）—— Python 客户端视角
+            #       register_vector() 告诉 psycopg2「vector 类型在这个进程里该怎么收发」。
+            #       它内部先查 pg_type 拿到 vector 类型的 OID，再注册两个适配器：
+            #           写入方向：Python 的 list / numpy array  转成  数据库的 vector
+            #           读取方向：数据库的 vector              转成  Python 的 numpy array
+            #       不注册的后果（反例）：save_history() 传 summary_embedding=[0.12,-0.34,...]
+            #       时 psycopg2 不认识 list 该转成什么，直接抛 can't adapt type 'list'，
+            #       向量根本写不进去 —— 而这恰恰是长期记忆语义检索的核心字段。
+            #
+            #   第 3 层（本行）—— 业务视角
+            #       _init_tables() 把 4 张表真正建出来，其中 chat_history 表的
+            #       summary_embedding 列就声明为 vector(1024)。
+            #       它内部跑完 DDL 后自己会 commit 一次（见该函数末尾），
+            #       所以这里不需要再补 commit。
+            #
+            # 【为什么第 1 层必须先 commit，才能做第 2 层】
+            #   register_vector 要查 pg_type 找 OID，而扩展必须已经生效可见；
+            #   若扩展还悬在未提交事务里，这一步就可能查不到类型导致注册失败。
+            #
+            # 【一句话串起来】
+            #   数据库认识 vector（服务端） + Python 会收发 vector（客户端）
+            #   + 表里真有 vector 列（业务）= 能写入 1024 维摘要向量并按语义检索。
+            # ------------------------------------------------------------------
             register_vector(self._conn)
             self._init_tables()
             _logger.info(f"PG连接成功: {s.pg_host}:{s.pg_port}/{s.pg_database}")
@@ -588,7 +653,28 @@ class PGManager:
                ORDER BY summary_embedding <=> %s
                LIMIT %s""",
             (emb, user_id, emb, top_k),
+
         )
+        # ------------------------------------------------------------------
+        # execute 只负责「执行」，返回 None；结果行留在游标的结果集里，要靠
+        # fetch 系列搬回 Python。官方对 fetchall 的说明是 "Return all the
+        # REMAINING rows" —— remaining 说明取过的不会再给。
+        #
+        # 实测（本项目真实库）：
+        #   不 fetch 拿不到数据，重复 fetchall 得 []；
+        #   不 fetch 也能拿到的只有 description（列名）和 rowcount（行数）。
+        #   ⚠ INSERT 之后 fetchall 是直接抛 ProgrammingError，不是返回 []。
+        #   ⚠ 没取就执行下一条 SQL，旧结果集被静默丢弃，fetchall 拿到新结果。
+        #
+        # fetchone() / fetchmany(n) / fetchall() 取的是同一份结果集，区别只在内存；
+        # 本方法有 LIMIT 兜底，用 fetchall 划算。返回值是 tuple，故用 r[0]、r[1] 取。
+        #
+        # 两个隐患：
+        #   1) 全类共用 self._cur（第 121 行）：单线程无碍，多线程下方法 B 的
+        #      execute 会顶掉方法 A 的结果集，A 的 fetchall 拿到错数据且不报错。
+        #   2) 客户端游标：execute 时结果已全读进本机内存，fetchall 省不了内存，
+        #      要流式取数需用命名游标 conn.cursor(name=...)。批量任务留意这点。
+        # ------------------------------------------------------------------
         rows = self._cur.fetchall()
         return [
             {

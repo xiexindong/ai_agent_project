@@ -84,19 +84,50 @@ def cmd_chat(args):
     skill_registry.register_batch(get_default_skills())
     _logger.info(f"技能已加载: {len(skill_registry.list_skills())} 个")
 
+    # ------------------------------------------------------------------
+    # 【MCP 技能网关 + Tool-RAG + 分层路由】三件套在这里装配
+    #   改造前：discover_tools() 全量注册 → 每轮把全部工具 schema 发给模型
+    #   改造后：网关只登记目录（工具描述进向量索引，不进 prompt），
+    #           AgentRouter 每轮按语义召回 top-k，只有被召回的才连 server + 注册
+    #
+    #   【装配失败怎么降级】网关/索引/路由任一环节出错，router 保持为 None，
+    #   ReActAgent 会退回「全部工具」模式，行为与改造前一致 —— 新机制是增强，不是依赖。
+    # ------------------------------------------------------------------
+    gateway = None
+    router = None
     try:
-        from modules.mcp.mcp_client import MCPClient, MCPToolAdapter
-        mcp = MCPClient(
-            server_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
-            name="enterprise-mcp",
+        from modules.mcp.gateway import MCPGateway
+        from modules.tools.tool_rag import ToolRAGIndex
+        from modules.agent.router import AgentRouter
+        from modules.common.circuit_breaker import CircuitBreaker
+
+        if s.mcp_enabled:
+            gateway = MCPGateway.from_settings(
+                s,
+                breaker=CircuitBreaker(s.cb_failure_threshold, s.cb_recovery_seconds),
+                default_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
+            )
+            _logger.info(f"MCP 网关已就绪: servers={gateway.server_names}")
+
+        tool_index = None
+        if s.tool_rag_enabled:
+            tool_index = ToolRAGIndex(top_k=s.tool_rag_top_k, min_score=s.tool_rag_min_score)
+            # 索引内容 = 本地工具 + 远程目录（只有描述，不是调用契约）
+            tool_index.index_tools(tool_registry.list_tools())
+            if gateway:
+                tool_index.index_tools(gateway.catalog())
+            _logger.info(f"Tool-RAG 索引已建立: {tool_index.stats()}")
+
+        router = AgentRouter(
+            skill_registry=skill_registry,
+            tool_index=tool_index,
+            gateway=gateway,
+            top_k=s.tool_rag_top_k,
+            max_tools=s.max_tools_per_turn,
         )
-        mcp.connect()
-        for tool_info in mcp.discover_tools():
-            tool_registry.register(MCPToolAdapter(mcp, tool_info))
-        _logger.info(f"MCP工具已接入: {len(tool_registry.list_tools())} 个工具")
     except Exception as e:
-        _logger.warning(f"MCP降级（本地工具仍可用）: {e}")
-        mcp = None
+        _logger.warning(f"技能网关/路由降级（按全部工具运行）: {e}")
+        router = None
 
     rag = None
     try:
@@ -111,6 +142,7 @@ def cmd_chat(args):
         rag_chain=rag,
         memory_manager=memory,
         skill_registry=skill_registry,
+        router=router,
     )
     agent_graph = AgentGraph(react_agent)
 
@@ -160,8 +192,9 @@ def cmd_chat(args):
             print("（历史记忆已自动压缩）")
         print()
 
-    if mcp:
-        mcp.disconnect()
+    # 网关负责收尾它拉起的所有 MCP 子进程（改造前这里是 mcp.disconnect()）
+    if gateway:
+        gateway.shutdown()
     pg.close()
 
 

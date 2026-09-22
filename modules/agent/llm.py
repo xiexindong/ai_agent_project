@@ -23,8 +23,32 @@ from modules.common.logger import get_logger
 from modules.common.exceptions import LLMException
 from modules.common.validator import repair_json
 from config import get_settings
+from modules.common.circuit_breaker import CircuitBreaker
 
 _logger = get_logger("llm")
+
+# 不可降级的 HTTP 状态码：这些是「请求本身有问题」，换个模型结果一模一样。
+#   400 参数错 / 401 认证失败 / 402 欠费 / 403 无权限 / 404 模型不存在 / 405 / 409 / 413 / 422
+# 反过来看：无状态码（网络层超时、连接失败）与 429 限流、5xx 服务端故障，都是「可降级」。
+_NO_DEGRADE_STATUS = {400, 401, 402, 403, 404, 405, 409, 413, 422}
+
+
+def _is_degradable(exc: BaseException) -> bool:
+    """这个异常是否值得「换个模型再试一次」。
+
+    True  ：超时 / 连接失败 / 429 / 5xx —— 下游瞬时故障，降级有意义
+    False ：400 / 401 / 402 / 403 / 404 / 422 —— 请求本身的错，换谁都一样；
+            这类既不该降级（白等一次超时），也不该计入熔断
+            （否则一次参数 bug 就能把主模型熔断掉，整条链路跟着被误伤）
+
+    判据用「HTTP 状态码」而不是异常类名：OpenAI SDK 的网络异常
+    （APITimeoutError / APIConnectionError）没有 status_code，
+    所以「无状态码」就等于「请求没到达服务端」，一律视为可降级。
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return True
+    return status not in _NO_DEGRADE_STATUS
 
 
 def _llm_retry():
@@ -88,6 +112,11 @@ class LLMClient:
                 )
                 self._model: str = s.deepseek_model
                 self.usage_context: dict = {}
+                # 熔断器跟着单例走：整个进程共用一个，内部按模型名隔离计数
+                self._breaker = CircuitBreaker(
+                    failure_threshold=s.cb_failure_threshold,
+                    recovery_timeout=s.cb_recovery_seconds,
+                )
                 _logger.info(f"LLM客户端初始化: model={self._model}")
             except Exception as e:
                 raise LLMException("LLM客户端初始化失败", str(e))
@@ -112,7 +141,7 @@ class LLMClient:
         }
 
     def _chat(self, **kwargs):
-        """统一出口：超时 + 备用模型降级 + token 用量的落库入口。"""
+        """统一出口：熔断快速失败 + 备用模型降级 + token 用量落库。"""
         s = get_settings()
         started = time.time()
         # ------------------------------------------------------------------
@@ -126,22 +155,100 @@ class LLMClient:
         #   → 单次对话耗时被拉到 3~4 秒且答案为空。接口仍返回 200，
         #     所以只看 HTTP 状态码的压测会显示"全部成功"，是最难发现的静默故障。
         #
-        # 【为什么用 setdefault】上面的降级分支会显式传 model=备用模型，
-        #   不能覆盖它，只在没指定时才填主模型。
+        # 【为什么从 setdefault 改成 pop】model 不再原样转发给 SDK，
+        #   而是取出来当「主模型」用 —— 熔断计数、降级判断都按它做；
+        #   真正发给 SDK 的 model 由下面的 _request() 显式指定。
         # ------------------------------------------------------------------
-        kwargs.setdefault("model", self._model)
-        try:
-            resp = self._client.chat.completions.create(timeout=s.llm_timeout_seconds, **kwargs)
-        except Exception as e:
-            fb = s.fallback_model
-            if not fb or fb == self._model:
-                raise
-            _logger.warning(f"主模型 {self._model} 调用失败，降级备用模型 {fb}: {e}")
-            resp = self._client.chat.completions.create(
-                model=fb, timeout=s.llm_timeout_seconds, **kwargs
-            )
-        self._log_usage(resp, int((time.time() - started) * 1000))
+        primary = kwargs.pop("model", None) or self._model
+        fb = s.fallback_model
+        can_fallback = bool(fb) and fb != primary
+
+        # ------------------------------------------------------------------
+        # _chat 是 invoke / invoke_with_tools / invoke_structured 的唯一出口，
+        # 一次调用要过两道闸：
+        #
+        #   闸 1 · 熔断：主模型连续失败已达阈值 → 试都不试，直接走备用模型。
+        #          省下的正是「注定失败的那次等待」—— 默认 30s 超时。
+        #   闸 2 · 降级：主模型这次真的失败了 → 换备用模型重发一次。
+        #          只对「换个下游可能就好」的故障降级：超时/连接失败/429/5xx；
+        #          400/401/402 这类请求本身的错直接抛 —— 换谁都一样，且不计入熔断。
+        #
+        #   处理前 kwargs（model 已被上一行取出，其余由上层 invoke* 传入）：
+        #       {"messages": [{"role": "user", "content": "3*7等于几"}],
+        #        "temperature": 0.3, "max_tokens": 2048}
+        #   处理后 resp —— OpenAI SDK 的 ChatCompletion 对象，回答不在顶层：
+        #       resp.choices[0].message.content → "3*7=21"   ← 正文，invoke 里取的就是它
+        #       resp.model                      → 实际服务的模型，计费按它算
+        #       resp.usage.prompt_tokens        → 12          ← _log_usage 取它
+        #
+        # 【有熔断器之后的耗时差别】主备都故障时（llm_max_attempts=3）：
+        #   只有降级：每次重试都先撞一次主模型 → 3 × (30s + 30s) ≈ 3 分钟
+        #   加了熔断：熔断期间直接跳过主模型 → 3 × 30s ≈ 1.5 分钟
+        # ------------------------------------------------------------------
+        if can_fallback and not self._breaker.allow(primary):
+            # 熔断中：不做无谓尝试，直接降级。这一步是「省时间」而不是「容错」
+            _logger.warning(f"熔断器打开，跳过主模型 {primary}，直接使用备用模型 {fb}")
+            resp = self._request(fb, s, **kwargs)
+        else:
+            try:
+                resp = self._request(primary, s, **kwargs)
+                self._breaker.record_success(primary)
+            except Exception as e:
+                if not _is_degradable(e):
+                    raise                       # 请求本身的错：降级无意义，也不记熔断
+                self._breaker.record_failure(primary)
+                if not can_fallback:
+                    raise
+                _logger.warning(f"主模型 {primary} 调用失败，降级备用模型 {fb}: {e}")
+                resp = self._request(fb, s, **kwargs)
+
+        # ------------------------------------------------------------------
+        # 【这行在干什么】调用成功后记一笔用量流水，用来核对费用。
+        #   一次对话 = sys_llm_usage 里一行：谁（user_code）、哪个部门（dept_code）、
+        #   哪轮对话（session_id / task_id）、用了哪个模型、烧了多少 token、等了多久。
+        #   三个 invoke* 都从这里出去，主模型和降级后的备用模型也都从这里出去，
+        #   所以调用路径再多也不会漏账。
+        #
+        # 【处理前 → 处理后】
+        #   处理前 resp 由服务端带回用量，started 是进入 _chat 的时点：
+        #       resp.model                    → "deepseek-chat"   ← 实际服务的模型
+        #       resp.usage.prompt_tokens      → 12
+        #       resp.usage.completion_tokens  → 5
+        #       time.time() - started         → 0.82 秒
+        #   处理后 MySQL 多一行（total_tokens 由两列相加）：
+        #       sys_llm_usage(user_code='U001', dept_code='D_TECH',
+        #                     session_id='sess-7f3a', task_id='T-20260921-3f9c1a2b',
+        #                     model='deepseek-chat',
+        #                     prompt_tokens=12, completion_tokens=5, total_tokens=17,
+        #                     latency_ms=820)
+        #
+        # 【核对费用的口径】按部门：GROUP BY dept_code 后 SUM(total_tokens)；
+        #   按人则换成 user_code（idx_user_time 索引）。model 列要留着算价：
+        #   主模型与备用模型单价不同，混在一起就不准，所以记的是 resp.model
+        #   （实际服务的那一个），而不是我们请求时点名的那个。
+        #
+        # 【latency_ms 为什么在这里算】SDK 不返回端到端耗时。started 取自 _chat 入口，
+        #   包含了降级重发那次，记的是用户真实感受到的等待，与「主备都挂最坏 3 分钟」
+        #   的止损口径一致。
+        #
+        # 【两种记不上账的边界（都不影响对话返回）】
+        #   1. resp.usage 为空（部分兼容接口不返回）或 RBAC_ENABLED=false
+        #      → _log_usage 开头直接 return，不写库；
+        #   2. MySQL 写失败 → _log_usage 内只留一条 debug 日志，异常不上抛。
+        #      记账是旁路，不能反过来把主链路拖挂。
+        # ------------------------------------------------------------------
+        self._log_usage(resp, latency_ms=int((time.time() - started) * 1000))
         return resp
+
+    def _request(self, model: str, s, **kwargs):
+        """按指定模型发一次请求 —— 本类唯一真正发起 HTTP 的地方。
+
+        model 由调用方显式传入（主模型或备用模型），熔断与降级共用这一个出口，
+        不会出现「两处 HTTP 代码各写一遍、改一处漏一处」的漂移。
+        """
+        return self._client.chat.completions.create(
+            model=model, timeout=s.llm_timeout_seconds, **kwargs
+        )
 
     def _log_usage(self, resp, latency_ms: int):
         usage = getattr(resp, "usage", None)

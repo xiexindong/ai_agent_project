@@ -10,11 +10,13 @@ from modules.mcp.protocol import (
     JSONRPCRequest, JSONRPCResponse, JSONRPCError,
     parse_message, create_request, create_response, create_error,
 )
-from modules.mcp.mcp_client import MCPClient
+from modules.mcp.mcp_client import MCPClient, MCPToolAdapter
 from modules.mcp.mcp_server import MCPServer
+from modules.mcp.gateway import MCPGateway, MCPServerConfig
 
 __all__ = [
     "JSONRPCRequest", "JSONRPCResponse", "JSONRPCError",
     "parse_message", "create_request", "create_response", "create_error",
-    "MCPClient", "MCPServer",
+    "MCPClient", "MCPToolAdapter", "MCPServer",
+    "MCPGateway", "MCPServerConfig",
 ]

@@ -45,6 +45,36 @@ class MCPClient:
         """启动 MCP Server 子进程并完成握手初始化。"""
         timeout = timeout or get_settings().tool_timeout_seconds
         try:
+            # ------------------------------------------------------------------
+            # 【这行在干什么】拉起 MCP Server 子进程，并把它三条标准流都接成管道。
+            #   MCP 的 stdio 传输就跑在这三条管道上，一条都不能少：
+            #     stdin  ← 我们写一行 JSON-RPC 请求（_send_request：write + flush）
+            #     stdout ← 我们读一行 JSON-RPC 响应（_send_request：readline）
+            #     stderr ← 子进程自己打的日志，不参与协议，交给下面那个线程抽走
+            #
+            # 【处理前 → 处理后】
+            #   处理前 self._server_command = [python.exe, "-m", "modules.mcp.mcp_server"]
+            #   处理后 self._process 是一个活着的子进程，三条流各有管道可用：
+            #     self._process.stdin   → 可写
+            #     self._process.stdout  → 可读
+            #     self._process.stderr  → 可读（必须有人持续读，见下一块注释）
+            #
+            # 【三个参数各自的硬性理由 / 不这么写会怎样】
+            #   text=True + encoding="utf-8"
+            #       少了 text=True → readline 拿到的是 bytes，parse_message 解 JSON 直接抛；
+            #       少了 encoding → Windows 上按系统默认编码（GBK）解码，中文工具名与
+            #       中文结果变乱码，且是静默乱码，不报错。
+            #   bufsize=1
+            #       行缓冲。配合 _send_request 里显式 flush()，一行请求立刻送达对端；
+            #       不设则是大块缓冲，对端迟迟收不到请求 —— 表现成"卡住直到超时"。
+            #   stderr=subprocess.PIPE
+            #       接了管道就必须有人一直读。管道缓冲区（Linux 默认 64 KiB）写满后，
+            #       子进程再 print 一行日志就会阻塞，请求也就再也等不到响应，
+            #       而主进程这边只看到"超时"，看不出是日志把管道堵死了。
+            #
+            # 【为什么用子进程而不是直接 import】命令换成 ["node", "server.js"] 就能接
+            #   Node 写的工具，Python 包版本冲突也一并隔离；Server 崩了只崩它自己。
+            # ------------------------------------------------------------------
             self._process = subprocess.Popen(
                 self._server_command,
                 stdin=subprocess.PIPE,
@@ -54,6 +84,25 @@ class MCPClient:
                 bufsize=1,
                 encoding="utf-8",
             )
+            # ------------------------------------------------------------------
+            # 【这行在干什么】起一个后台线程专职抽 stderr，主线程不被日志 IO 拖住。
+            #   _read_stderr 里是 `for line in self._process.stderr` —— 阻塞式读，
+            #   没有下一行就一直等着，所以只能放线程里跑，不能放进主线程。
+            #
+            # 【处理前 → 处理后】
+            #   处理前 子进程往 stderr 写一行：
+            #     "[enterprise-mcp] 工具 get_current_time 被调用\n"
+            #   处理后 这一行进 _stderr_queue，并打一条 debug 日志：
+            #     [enterprise-mcp] stderr: 工具 get_current_time 被调用
+            #
+            # 【daemon=True 的理由 / 不这么写会怎样】
+            #   不加 → 主线程退出时解释器要等这个非守护线程结束，而它正阻塞在读管道、
+            #   永远等不到 EOF，主进程就退不掉，只能靠 kill。
+            #
+            # 【边界情况】这个线程没有停止开关，靠子进程退出时 stderr 关闭、
+            #   for 循环自然结束。所以 disconnect() 里 terminate + wait(5) 之后，
+            #   队列里不会再有新行进来，残留内容可直接丢弃。
+            # ------------------------------------------------------------------
             threading.Thread(
                 target=self._read_stderr, daemon=True
             ).start()

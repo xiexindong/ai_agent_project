@@ -37,7 +37,7 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, BaseTool] = {}
         self._call_records: Dict[str, set] = defaultdict(set)
-        self._call_counts: Dict[str, int] = defaultdict(int)
+        self._call_counts: Dict[str, int] = defaultdict[str, int](int)
         # ------------------------------------------------------------------
         # 【结果缓存】会话ID → {去重键: 上次成功的 ToolResult}
         #   只缓存成功结果，用途是「同参数再次调用」时把上次答案直接回传。

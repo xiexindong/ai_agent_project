@@ -27,6 +27,8 @@ class AgentStateDict(TypedDict, total=False):
 
     active_skill: str
     skill_context: str
+    # L0 路由选出的本轮工具名单（只算一次，后续 ReAct 轮次沿用）
+    routed_tools: list
 
     memory_context: str
     long_term_memory: list
@@ -70,6 +72,8 @@ class AgentState:
     rag_sources: list = field(default_factory=list)
     active_skill: str = ""
     skill_context: str = ""
+    # 本轮工具名单：由 AgentRouter 在第 1 轮算出，之后沿用（避免每轮重算 embedding）
+    routed_tools: list = field(default_factory=list)
     memory_context: str = ""
     long_term_memory: list = field(default_factory=list)
     short_term_memory: list = field(default_factory=list)
@@ -121,6 +125,7 @@ class AgentState:
             "rag_sources": self.rag_sources,
             "active_skill": self.active_skill,
             "skill_context": self.skill_context,
+            "routed_tools": self.routed_tools,
             "memory_context": self.memory_context,
             "long_term_memory": self.long_term_memory,
             "short_term_memory": self.short_term_memory,
@@ -169,6 +174,7 @@ class AgentState:
             rag_sources=d.get("rag_sources", []),
             active_skill=d.get("active_skill", ""),
             skill_context=d.get("skill_context", ""),
+            routed_tools=d.get("routed_tools", []),
             memory_context=d.get("memory_context", ""),
             long_term_memory=d.get("long_term_memory", []),
             short_term_memory=d.get("short_term_memory", []),

@@ -9,5 +9,9 @@ from modules.tools.base_tool import BaseTool, ToolResult
 from modules.tools.calculator import CalculatorTool
 from modules.tools.data_query import DataQueryTool
 from modules.tools.tool_registry import ToolRegistry
+from modules.tools.tool_rag import ToolRAGIndex, ToolHit
 
-__all__ = ["BaseTool", "ToolResult", "CalculatorTool", "DataQueryTool", "ToolRegistry"]
+__all__ = [
+    "BaseTool", "ToolResult", "CalculatorTool", "DataQueryTool", "ToolRegistry",
+    "ToolRAGIndex", "ToolHit",
+]
