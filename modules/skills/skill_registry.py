@@ -117,7 +117,18 @@ class SkillRegistry:
         if skill.name in self._skills:
             _logger.warning(f"技能重复注册，覆盖: {skill.name}")
         self._skills[skill.name] = skill
+        # ------------------------------------------------------------------
+        # 【做什么】删掉该技能的旧向量缓存，逼 L2 路由下次重新编码
+        # 【为什么】register 允许重名覆盖（117行），_skills 换成新对象了，
+        #   缓存里却还是旧向量 → L2 静默按旧技能打分：改了触发词但结果不变
+        # 【为什么 pop 不用 del】缓存懒加载，首次注册 key 根本不存在，
+        #   del 抛 KeyError 会让注册整个失败；pop(x, None) 有就删、没有就跳过
+        # 【例子】{"db_query": [0.02, ...]} → pop → {} → 下次重编码成新向量
+        # 【依赖警告】键是 skill.name，改 _skills 的存储键必须同步改这里
+        # ------------------------------------------------------------------
         self._vec_cache.pop(skill.name, None)
+        # 【日志】注册成功的现场快照：触发词个数=0 或 绑定工具=无 时，
+        #   该技能在 L1/L2 基本不会被召回，排查"技能装了却用不上"先看这两项
         _logger.info(
             f"技能注册: {skill.name} | 触发词{len(skill.trigger_keywords)}个 "
             f"| 绑定工具={skill.bound_tools or '无'}"

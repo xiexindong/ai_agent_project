@@ -25,8 +25,7 @@ _logger = get_logger("registry")
 
 
 class ToolRegistry:
-    """
-    双模式工具注册器（本地 + MCP 远程）。
+    """双模式工具注册器（本地 + MCP 远程）。
 
     内部维护 3 张"账本"：
         _tools         工具名 → 工具实例 的注册表（核心字典）
