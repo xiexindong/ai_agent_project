@@ -31,11 +31,13 @@ from modules.common.logger import get_logger
 
 _logger = get_logger("circuit_breaker")
 
-CLOSED = "closed"
-OPEN = "open"
-HALF_OPEN = "half_open"
+CLOSED = "closed"        # 闭合：正常放行，失败计数累加中
+OPEN = "open"            # 打开：冷却期内直接拦掉，根本不调用下游
+HALF_OPEN = "half_open"  # 半开：冷却结束，只放行一个探针请求
 
 
+# 【什么】按 key 隔离的三态熔断器
+# 【作用】判定某个下游"已经不可用"后跨请求拦截，省掉每次注定失败的超时等待
 class CircuitBreaker:
     """按 key 隔离的三态熔断器，线程安全（内部一把锁，可多线程共享）。
 
@@ -50,9 +52,11 @@ class CircuitBreaker:
         cb.record_success("deepseek-chat")
     """
 
+    # 【什么】构造熔断器（阈值与冷却时间在此固化）
+    # 【作用】默认连续失败 5 次打开、冷却 30 秒；运行期这两个值不再变
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
-        self.failure_threshold = max(1, int(failure_threshold))
-        self.recovery_timeout = max(0.0, float(recovery_timeout))
+        self.failure_threshold = max(1, int(failure_threshold))     # 连续失败达 5 次就打开；下限 1
+        self.recovery_timeout = max(0.0, float(recovery_timeout))   # 打开后冷却 30 秒才转半开；下限 0
         self._lock = threading.Lock()
         self._failures: Dict[str, int] = {}      # key -> 连续失败次数
         self._opened_at: Dict[str, float] = {}   # key -> 打开时刻（monotonic，不受系统改时间影响）
@@ -61,6 +65,8 @@ class CircuitBreaker:
     # ------------------------------------------------------------------
     # 对外三个动作：问、报成功、报失败 
     # ------------------------------------------------------------------
+    # 【什么】问一句：本次请求能不能放行
+    # 【作用】调用下游前先过这一关；返回 False 就直接走降级，不做无谓等待
     def allow(self, key: str) -> bool:
         """本次请求是否放行到下游。返回 False = 正在熔断，调用方应直接走降级。
 
@@ -81,6 +87,8 @@ class CircuitBreaker:
             _logger.warning(f"熔断器半开，放行探测请求: {key}")
             return True
 
+    # 【什么】上报一次成功
+    # 【作用】清空该 key 的失败计数与打开标记，让下游回到完全放行状态
     def record_success(self, key: str) -> None:
         """下游调用成功：失败计数清零；若此前处于打开/半开则标记为已恢复。"""
         with self._lock:
@@ -91,6 +99,8 @@ class CircuitBreaker:
         if was_broken:
             _logger.info(f"熔断器闭合，下游已恢复: {key}")
 
+    # 【什么】上报一次失败
+    # 【作用】累加连续失败次数，达到阈值就打开熔断；已打开时重置冷却计时
     def record_failure(self, key: str) -> None:
         """下游调用失败。
 
@@ -119,6 +129,8 @@ class CircuitBreaker:
     # ------------------------------------------------------------------
     # 观测接口：给健康检查 / 监控用，不参与判断
     # ------------------------------------------------------------------
+    # 【什么】查单个 key 当前处于哪一态
+    # 【作用】给健康检查与监控看；不参与放行判断，判断只认 allow()
     def state(self, key: str) -> str:
         """当前状态：closed / open / half_open。"""
         with self._lock:
@@ -129,16 +141,20 @@ class CircuitBreaker:
                 return OPEN
             return HALF_OPEN
 
+    # 【什么】全部 key 的状态快照
+    # 【作用】运维/健康检查一次性看到所有下游的状态与失败次数；键名排序后输出
     def snapshot(self) -> dict:
         """全部下游的状态快照，形如 {"deepseek-chat": {"state": "open", "failures": 5}}。"""
         with self._lock:
-            failures = dict(self._failures)
+            failures = dict(self._failures)   # 先拷一份再出锁，避免遍历时别的线程在改
             keys = set(self._opened_at) | set(failures)
         return {
             k: {"state": self.state(k), "failures": failures.get(k, 0)}
             for k in sorted(keys)
         }
 
+    # 【什么】手动清空熔断状态
+    # 【作用】运维确认下游已恢复、或单元测试要干净起点时调用
     def reset(self, key: str = "") -> None:
         """清空状态。传 key 只清一个，不传清全部（运维手动恢复 / 测试用）。"""
         with self._lock:

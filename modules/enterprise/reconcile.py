@@ -32,30 +32,34 @@ from config import get_settings
 _logger = get_logger("reconcile")
 
 
+# 【什么】跨库对账入口：按 task_id 比对 PG 与 MySQL
+# 【作用】把单边缺失的流水号找出来；只报告不自动删，默认窗口 24 小时、上限 5000 条
 def reconcile(hours: int = 24, limit: int = 5000) -> dict:
     """比对最近 N 小时内两边的 task_id，返回单边缺失清单。"""
-    hours = int(hours)
+    hours = int(hours)     # 转 int，避免字符串被拼进 SQL 的 INTERVAL
     result = {
-        "ok": True,
-        "window_hours": hours,
-        "pg_count": 0,
-        "mysql_count": 0,
-        "matched": 0,
-        "pg_only": [],
-        "mysql_only": [],
-        "errors": [],
+        "ok": True,                # 是否跑通；任一侧不可用就置 False
+        "window_hours": hours,     # 比对窗口（小时）
+        "pg_count": 0,             # PG 侧流水号条数
+        "mysql_count": 0,          # MySQL 侧流水号条数
+        "matched": 0,              # 两边都有的条数
+        "pg_only": [],             # 只有 PG 有：MySQL 侧写入可能失败
+        "mysql_only": [],          # 只有 MySQL 有：PG 会话可能已被归档清理
+        "errors": [],              # 异常信息列表
     }
 
     try:
+        # 【延迟导入】PGManager 依赖 PG 驱动，用到才导入
         from modules.memory.pg_manager import PGManager
 
-        pg_ids = set(PGManager().list_task_ids_since(hours, limit))
+        pg_ids = set(PGManager().list_task_ids_since(hours, limit))   # PG 侧的 task_id 集合
     except Exception as e:
         result["ok"] = False
         result["errors"].append(f"PG 不可用: {e}")
         return result
     result["pg_count"] = len(pg_ids)
 
+    # 【跳过比对】RBAC 关闭时 MySQL 侧根本不写审计与用量，此时"MySQL 缺失"是设计如此
     if not get_settings().rbac_enabled:
         result["note"] = "RBAC_ENABLED=False，MySQL 侧不落审计与用量，已跳过 MySQL 比对"
         return result
@@ -63,16 +67,16 @@ def reconcile(hours: int = 24, limit: int = 5000) -> dict:
     try:
         from modules.enterprise.audit import list_task_ids_since
 
-        mysql_ids = set(list_task_ids_since(hours, limit))
+        mysql_ids = set(list_task_ids_since(hours, limit))   # MySQL 侧 = 审计 ∪ 用量
     except Exception as e:
         result["ok"] = False
         result["errors"].append(f"MySQL 不可用: {e}")
         return result
     result["mysql_count"] = len(mysql_ids)
 
-    result["matched"] = len(pg_ids & mysql_ids)
-    result["pg_only"] = sorted(pg_ids - mysql_ids)
-    result["mysql_only"] = sorted(mysql_ids - pg_ids)
+    result["matched"] = len(pg_ids & mysql_ids)              # 交集：两边都写了
+    result["pg_only"] = sorted(pg_ids - mysql_ids)           # 差集排序，输出顺序稳定
+    result["mysql_only"] = sorted(mysql_ids - pg_ids)        # 同上
 
     if result["pg_only"] or result["mysql_only"]:
         _logger.warning(

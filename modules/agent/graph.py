@@ -29,6 +29,8 @@ LangGraph 图构建模块
         save     → 落 PG（原文+摘要+向量+工具日志）→ END
     输出: {final_answer:"3*7 等于 21", iteration:2, tool_call_logs:[...]}
 """
+# 【什么】LangGraph 图框架 + 敏感词校验 + 状态与 ReAct 引擎
+# 【作用】建图、跑图、落库都要它们；check_sensitive 只在自动初审里用
 from typing import Annotated, Any
 from langgraph.graph import StateGraph, END
 from modules.common.logger import get_logger
@@ -40,14 +42,20 @@ from config import get_settings
 _logger = get_logger("graph")
 
 
+# 【什么】LangGraph 状态图的编排器
+# 【作用】把 ReAct 的循环装进图里，换取分支判断、断点续跑与状态持久化
 class AgentGraph:
     """LangGraph 状态化 Agent 编排器。"""
 
+    # 【什么】拿一个 ReActAgent 建图
+    # 【作用】图只负责编排，真正的推理与工具执行都在 ReActAgent 里
     def __init__(self, react_agent: ReActAgent):
-        self.agent = react_agent
-        self._checkpointer = None
-        self._graph = self._build_graph()
+        self.agent = react_agent                 # 业务执行体：prepare/reason/act/answer 都在它身上
+        self._checkpointer = None                # 断点续跑用；未开启或不可用时保持 None
+        self._graph = self._build_graph()        # 编译后的图，run() 直接 invoke 它
 
+    # 【什么】按「5 节点 + 6 条边」搭出整张图并编译
+    # 【作用】流程全貌集中在这里，改跳转只改这一段
     def _build_graph(self):
         """
         构建 LangGraph 状态图：5 个节点 + 6 条边（含 1 条条件边）。
@@ -117,6 +125,8 @@ class AgentGraph:
         return compiled
 
 
+    # 【什么】prepare 节点：召回记忆/技能/RAG，初始化 state
+    # 【作用】只跑一次（靠 prepared 标记），避免循环回来重复召回
     def _prepare_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
@@ -129,10 +139,12 @@ class AgentGraph:
                 principal=state.get("principal"),
             )
             updates = full_state.to_dict()
-            updates["prepared"] = True
+            updates["prepared"] = True      # 打上已准备标记，循环回到本节点时不再重复召回
             return updates
-        return {}
+        return {}                           # 已准备过：返回空更新，原样往下走
 
+    # 【什么】reason 节点：调一次 ReAct 的 Reason 步骤
+    # 【作用】把 LLM 的决策结果（要不要调工具、答案是什么）写回图状态
     def _reason_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """推理节点：LLM ReAct 分析，判断是否调用工具。"""
         from modules.agent.state import AgentState
@@ -152,6 +164,8 @@ class AgentGraph:
         }
         return updates
 
+    # 【什么】act 节点：执行本轮工具调用
+    # 【作用】把观察结果与两条工具日志回写状态，下一轮 reason 才看得到
     def _act_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """执行节点：调用工具（本地 or MCP）。"""
         from modules.agent.state import AgentState
@@ -165,6 +179,8 @@ class AgentGraph:
             "tool_call_logs": updated.tool_call_logs,
         }
 
+    # 【什么】answer 节点：出最终答案 + 一句话摘要
+    # 【作用】收尾节点，跑完把 finished 置 True，交给 save
     def _answer_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """答案节点：生成完整答案 + 精简摘要。"""
         from modules.agent.state import AgentState
@@ -178,6 +194,8 @@ class AgentGraph:
             "finished": True,
         }
 
+    # 【什么】save 节点：把这一轮对话与状态落库
+    # 【作用】原文 + 摘要 + 向量 + 工具日志入库，顺带跑初审入队
     def _save_node(self, state: dict[str, Any]) -> dict[str, Any]:
         """保存节点：记忆入库（原文+摘要+向量），Agent状态持久化。"""
         session_id = state.get("session_id", "")
@@ -223,6 +241,8 @@ class AgentGraph:
                 _logger.error(f"记忆保存异常: {e}")
         return {}
 
+    # 【什么】把本轮工具调用逐条写进 tool_call_log 表
+    # 【作用】与 chat_history 里的 JSONB 互补，是审计的原始依据
     def _save_tool_logs(self, state: dict) -> None:
         """工具调用全量落 tool_call_log 表（审计依据，与 chat_history 的 JSONB 互补）。"""
         for tc in state.get("tool_call_logs", []):
@@ -230,13 +250,15 @@ class AgentGraph:
                 state.get("session_id", ""),
                 state.get("user_id", ""),
                 tc.get("name", ""),
-                tc.get("type", "local"),
-                tc.get("arguments", {}) or {},
-                str(tc.get("result", ""))[:2000],
-                "success" if tc.get("success", True) else "error",
-                tc.get("duration_ms", 0),
+                tc.get("type", "local"),                        # 工具类型：local / mcp
+                tc.get("arguments", {}) or {},                  # 入参，None 时记空字典
+                str(tc.get("result", ""))[:2000],               # 结果最多存 2000 字
+                "success" if tc.get("success", True) else "error",   # 缺省按成功记
+                tc.get("duration_ms", 0),                       # 耗时，缺失记 0
             )
 
+    # 【什么】自动初审：命中风险就挂人工复核队列
+    # 【作用】四类风险只入队优先级最高的那条，同一轮不会刷出多条待办
     def _auto_review(self, state: dict, history_id) -> None:
         """自动初审：命中四类风险之一即挂人工复核（合规留痕 + 数据反哺）。
 
@@ -248,23 +270,25 @@ class AgentGraph:
         query = state.get("user_query", "")
         reasons = []
         if state.get("error") == "prompt_injection_blocked" or check_sensitive(query):
-            reasons.append(("sensitive", query))
+            reasons.append(("sensitive", query))                            # 优先级 1：注入/敏感词
         if any(not tc.get("success", True) for tc in state.get("tool_call_logs", [])):
-            reasons.append(("tool_fail", "本轮存在工具调用失败"))
+            reasons.append(("tool_fail", "本轮存在工具调用失败"))             # 优先级 2：工具失败
         if state.get("memory_low_confidence"):
-            reasons.append(("low_sim", "长期记忆召回低置信"))
+            reasons.append(("low_sim", "长期记忆召回低置信"))                 # 优先级 3：记忆低置信
         if self.agent.rag and not state.get("rag_sources"):
-            reasons.append(("no_rag", query))
+            reasons.append(("no_rag", query))                               # 优先级 4：无知识库依据
 
         if not reasons:
             return
-        review_type, content = reasons[0]
+        review_type, content = reasons[0]                                   # 只取排序最靠前的那一类
         self.agent.memory.pg.add_to_review_queue(
             state.get("session_id", ""), state.get("user_id", ""),
-            history_id, content[:500], review_type,
+            history_id, content[:500], review_type,                         # 内容最多存 500 字
         )
         _logger.info(f"自动初审入队: type={review_type} history_id={history_id}")
 
+    # 【什么】prepare 之后的路由：进循环还是直接收尾
+    # 【作用】注入拦截/异常的答案直接发走，不进 reason 免得被 LLM 覆盖
     def _after_prepare(self, state: dict) -> str:
         """prepare 之后的路由：注入拦截/异常直接收尾，否则进 ReAct 循环。
 
@@ -275,6 +299,8 @@ class AgentGraph:
             return "answer"
         return "reason"
 
+    # 【什么】整张图的「红绿灯」：返回 act 或 answer
+    # 【作用】LangGraph 拿返回值当 key 查 path_map，决定下一步走哪个节点
     def _should_continue(self, state: dict) -> str:
         """
         条件路由：reason 之后该往哪走？返回 "act" 或 "answer"。
@@ -304,13 +330,15 @@ class AgentGraph:
         return "answer"
 
 
+    # 【什么】跑完整条 Agent 流程（外部唯一入口）
+    # 【作用】组装初始状态、按需断点续跑，最后把终态 dict 返回给调用方
     def run(
         self,
-        query: str,
-        session_id: str,
-        user_id: str,
-        principal=None,
-        resume: bool = True,
+        query: str,                 # 本轮用户提问
+        session_id: str,            # 会话 ID，兼作 thread_id
+        user_id: str,               # 用户标识
+        principal=None,             # 权限载体，None = 未启用权限
+        resume: bool = True,        # True = 有未完成快照时接着跑
     ) -> dict[str, Any]:
         """
         执行完整 Agent 流程。
@@ -325,13 +353,13 @@ class AgentGraph:
             f"权限={'已加载' if principal else '未启用'} | query='{query[:50]}'"
         )
         initial_state: AgentStateDict = {
-            "session_id": session_id,
-            "user_id": user_id,
-            "user_query": query,
-            "principal": principal,
-            "prepared": False,
+            "session_id": session_id,       # 会话 ID，兼作 thread_id
+            "user_id": user_id,             # 用户标识
+            "user_query": query,            # 原始提问（prepare 节点会清洗）
+            "principal": principal,         # 权限载体
+            "prepared": False,              # False = 本轮还没跑 prepare
         }
-        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 30}
+        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 30}   # 30 = 图内最大跳转步数
 
         if resume and self._checkpointer is not None:
             try:

@@ -27,6 +27,8 @@ from config import get_settings
 _logger = get_logger("pipeline.recall")
 
 
+# 【什么】把提问编码成向量
+# 【作用】编码失败返回 None 而不是抛异常，调用方据此切到关键词降级
 def _embed_query(text: str) -> Optional[List[float]]:
     """把提问编码成向量；失败返回 None（调用方接着走关键词降级）。"""
     try:
@@ -37,11 +39,13 @@ def _embed_query(text: str) -> Optional[List[float]]:
         return None
 
 
+# 【什么】用关键词在本地工具清单里匹配（最后兜底）
+# 【作用】PG 完全不可用时仍能有候选；打分同关键词路径，上限 0.60
 def _match_local_pool(
-    keywords: Sequence[str],
-    tools: Sequence,
-    exclude: Sequence[str],
-    top_k: int,
+    keywords: Sequence[str],     # 关键词列表
+    tools: Sequence,             # 本地工具对象清单，取 name/description 参与匹配
+    exclude: Sequence[str],      # 黑名单工具名
+    top_k: int,                  # 返回数量上限
 ) -> List[ToolHit]:
     """用关键词在本地工具清单里匹配（PG 完全不可用时的最后兜底）。
 
@@ -75,15 +79,17 @@ def _match_local_pool(
     return hits[:top_k]
 
 
+# 【什么】Tool-RAG 召回总入口：非工具意图直接跳过，其余走三级降级
+# 【作用】产出候选工具清单；任何一级失败都只置 degraded=True，不抛异常
 def recall_tools(
-    query: str,
-    intent: IntentResult,
-    store=None,
-    top_k: int = 0,
-    min_score: float = -1,
-    extra_exclude: Optional[List[str]] = None,
-    fallback_tools: Optional[Sequence] = None,
-    embed_fn: Optional[Callable[[str], Optional[List[float]]]] = None,
+    query: str,                    # Token 控制后的用户提问
+    intent: IntentResult,          # 意图识别结果：决定是否召回、提供域与黑名单
+    store=None,                    # ToolVectorStore；None 时内部创建
+    top_k: int = 0,                # 召回数量；<=0 时取 settings.pipeline_tool_top_k（3）
+    min_score: float = -1,         # 相似度下限；<0 时取 settings.tool_rag_min_score
+    extra_exclude: Optional[List[str]] = None,  # 调用方追加的黑名单（如权限不允许的工具）
+    fallback_tools: Optional[Sequence] = None,  # 本地工具清单，PG 不可用时兜底
+    embed_fn: Optional[Callable[[str], Optional[List[float]]]] = None,  # 自定义编码函数，测试用
 ) -> RecallResult:
     """按意图与提问召回候选工具。
 
@@ -92,7 +98,7 @@ def recall_tools(
         intent: 意图识别结果（决定是否执行召回、提供 domain 与黑名单）
         store: ToolVectorStore 实例；为 None 时内部创建一个
         top_k: 召回数量，默认取 settings.pipeline_tool_top_k（3）
-        min_score: 相似度下限，默认取 settings.tool_rag_min_score（0.30）
+        min_score: 相似度下限，默认取 settings.tool_rag_min_score（0.25，见 config.py）
         extra_exclude: 调用方额外追加的黑名单（如权限不允许的工具）
         fallback_tools: 本地工具清单，PG 不可用时用它做关键词兜底
         embed_fn: 自定义编码函数（测试用）；默认用智谱 embedding
@@ -109,9 +115,9 @@ def recall_tools(
                            reason="意图为 rag，不执行 Tool-RAG")
     """
     s = get_settings()
-    top_k = top_k or int(s.pipeline_tool_top_k)
-    min_score = min_score if min_score >= 0 else float(s.tool_rag_min_score)
-    relative_ratio = float(s.tool_rag_relative_ratio)
+    top_k = top_k or int(s.pipeline_tool_top_k)                             # 0/None 都表示"用配置值"
+    min_score = min_score if min_score >= 0 else float(s.tool_rag_min_score)  # 负数哨兵 = 用配置值
+    relative_ratio = float(s.tool_rag_relative_ratio)                       # 相对下限系数
 
     # ------------------------------------------------------------------
     # 【第 0 关：意图类型】非工具意图直接返回，不碰 embedding、不碰 PG
@@ -122,8 +128,8 @@ def recall_tools(
             reason=f"意图为 {intent.intent_type}，不执行 Tool-RAG",
         )
 
-    exclude = list(intent.exclude_tool_list or []) + list(extra_exclude or [])
-    keywords = intent.keyword_list or []
+    exclude = list(intent.exclude_tool_list or []) + list(extra_exclude or [])  # 模型黑名单 + 调用方黑名单合并
+    keywords = intent.keyword_list or []                                        # 关键词，向量降级路径用
 
     if store is None:
         try:

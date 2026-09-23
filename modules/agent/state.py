@@ -9,98 +9,104 @@ from dataclasses import dataclass, field
 from langgraph.graph import MessagesState
 
 
+# 【什么】交给 LangGraph 的全局状态字典
+# 【作用】框架节点函数只认 dict，这份 TypedDict 约定了所有可用字段名
 class AgentStateDict(TypedDict, total=False):
     """
     LangGraph Agent 全局状态（TypedDict，支持部分字段）。
     贯穿 ReAct 循环、工具调度、记忆管理全链路。
     """
-    session_id: str
-    user_id: str
-    user_query: str
+    session_id: str                 # 会话 ID，同时是断点续跑的 thread_id
+    user_id: str                    # 用户标识
+    user_query: str                 # 本轮用户提问（prepare 阶段已清洗）
 
-    principal: Any
+    principal: Any                  # 权限载体 Principal；None = 未启用权限
 
-    messages: list
+    messages: list                  # 对话消息列表，喂给 LLM 的原始 messages
 
-    rag_context: str
-    rag_sources: list
+    rag_context: str                # RAG 召回拼成的上下文文本
+    rag_sources: list               # RAG 命中的来源列表，落库时记在 rag_sources
 
-    active_skill: str
-    skill_context: str
+    active_skill: str               # 命中的技能名，未命中为空串
+    skill_context: str              # 技能 SOP 上下文，注入 prompt
     # L0 路由选出的本轮工具名单（只算一次，后续 ReAct 轮次沿用）
     routed_tools: list
 
-    memory_context: str
-    long_term_memory: list
-    short_term_memory: list
-    memory_compressed: bool
-    memory_low_confidence: bool
+    memory_context: str             # 长短期记忆拼成的上下文文本
+    long_term_memory: list          # 长期记忆条目
+    short_term_memory: list         # 短期记忆条目
+    memory_compressed: bool         # True = 本轮记忆做过压缩
+    memory_low_confidence: bool     # True = 长期记忆召回相似度偏低
 
-    iteration: int
-    max_iterations: int
-    reasoning: str
-    action: dict
-    observation: str
-    tool_call_logs: list
-    tool_calls_history: list
+    iteration: int                  # 当前 ReAct 轮次，从 1 起算
+    max_iterations: int             # 轮次上限，默认 10，达到即强制收尾
+    reasoning: str                  # 本轮 LLM 的思考文本（debug 用）
+    action: dict                    # 待执行动作 {name, arguments, id}
+    observation: str                # 上一轮工具执行结果
+    tool_call_logs: list            # 工具流水，save 节点写 tool_call_log 表
+    tool_calls_history: list        # 工具历史，供重复调用检测与 prompt 展示
 
-    sub_tasks: list
-    current_task_index: int
-    task_results: list
+    sub_tasks: list                 # 任务拆解后的子任务列表
+    current_task_index: int         # 当前执行到第几个子任务
+    task_results: list              # 各子任务的结果
 
-    final_answer: str
-    llm_summary: str
-    summary_embedding: list
+    final_answer: str               # 最终答案，answer 节点填写
+    llm_summary: str                # 一句话摘要，用于向量入库
+    summary_embedding: list         # 摘要向量
 
-    need_tool_call: bool
-    finished: bool
-    error: str
-    prepared: bool
+    need_tool_call: bool            # True = 本轮要去 act 节点调工具
+    finished: bool                  # True = 流程结束，走 answer/save
+    error: str                      # 错误码，如 prompt_injection_blocked
+    prepared: bool                  # True = prepare 节点已跑过，不重复召回
 
 
+# 【什么】同一份状态的数据类版本（非 LangGraph 用）
+# 【作用】节点内点属性操作更顺手，入口 from_dict 转进来、出口 to_dict 转回去
 @dataclass
 class AgentState:
     """Agent 状态数据类（便于直接操作，非 LangGraph 用）。"""
-    session_id: str = ""
-    user_id: str = ""
-    user_query: str = ""
+    session_id: str = ""                                       # 会话 ID，也是断点续跑的 thread_id
+    user_id: str = ""                                          # 用户标识
+    user_query: str = ""                                       # 本轮提问（prepare 清洗后的文本）
 
-    principal: Any = None
+    principal: Any = None                                      # 权限载体 Principal；None = 未启用权限
 
-    messages: list = field(default_factory=list)
-    rag_context: str = ""
-    rag_sources: list = field(default_factory=list)
-    active_skill: str = ""
-    skill_context: str = ""
+    messages: list = field(default_factory=list)               # 对话消息列表
+    rag_context: str = ""                                      # RAG 上下文文本
+    rag_sources: list = field(default_factory=list)            # RAG 命中来源列表
+    active_skill: str = ""                                     # 命中的技能名，未命中为空串
+    skill_context: str = ""                                    # 技能 SOP 上下文
     # 本轮工具名单：由 AgentRouter 在第 1 轮算出，之后沿用（避免每轮重算 embedding）
     routed_tools: list = field(default_factory=list)
-    memory_context: str = ""
-    long_term_memory: list = field(default_factory=list)
-    short_term_memory: list = field(default_factory=list)
-    memory_compressed: bool = False
-    memory_low_confidence: bool = False
+    memory_context: str = ""                                   # 记忆上下文文本
+    long_term_memory: list = field(default_factory=list)       # 长期记忆条目
+    short_term_memory: list = field(default_factory=list)      # 短期记忆条目
+    memory_compressed: bool = False                            # True = 本轮记忆已压缩
+    memory_low_confidence: bool = False                        # True = 长期记忆召回低置信
 
-    iteration: int = 0
-    max_iterations: int = 10
-    reasoning: str = ""
-    action: dict = field(default_factory=dict)
-    observation: str = ""
-    tool_call_logs: list = field(default_factory=list)
-    tool_calls_history: list = field(default_factory=list)
+    iteration: int = 0                                         # 当前 ReAct 轮次，从 1 起算
+    max_iterations: int = 10                                   # 轮次上限 10，达到即强制收尾
+    reasoning: str = ""                                        # 本轮 LLM 思考文本
+    action: dict = field(default_factory=dict)                 # 待执行动作 {name, arguments, id}
+    observation: str = ""                                      # 上一轮工具执行结果
+    tool_call_logs: list = field(default_factory=list)         # 工具流水，save 节点落表
+    tool_calls_history: list = field(default_factory=list)     # 工具历史，用于重复调用检测
 
-    sub_tasks: list = field(default_factory=list)
-    current_task_index: int = 0
-    task_results: list = field(default_factory=list)
+    sub_tasks: list = field(default_factory=list)              # 拆解出的子任务
+    current_task_index: int = 0                                # 当前子任务下标
+    task_results: list = field(default_factory=list)           # 各子任务的结果
 
-    final_answer: str = ""
-    llm_summary: str = ""
-    summary_embedding: list = field(default_factory=list)
+    final_answer: str = ""                                     # 最终答案
+    llm_summary: str = ""                                      # 一句话摘要，用于向量入库
+    summary_embedding: list = field(default_factory=list)      # 摘要向量
 
-    need_tool_call: bool = False
-    finished: bool = False
-    error: str = ""
-    prepared: bool = False
+    need_tool_call: bool = False                               # True = 走 act 节点调工具
+    finished: bool = False                                     # True = 流程结束
+    error: str = ""                                            # 错误码，如 prompt_injection_blocked
+    prepared: bool = False                                     # True = prepare 已跑过，不重复召回
 
+    # 【什么】dataclass → dict 的序列化出口
+    # 【作用】LangGraph 只认 dict，节点返回值必须先转成 dict 才能合并回全局状态
     def to_dict(self) -> AgentStateDict:
         """
         把 dataclass 对象转回普通 dict，交给 LangGraph。
@@ -150,6 +156,8 @@ class AgentState:
             "prepared": self.prepared,
         }
 
+    # 【什么】dict → dataclass 的反序列化入口（to_dict 的逆操作）
+    # 【作用】框架给的是 dict，业务里用 dataclass，缺字段按默认值补齐不报错
     @classmethod
     def  from_dict(cls, d: dict) -> "AgentState":
         """
@@ -181,7 +189,7 @@ class AgentState:
             memory_compressed=d.get("memory_compressed", False),
             memory_low_confidence=d.get("memory_low_confidence", False),
             iteration=d.get("iteration", 0),
-            max_iterations=d.get("max_iterations", 10),
+            max_iterations=d.get("max_iterations", 10),      # 缺省 10：与 dataclass 默认值保持一致
             reasoning=d.get("reasoning", ""),
             action=d.get("action", {}),
             observation=d.get("observation", ""),

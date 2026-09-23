@@ -11,6 +11,8 @@ RAG 向量入库与 PG 记忆向量共用此服务。
 JS 类比：相当于项目里统一封装第三方接口的 axios service 模块。
 上下游：上游是 RAG 文档入库和记忆系统（MemoryManager），下游是智谱 embedding-2 API。
 """
+# 【什么】标准库与项目内依赖
+# 【作用】time 控批次间隔、tenacity 提供重试装饰器、LLMException 抛向量错误、get_settings 读模型与维度
 import time
 from typing import List
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -18,32 +20,40 @@ from modules.common.logger import get_logger
 from modules.common.exceptions import LLMException, handle_exception
 from config import get_settings
 
-_logger = get_logger("embedding")
+_logger = get_logger("embedding")                   # 模块级日志器，前缀 embedding
 
 
+# 【什么】智谱 embedding-2 的向量生成服务（单例）
+# 【作用】全项目唯一的文字转向量出口，RAG 入库与记忆召回共用同一份客户端
 class EmbeddingService:
     """智谱 embedding-2 向量生成服务（1024维）。"""
 
-    _instance = None
-    _client = None
+    _instance = None                                # 类级单例对象；None 表示还没创建过
+    _client = None                                  # zhipuai SDK 客户端，进程内只建一次
 
+    # 【什么】控制实例只创建一次
+    # 【作用】反复调用 EmbeddingService() 拿到同一个对象，避免重复建客户端
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    # 【什么】初始化 SDK 客户端并固化模型名与维度
+    # 【作用】_client 已存在就跳过，保证单例下连接只建一次；失败即抛，不做降级
     def __init__(self):
         if self._client is None:
             s = get_settings()
             try:
                 from zhipuai import ZhipuAI
-                self._client = ZhipuAI(api_key=s.zhipu_api_key)
-                self._model = s.embedding_model
-                self._dim = s.embedding_dimension
+                self._client = ZhipuAI(api_key=s.zhipu_api_key)     # zhipuai SDK 客户端
+                self._model = s.embedding_model                     # 模型名，默认 embedding-2
+                self._dim = s.embedding_dimension                   # 向量维度，默认 1024
                 _logger.info(f"Embedding服务初始化: model={self._model}, dim={self._dim}")
             except Exception as e:
                 raise LLMException("Embedding服务初始化失败", str(e))
 
+    # 【什么】唯一真正发网络请求算向量的一层
+    # 【作用】单一出口：重试、日志、异常处理只在这处做，上层的 embed / embed_batch 只整理参数
     # ------------------------------------------------------------------
     # 【这个装饰器在干什么】给下面的 API 调用自动套一层「失败重试」
     #   被装饰后，_embed_batch() 调用失败不会立刻抛错，tenacity 会自动再调几次。
@@ -150,6 +160,8 @@ class EmbeddingService:
         # 属于「静默全失败」的同类问题。
         return [item.embedding for item in resp.data]
 
+    # 【什么】单条文本转向量
+    # 【作用】记忆系统存取一条记忆向量时用；空文本直接返回全零向量，省一次 API 调用
     def embed(self, text: str) -> List[float]:
         """生成单条文本的向量。"""
         if not text or not text.strip():
@@ -157,7 +169,7 @@ class EmbeddingService:
             #result = [0.0] * 5
             # 运行结果：[0.0, 0.0, 0.0, 0.0, 0.0]
             
-            return [0.0] * self._dim
+            return [0.0] * self._dim    # 全零向量，长度 = _dim（默认 1024）；不调 API
         try:
             vectors = self._embed_batch([text.strip()])
             return vectors[0]
@@ -165,10 +177,12 @@ class EmbeddingService:
             _logger.error(f"向量生成失败: {e}")
             raise LLMException("向量生成失败", str(e))
 
+    # 【什么】批量文本转向量，自动按 64 条切批
+    # 【作用】RAG 文档入库用；单批失败只把该批填成全零向量，不拖垮其它批次
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """批量生成向量，自动分批（智谱单次限制64条）。"""
         results = []
-        batch_size = 64
+        batch_size = 64                 # 智谱 API 单批硬上限 64 条；这里是切批步长
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             try:
@@ -178,15 +192,20 @@ class EmbeddingService:
             except Exception as e:
                 _logger.error(f"批次{i//batch_size+1}生成失败: {e}")
                 results.extend([[0.0] * self._dim] * len(batch))
+            # 批间停顿 0.3 秒：仅当还有下一批时才睡，避免打满智谱 QPS 被限流
             if i + batch_size < len(texts):
                 time.sleep(0.3)
         return results
 
+    # 【什么】对外暴露向量维度
+    # 【作用】建表定 vector(1024)、造全零向量都读它，避免维度被写死在多处
     @property
     def dimension(self) -> int:
         return self._dim
 
 
+# 【什么】获取向量服务的全局单例
+# 【作用】统一入口，调用方不必自己 new，全进程共用一个客户端
 def get_embedding_service() -> EmbeddingService:
     """获取 Embedding 服务单例。"""
     return EmbeddingService()

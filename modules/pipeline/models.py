@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List
 
 
+# 【什么】意图大类常量集：6 个类别值 + 合法全集 + 需召回子集
+# 【作用】给 LLM 分类圈定取值范围，下游校验与"要不要召回"都看它
 class IntentType:
     """意图大类（LLM 只能从这 6 个里选一个）。
 
@@ -31,7 +33,7 @@ class IntentType:
     MCP_REMOTE = "mcp_remote"      # 需要调用 MCP 远程技能
     CONTINUE_MEMORY = "continue_memory"  # 承接上一轮对话（"继续"、"刚才那个"）
 
-    ALL = (INVALID, CHAT, LOCAL_SKILL, RAG, MCP_REMOTE, CONTINUE_MEMORY)
+    ALL = (INVALID, CHAT, LOCAL_SKILL, RAG, MCP_REMOTE, CONTINUE_MEMORY)  # 合法类别全集，归一化时按它校验
 
     # ------------------------------------------------------------------
     # 【只有这两类才值得跑 Tool-RAG】rag 走向量库、continue_memory 走记忆库、
@@ -40,31 +42,39 @@ class IntentType:
     TOOL_INTENTS = (LOCAL_SKILL, MCP_REMOTE)
 
 
+# 【什么】分支落点常量集：6 条支路，与 IntentType 一一对应
+# 【作用】把意图翻译成链路名，上层按 branch 分派到对应处理逻辑
 class Branch:
     """分支路由的最终落点（与 IntentType 一一对应，invalid 落到 reject）。"""
 
-    REJECT = "reject"
-    CHAT = "chat"
-    LOCAL_SKILL = "local_skill"
-    RAG = "rag"
-    MCP_REMOTE = "mcp_remote"
-    CONTINUE_MEMORY = "continue_memory"
+    REJECT = "reject"                    # 拒答/澄清：输入无效或被风控拦截
+    CHAT = "chat"                        # 普通对话：不带工具，直接答
+    LOCAL_SKILL = "local_skill"          # 本地函数工具链路：带召回到的工具
+    RAG = "rag"                          # 知识库检索链路：走 Milvus，不带工具
+    MCP_REMOTE = "mcp_remote"            # MCP 远程技能链路：带召回到的工具
+    CONTINUE_MEMORY = "continue_memory"  # 记忆续聊链路：先取历史记忆再回答
 
 
+# 【什么】第 ① 环文本清洗的结果对象
+# 【作用】把清洗后文本与长度变化交给下一环，removed 供日志溯源
 @dataclass
 class CleanResult:
     """文本清洗结果。"""
 
     text: str = ""                       # 清洗后的文本（后续环节都用这份）
-    original_length: int = 0
-    cleaned_length: int = 0
+    original_length: int = 0             # 清洗前字符数
+    cleaned_length: int = 0              # 清洗后字符数
     changed: bool = False                # 是否被改动过（用于判断是否记日志）
     removed: List[str] = field(default_factory=list)  # 被清掉的东西，如 ["控制字符x3","零宽字符x2"]
 
+    # 【什么】把 dataclass 原样转成普通 dict
+    # 【作用】API 响应与日志直接吃这份结构，上层不必再逐字段拼装
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
+# 【什么】第 ② 环前置风控的结果对象
+# 【作用】给出放行与否与处置动作，pipeline 只看 passed 决定要不要继续
 @dataclass
 class RiskResult:
     """前置高危规则风控结果。
@@ -75,30 +85,38 @@ class RiskResult:
         passed  = action != "block"，调用方只看这一个字段决定要不要继续
     """
 
-    passed: bool = True
-    level: str = "none"
-    action: str = "pass"
+    passed: bool = True       # 是否放行；调用方只看这一个字段
+    level: str = "none"       # 严重程度：none/low/medium/high，取所有命中的最高级
+    action: str = "pass"      # 处置动作：pass 放行 / review 挂复核 / block 拦截
     hits: List[Dict[str, str]] = field(default_factory=list)  # [{"code","level","desc"}]
-    reason: str = ""
+    reason: str = ""          # 给人看的说明，正常放行时为空串
 
+    # 【什么】把 dataclass 原样转成普通 dict
+    # 【作用】API 响应与日志直接吃这份结构，上层不必再逐字段拼装
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
+# 【什么】第 ③ 环 Token 控制与压缩的结果对象
+# 【作用】给出最终文本，method 说明这次走了哪一级压缩，便于排障
 @dataclass
 class TokenResult:
     """Token 长度控制与压缩结果。"""
 
-    text: str = ""
-    tokens_before: int = 0
-    tokens_after: int = 0
-    compressed: bool = False
-    method: str = "none"   # none=未超阈值 / rule=规则压缩 / llm=LLM压缩 / truncate=硬截断
+    text: str = ""            # 最终文本，后续环节一律用它
+    tokens_before: int = 0    # 压缩前 token 数
+    tokens_after: int = 0     # 压缩后 token 数
+    compressed: bool = False  # 是否发生过压缩或截断
+    method: str = "none"      # none=未超阈值 / rule=规则压缩 / llm=LLM压缩 / truncate=硬截断
 
+    # 【什么】把 dataclass 原样转成普通 dict
+    # 【作用】API 响应与日志直接吃这份结构，上层不必再逐字段拼装
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
+# 【什么】第 ④ 环意图识别的结果对象
+# 【作用】承载 LLM 的 6 字段结构化输出，供召回与路由两个环节取用
 @dataclass
 class IntentResult:
     """意图识别结果（LLM 结构化输出的落地形态）。
@@ -112,47 +130,57 @@ class IntentResult:
         exclude_tool_list  黑名单：这些工具本轮不许被召回
     """
 
-    intent_type: str = IntentType.CHAT
-    intent_confidence: float = 0.0
-    need_memory: bool = False
-    domain_tag: str = "general"
-    keyword_list: List[str] = field(default_factory=list)
-    exclude_tool_list: List[str] = field(default_factory=list)
+    intent_type: str = IntentType.CHAT  # 意图类别：6 选 1，见 IntentType
+    intent_confidence: float = 0.0      # 置信度 0~1；低于 0.5 时下游禁止调工具
+    need_memory: bool = False           # 本轮是否需要取历史记忆
+    domain_tag: str = "general"         # 业务域标签，Tool-RAG 按它过滤候选
+    keyword_list: List[str] = field(default_factory=list)  # 关键词，向量召回失败时降级用
+    exclude_tool_list: List[str] = field(default_factory=list)  # 黑名单：这些工具本轮不许被召回
     raw: Dict[str, Any] = field(default_factory=dict)   # LLM 原始输出，排障用
-    degraded: bool = False        # True = LLM 没跑成，走了规则兜底
-    degrade_reason: str = ""
+    degraded: bool = False              # True = LLM 没跑成，走了规则兜底
+    degrade_reason: str = ""            # 降级原因，degraded=True 时才有内容
 
+    # 【什么】把 dataclass 原样转成普通 dict
+    # 【作用】API 响应与日志直接吃这份结构，上层不必再逐字段拼装
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
+# 【什么】Tool-RAG 召回到的单个候选技能
+# 【作用】把"名字 + 描述 + 相似度 + 来源"打包，供路由挑选与按需加载
 @dataclass
 class ToolHit:
     """Tool-RAG 召回到的一个候选技能。"""
 
-    name: str
-    description: str = ""
+    name: str                    # 工具/技能名，表里的唯一键
+    description: str = ""         # 工具描述，关键词降级时参与匹配
     score: float = 0.0            # 相似度（余弦），0~1
-    domain_tag: str = "general"
+    domain_tag: str = "general"   # 业务域标签
     source_type: str = "local"    # local=本地工具 / mcp_remote=远程技能
     server_name: str = ""         # MCP 场景下属于哪个 server（按需加载用）
     source: str = "pgvector"      # pgvector / keyword
 
+    # 【什么】把 dataclass 原样转成普通 dict
+    # 【作用】API 响应与日志直接吃这份结构，上层不必再逐字段拼装
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
+# 【什么】第 ⑤ 环 Tool-RAG 召回的结果对象
+# 【作用】带回候选工具清单，并说明这次走的向量还是关键词降级
 @dataclass
 class RecallResult:
     """Tool-RAG 召回结果。"""
 
     executed: bool = False                 # 是否真的跑了召回（非工具意图时为 False）
-    tools: List[ToolHit] = field(default_factory=list)
+    tools: List[ToolHit] = field(default_factory=list)  # 候选工具，按 score 降序
     source: str = "none"                   # pgvector / keyword / none
-    reason: str = ""
-    degraded: bool = False
-    degrade_reason: str = ""
+    reason: str = ""                       # 结果说明，如"向量召回为空，改用关键词召回"
+    degraded: bool = False                 # True = 没走成向量召回，用了降级路径
+    degrade_reason: str = ""               # 降级原因，如"pgvector 存储不可用"
 
+    # 【什么】转成 dict，并把 tools 逐个转 dict
+    # 【作用】嵌套的 ToolHit 不是 JSON 原生类型，asdict 之外还要手动展开一层
     def to_dict(self) -> Dict[str, Any]:
         return {
             "executed": self.executed,
@@ -164,16 +192,20 @@ class RecallResult:
         }
 
 
+# 【什么】第 ⑥ 环分支路由的决策对象
+# 【作用】定支路 + 定工具白名单，是流水线交给上层的最终结论
 @dataclass
 class RouteDecision:
     """分支路由决策。"""
 
-    branch: str = Branch.CHAT
-    tool_calls_allowed: bool = False   # False = 本轮禁止调用任何工具
-    tools: List[ToolHit] = field(default_factory=list)
-    reason: str = ""
-    min_confidence: float = 0.5
+    branch: str = Branch.CHAT              # 落点支路，见 Branch
+    tool_calls_allowed: bool = False       # False = 本轮禁止调用任何工具
+    tools: List[ToolHit] = field(default_factory=list)  # 本轮可用工具白名单，禁工具时为空
+    reason: str = ""                       # 决策说明，如"置信度 0.35 < 阈值 0.50"
+    min_confidence: float = 0.5            # 本次生效的置信度下限（默认 0.5）
 
+    # 【什么】转成 dict，并把 tools 逐个转 dict
+    # 【作用】同上：嵌套 ToolHit 需手动展开，另外带上生效的 min_confidence
     def to_dict(self) -> Dict[str, Any]:
         return {
             "branch": self.branch,
@@ -184,21 +216,25 @@ class RouteDecision:
         }
 
 
+# 【什么】流水线最终输出：六环结果 + trace 全在里面
+# 【作用】一次返回全链路证据，排障时能直接看出是哪一环做的决定
 @dataclass
 class PipelineResult:
     """流水线最终输出：每一环的结果都在里面，排障时一眼看到是哪一步做的决定。"""
 
-    query: str = ""
-    clean: CleanResult = field(default_factory=CleanResult)
-    risk: RiskResult = field(default_factory=RiskResult)
-    tokens: TokenResult = field(default_factory=TokenResult)
-    intent: IntentResult = field(default_factory=IntentResult)
-    recall: RecallResult = field(default_factory=RecallResult)
-    route: RouteDecision = field(default_factory=RouteDecision)
-    trace: List[Dict[str, Any]] = field(default_factory=list)
+    query: str = ""            # 用户原始输入（未清洗）
+    clean: CleanResult = field(default_factory=CleanResult)  # ① 文本清洗结果
+    risk: RiskResult = field(default_factory=RiskResult)  # ② 前置风控结果
+    tokens: TokenResult = field(default_factory=TokenResult)  # ③ Token 控制结果
+    intent: IntentResult = field(default_factory=IntentResult)  # ④ 意图识别结果
+    recall: RecallResult = field(default_factory=RecallResult)  # ⑤ Tool-RAG 召回结果
+    route: RouteDecision = field(default_factory=RouteDecision)  # ⑥ 分支路由决策
+    trace: List[Dict[str, Any]] = field(default_factory=list)  # 每环执行记录：step/ok/ms/detail
     stopped_at: str = ""       # 非空 = 流水线在这一步提前结束（如风控拦截）
     degraded: bool = False     # 链路中任意环节降级过
 
+    # 【什么】把全链路结果转成一个可序列化的 dict
+    # 【作用】API 直接返回它即可，前端/日志能一次看到六环结果与降级标记
     def to_dict(self) -> Dict[str, Any]:
         return {
             "query": self.query,

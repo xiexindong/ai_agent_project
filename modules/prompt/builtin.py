@@ -152,9 +152,11 @@ _BUILTINS = [
     PromptTemplate("classify.intent", _CLASSIFY_INTENT, "v1", "zero_shot", "意图分类（JSON 输出）"),
 ]
 
-_registry: PromptRegistry | None = None
+_registry: PromptRegistry | None = None   # 全局注册表单例；None 表示尚未创建过
 
 
+# 【什么】把 8 个内置模板注册进给定注册表
+# 【作用】让新建的注册表也有全套内置模板，返回它便于链式调用
 def register_builtin(registry: PromptRegistry) -> PromptRegistry:
     """把内置模板注册进一个（通常是新建的）注册表。"""
     for tpl in _BUILTINS:
@@ -162,6 +164,8 @@ def register_builtin(registry: PromptRegistry) -> PromptRegistry:
     return registry
 
 
+# 【什么】懒加载的全局注册表单例
+# 【作用】全进程共用一份模板表，避免「A 注册的模板 B 看不到」
 def get_registry() -> PromptRegistry:
     """全局注册表单例：首次调用时创建并注册内置模板。
 
@@ -175,6 +179,8 @@ def get_registry() -> PromptRegistry:
     return _registry
 
 
+# 【什么】重建全局注册表单例
+# 【作用】测试之间互相隔离用，返回新注册表以免用例互相污染
 def reset_registry() -> PromptRegistry:
     """清空单例并重建（测试用，避免用例之间互相污染）。"""
     global _registry

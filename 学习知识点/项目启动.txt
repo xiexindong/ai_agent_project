@@ -1,0 +1,2 @@
+杀死所有的python的进程
+taskkill /F /IM python.exe

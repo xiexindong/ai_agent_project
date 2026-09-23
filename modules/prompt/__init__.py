@@ -22,20 +22,30 @@
     summary_generator.py 两处改用 registry.render("summary" / "merge", ...)
     迁移前后措辞是否一致，由 examples/prompt_engineering_demo.py 第六幕回归比对。
 """
+# 【什么】模板层导出：模板类、注册表、提示词异常
+# 【作用】variables 校验与版本管理都在这层，builder/strategies 依赖它
 from modules.prompt.templates import (
     PromptError,
     PromptRegistry,
     PromptTemplate,
 )
+# 【什么】内置模板注册入口：全局注册表单例与重建函数
+# 【作用】进程一起来就有内置模板可用；测试用 reset_registry 隔离
 from modules.prompt.builtin import get_registry, register_builtin, reset_registry
+# 【什么】策略层导出：四种策略名 + 少样本示例库 + 策略块生成
+# 【作用】builder 靠 build_strategy_block 拼出「怎么问」那一段指令
 from modules.prompt.strategies import (
     STRATEGIES,
     FewShotExample,
     FewShotStore,
     build_strategy_block,
 )
+# 【什么】组装层导出：提示词组装器与 JSON 输出解析
+# 【作用】对外最常用的两个入口，绝大多数场景只用这两个
 from modules.prompt.builder import PromptBuilder, parse_json_output
 
+# 【什么】本包对外的符号白名单
+# 【作用】限制 import * 能拿到的名字，内部结构不对外承诺
 __all__ = [
     "PromptTemplate",
     "PromptRegistry",

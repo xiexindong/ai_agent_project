@@ -39,9 +39,13 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 # 重复标点：。。。。 → 。
 _REPEAT_PUNCT_RE = re.compile(r"([。！？!?，,；;]){3,}")
 
+# 【什么】默认截断阈值：5000 字符
+# 【作用】约 1 万 token，再长基本没有有效信息，且会拖垮后面的 token 计数
 _DEFAULT_MAX_CHARS = 5000
 
 
+# 【什么】全角字母数字与全角空格转半角
+# 【作用】让 "ＡＢＣ" 与 "ABC" 走到同一条规则上，避免同义输入被当成两种字符
 def _to_halfwidth(text: str) -> str:
     """全角字母、数字与全角空格转半角。
 
@@ -68,7 +72,7 @@ def _to_halfwidth(text: str) -> str:
     return "".join(out)
 
 
-def clean_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> CleanResult:
+def clean_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> CleanResult:  # max_chars=截断上限字符数
     """清洗用户输入。
 
     Args:

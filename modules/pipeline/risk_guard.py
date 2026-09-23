@@ -73,15 +73,21 @@ _RULES: List[Tuple[str, str, str, str]] = [
      r"(查|看|告诉|给我).{0,8}(别人|他人|同事|张三|李四|王五).{0,6}(工资|薪资|收入|绩效|奖金)"),
 ]
 
+# 【什么】预编译后的规则表：正则只在导入时编译一次
+# 【作用】每条请求都要过一遍全部规则，预编译省掉重复解析开销；IGNORECASE 统一大小写
 _COMPILED = [(code, level, desc, re.compile(pat, re.IGNORECASE)) for code, level, desc, pat in _RULES]
 
 # 超长输入阈值：超过这个长度基本是粘贴了大段文档/日志，属于异常但不危险
 _LONG_INPUT_CHARS = 8000
 
-_LEVEL_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
-_LEVEL_ACTION = {"high": "block", "medium": "review", "low": "pass", "none": "pass"}
+# 【什么】级别序数与级别动作两张映射表
+# 【作用】多条规则命中时按 _LEVEL_ORDER 取最高级，再按 _LEVEL_ACTION 定处置动作
+_LEVEL_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}    # 严重程度序数，数字越大越严重
+_LEVEL_ACTION = {"high": "block", "medium": "review", "low": "pass", "none": "pass"}  # 级别 → 处置动作
 
 
+# 【什么】前置高危规则风控总入口
+# 【作用】在花任何 token 之前先挡掉明显不该往下走的输入，命中 high 即拦截
 def check_risk(text: str) -> RiskResult:
     """前置高危规则风控。
 
@@ -117,6 +123,8 @@ def check_risk(text: str) -> RiskResult:
     hits: List[dict] = []
     top_level = "none"
 
+    # 【什么】把当前最高级别抬到指定级别（只升不降）
+    # 【作用】多条规则命中时，最终级别取所有命中的最高级，而不是最后一条
     def _bump(level: str) -> None:
         nonlocal top_level
         if _LEVEL_ORDER[level] > _LEVEL_ORDER[top_level]:
@@ -141,7 +149,7 @@ def check_risk(text: str) -> RiskResult:
         _bump("low")
 
     action = _LEVEL_ACTION[top_level]
-    passed = action != "block"
+    passed = action != "block"   # 只有 block 才不放行；review/pass 都继续往下走
 
     if not passed:
         _logger.warning(f"风控拦截: level={top_level} hits={[h['code'] for h in hits]}")

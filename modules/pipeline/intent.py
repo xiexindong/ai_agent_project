@@ -61,12 +61,14 @@ _INTENT_SYSTEM = """你是一个请求分类器，负责判断用户输入的"�
 3. exclude_tool_list 只在明确要排除某个工具时才填，否则给空数组
 4. 能直接回答的常识问题归 chat，不要因为提到了某个名词就归 rag"""
 
+# 【什么】用户提示词模板：只占位 {text} 一处
+# 【作用】把待分类文本单独放用户侧，分类定义留在 system 侧，减少每轮重复 token
 _INTENT_PROMPT_TMPL = "请判断下面这条用户输入的任务大类：\n\n{text}"
 
 # LLM 返回的字段长度上限：防止模型把整段原文塞进 keyword_list
-_MAX_KEYWORDS = 8
-_MAX_WORD_LEN = 24
-_MAX_DOMAIN_LEN = 32
+_MAX_KEYWORDS = 8        # 关键词最多保留 8 个
+_MAX_WORD_LEN = 24       # 单个关键词最多 24 字符，超了直接截断
+_MAX_DOMAIN_LEN = 32     # domain_tag 最多 32 字符
 
 # ----------------------------------------------------------------------
 # 【规则兜底表】LLM 不可用时的降级判定（关键词 → 意图 + 业务域）
@@ -82,12 +84,16 @@ _RULE_FALLBACK: List[tuple] = [
     ("mcp_remote", "it", r"(工单|运维|服务器|权限|VPN|资产|账号)", 0.35),
     ("local_skill", "general", r"(订单|库存|数据|统计|报表|查询)", 0.35),
 ]
+# 【什么】预编译后的兜底规则表
+# 【作用】导入时编译一次正则，降级路径每条请求都要过一遍，避免重复解析
 _COMPILED_FALLBACK = [(t, d, re.compile(p), c) for t, d, p, c in _RULE_FALLBACK]
 
 # 兜底用的关键词抽取：中文词 2-6 字 + 英文单词 2 字以上
 _WORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,}")
 
 
+# 【什么】按正则从文本里抽关键词（去重、限数量）
+# 【作用】给降级路径和 keyword_list 兜底，保证召回总能拿到可用的关键词
 def _extract_keywords(text: str, limit: int = _MAX_KEYWORDS) -> List[str]:
     """从文本里抽关键词（兜底路径用，也用于给 LLM 的 keyword_list 兜底）。
 
@@ -104,6 +110,8 @@ def _extract_keywords(text: str, limit: int = _MAX_KEYWORDS) -> List[str]:
     return words
 
 
+# 【什么】把 LLM 各种形态的"是/否"统一成 bool
+# 【作用】模型有时给 true、有时给"是"、有时给 1，不统一会在下游判断上出错
 def _to_bool(value: Any) -> bool:
     """把 LLM 可能给出的各种形态统一成 bool。
 
@@ -118,6 +126,8 @@ def _to_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "是", "需要")
 
 
+# 【什么】规整字符串列表：只留字符串、去空白、去重、限长、限数量
+# 【作用】挡住模型把整段原文或"无"塞进数组这类输出，保证下游遍历有意义
 def _clean_list(value: Any, limit: int = _MAX_KEYWORDS) -> List[str]:
     """规整字符串列表：只留字符串、去空白、去重、限长、限数量。
 
@@ -149,6 +159,8 @@ def _clean_list(value: Any, limit: int = _MAX_KEYWORDS) -> List[str]:
     return out
 
 
+# 【什么】规整业务域标签：只留字母数字下划线、小写、限长
+# 【作用】domain_tag 会拼进召回过滤条件，必须收敛成可控字符集
 def _normalize_domain(value: Any) -> str:
     """规整业务域标签：小写、只留字母数字下划线、超长截断、空值兜底 general。"""
     s = re.sub(r"[^A-Za-z0-9_]", "", str(value or "")).lower()
@@ -157,6 +169,8 @@ def _normalize_domain(value: Any) -> str:
     return s[:_MAX_DOMAIN_LEN]
 
 
+# 【什么】把 LLM 原始 JSON 归一化成 IntentResult
+# 【作用】字段逐个校验收敛，出参的六个字段对下游而言全部可信
 def _normalize(raw: Dict[str, Any]) -> IntentResult:
     """把 LLM 原始 JSON 归一化成 IntentResult（字段全部可信）。"""
     itype = str(raw.get("intent_type", "")).strip().lower()
@@ -188,6 +202,8 @@ def _normalize(raw: Dict[str, Any]) -> IntentResult:
     )
 
 
+# 【什么】规则兜底：按关键词表猜一个意图
+# 【作用】LLM 不可用时也能给出可用结果，且置信度封顶 0.4 保证不误触发工具
 def _rule_fallback(text: str, reason: str) -> IntentResult:
     """规则兜底：LLM 不可用时的降级判定。
 
@@ -214,6 +230,8 @@ def _rule_fallback(text: str, reason: str) -> IntentResult:
     )
 
 
+# 【什么】意图识别总入口：LLM 结构化输出 + 规则降级
+# 【作用】给出 6 选 1 大类与辅助字段；任何异常都不上抛，一律转规则兜底
 def recognize_intent(text: str, llm=None, use_llm: bool = True) -> IntentResult:
     """意图识别（LLM 结构化输出 + 规则降级）。
 
@@ -246,6 +264,7 @@ def recognize_intent(text: str, llm=None, use_llm: bool = True) -> IntentResult:
                 return _rule_fallback(text, "未配置 DEEPSEEK_API_KEY，走规则兜底")
             llm = LLMClient()
 
+        # text[:2000]：分类不需要全文，超长部分砍掉省 token，也避免被细节带偏
         prompt = _INTENT_PROMPT_TMPL.format(text=text[:2000])
         raw = llm.invoke_structured(prompt, system_prompt=_INTENT_SYSTEM, temperature=0.1)
 

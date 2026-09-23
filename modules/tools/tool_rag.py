@@ -33,6 +33,8 @@ _logger = get_logger("tool_rag")
 _KEYWORD_SCALE = 0.6
 
 
+# 【什么】一次工具召回的结果记录
+# 【作用】带名字与分数返回给路由层，由它决定是否把工具放进 prompt
 @dataclass
 class ToolHit:
     """一次召回结果。
@@ -42,11 +44,13 @@ class ToolHit:
         score:  相似度，向量命中为余弦值（0~1），关键词命中为折算后的比例分
         source: "vector"（语义召回）/ "keyword"（降级召回）
     """
-    name: str
-    score: float
-    source: str
+    name: str        # 工具名，与 ToolRegistry 里注册的名字一致
+    score: float     # 相似度：向量为余弦值(0~1)，关键词为折算后的比例分
+    source: str      # 召回方式：vector（语义） / keyword（降级）
 
 
+# 【什么】工具的语义检索索引
+# 【作用】建索引 + 按提问召回 top-k 工具，让 prompt 里只有少量候选
 class ToolRAGIndex:
     """工具语义索引：index_tools() 建索引，recall() 按提问召回。
 
@@ -57,14 +61,14 @@ class ToolRAGIndex:
     """
 
     def __init__(self, top_k: int = 5, min_score: float = 0.25, enabled: bool = True):
-        self._top_k = max(1, int(top_k))
-        self._min_score = float(min_score)
-        self._enabled = enabled
-        self._texts: Dict[str, str] = {}
-        self._vectors: Dict[str, List[float]] = {}
-        self._metas: Dict[str, dict] = {}
-        self._vector_available = True
-        self._last_source = "vector"
+        self._top_k = max(1, int(top_k))                  # 单次最多召回几个工具，默认 5，下限 1
+        self._min_score = float(min_score)                # 召回分数门槛，默认 0.25，低于它一律不要
+        self._enabled = enabled                           # 总开关：False 时 recall() 直接返回空列表
+        self._texts: Dict[str, str] = {}                  # 工具名 → 用途画像文本
+        self._vectors: Dict[str, List[float]] = {}        # 工具名 → 语义向量（embedding 可用时才有）
+        self._metas: Dict[str, dict] = {}                 # 工具名 → 原始元信息（server 来源，排查用）
+        self._vector_available = True                     # 向量是否可用；失败一次后永久降级关键词
+        self._last_source = "vector"                      # 上次召回方式，供 stats() 观测
 
     # ------------------------------------------------------------------
     # 【建索引】工具可以是 BaseTool 实例，也可以是网关目录里的 dict
@@ -80,6 +84,8 @@ class ToolRAGIndex:
     #           _texts["calculator"] = "calculator。安全计算数学表达式 可填参数: expression、precision"
     #           _texts["weather"]    = "weather。查询城市天气 可填参数: city"
     # ------------------------------------------------------------------
+    # 【什么】给工具建索引，返回新编码的工具数
+    # 【作用】文本没变且已编码的工具跳过，避免重复调 embedding
     def index_tools(self, tools: list) -> int:
         pending: List[tuple] = []
         for tool in tools or []:
@@ -124,6 +130,8 @@ class ToolRAGIndex:
     #     输出  [ToolHit("weather", 0.7412, "vector"), ToolHit("web_search", 0.5231, "vector")]
     #           其余 30 个工具相似度低于 0.25，不进结果
     # ------------------------------------------------------------------
+    # 【什么】按提问召回最相关的若干工具
+    # 【作用】向量优先、关键词兜底；无命中返回空列表交由路由层回退默认工具
     def recall(self, query: str, top_k: Optional[int] = None) -> List[ToolHit]:
         if not self._enabled or not query or not self._texts:
             return []
@@ -139,6 +147,8 @@ class ToolRAGIndex:
         self._last_source = "keyword"
         return self._recall_keyword(query, k)
 
+    # 【什么】语义召回：编码 query 后与全部工具向量算余弦
+    # 【作用】主力召回路径；编码失败就关掉开关交给关键词兜底
     def _recall_vector(self, query: str, k: int) -> List[ToolHit]:
         try:
             from modules.memory.embedding_service import get_embedding_service
@@ -160,6 +170,8 @@ class ToolRAGIndex:
         )
         return hits
 
+    # 【什么】关键词降级召回：按 2-gram 片段重合打分
+    # 【作用】embedding 不可用时仍能选出工具；分数乘 _KEYWORD_SCALE=0.6 折算
     def _recall_keyword(self, query: str, k: int) -> List[ToolHit]:
         q_frags = self._fragments(query)
         if not q_frags:
@@ -187,6 +199,8 @@ class ToolRAGIndex:
     #     输出  ['北京', '京天', '天气', '3']
     #           （"3*7" 被正则切成 ['3','7']，长度 <2 的片段不参与）
     # ------------------------------------------------------------------
+    # 【什么】把文本切成可比对片段
+    # 【作用】中文走 2-gram、英文数字走词，供关键词召回做重合统计
     @staticmethod
     def _fragments(text: str) -> List[str]:
         lower = (text or "").lower()
@@ -202,6 +216,8 @@ class ToolRAGIndex:
     #     输入  name="data_query", desc="查询业务数据", schema={"properties":{"table":{},"limit":{}}}
     #     输出  "data_query。查询业务数据 可填参数: table、limit"
     # ------------------------------------------------------------------
+    # 【什么】拼出工具的用途画像文本
+    # 【作用】只取参数名（最多前 6 个），不把完整 schema 塞进索引
     @staticmethod
     def _routing_text(name: str, description: str, schema: dict) -> str:
         props = (schema or {}).get("properties", {}) or {}
@@ -209,6 +225,8 @@ class ToolRAGIndex:
         return f"{name}。{description} 可填参数: {params}"
 
     @staticmethod
+    # 【什么】把 dict 形态与 BaseTool 形态的工具归一化
+    # 【作用】索引与网关目录两套来源共用一套取字段逻辑
     def _normalize(tool) -> tuple:
         """把 BaseTool 实例或网关目录 dict 统一成 (name, description, schema, meta)。"""
         if isinstance(tool, dict):
@@ -224,6 +242,8 @@ class ToolRAGIndex:
         schema = getattr(tool, "parameters_schema", None) or getattr(tool, "parameters", None) or {}
         return str(name), str(desc), schema, {"server": getattr(tool, "tool_type", "")}
 
+    # 【什么】输出索引运行态观测数据
+    # 【作用】排查召回效果时看是否降级、当前 top_k 与 min_score 是多少
     def stats(self) -> dict:
         """索引观测：总数、向量可用与否、上次召回方式。"""
         return {
@@ -235,12 +255,16 @@ class ToolRAGIndex:
             "min_score": self._min_score,
         }
 
+    # 【什么】清空三张内部表
+    # 【作用】重建索引前调用；不清会残留旧工具的画像与向量
     def clear(self) -> None:
         self._texts.clear()
         self._vectors.clear()
         self._metas.clear()
 
 
+# 【什么】计算两个向量的余弦相似度
+# 【作用】语义召回的打分函数；长度不等或零向量返回 0.0
 def _cosine(a: List[float], b: List[float]) -> float:
     """余弦相似度（0~1 区间由调用方按 min_score 把关）。"""
     if not a or not b or len(a) != len(b):

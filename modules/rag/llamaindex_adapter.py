@@ -205,13 +205,26 @@ class LlamaIndexRAG:
             for i, d in enumerate(docs, 1)
         )
 
-    def get_knowledge_stats(self) -> dict:
-        """知识库统计（字段对齐自研 RAGChain.get_knowledge_stats）。"""
+    def get_knowledge_stats(self, kb_codes: Optional[list] = None) -> dict:
+        """知识库统计（字段对齐自研 RAGChain.get_knowledge_stats）。
+
+        kb_codes 仅为对齐接口签名：llama-index 后端是独立落盘的单一索引，
+        没有分库概念，这里忽略该参数。
+        """
         return {
             "backend": "llamaindex",
             "persist_dir": self.persist_dir,
             "index_ready": self._index is not None,
+            "total_chunks": self._chunk_count(),
+            "by_kb": {},
         }
+
+    def _chunk_count(self) -> int:
+        """索引里的分片总数；索引未就绪时返回 0（不抛异常，统计接口不该拖垮页面）。"""
+        try:
+            return len(self._index.docstore.docs) if self._index is not None else 0
+        except Exception:
+            return 0
 
 
 def build_rag(prefer: str = ""):

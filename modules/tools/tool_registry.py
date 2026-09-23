@@ -24,6 +24,8 @@ from modules.tools.base_tool import BaseTool, ToolResult
 _logger = get_logger("registry")
 
 
+# 【什么】工具注册与调度中心（本地 + MCP 双模式）
+# 【作用】工具调用的唯一入口，内含 5 次上限与同参去重两道防死循环闸门
 class ToolRegistry:
     """双模式工具注册器（本地 + MCP 远程）。
 
@@ -34,9 +36,9 @@ class ToolRegistry:
     """
 
     def __init__(self):
-        self._tools: Dict[str, BaseTool] = {}
-        self._call_records: Dict[str, set] = defaultdict(set)
-        self._call_counts: Dict[str, int] = defaultdict[str, int](int)
+        self._tools: Dict[str, BaseTool] = {}                                  # 工具名 → 工具实例
+        self._call_records: Dict[str, set] = defaultdict(set)                  # 会话ID → {"工具名:参数指纹"}，去重用
+        self._call_counts: Dict[str, int] = defaultdict[str, int](int)         # 工具名 → 累计调用次数，限频用
         # ------------------------------------------------------------------
         # 【结果缓存】会话ID → {去重键: 上次成功的 ToolResult}
         #   只缓存成功结果，用途是「同参数再次调用」时把上次答案直接回传。
@@ -49,9 +51,11 @@ class ToolRegistry:
         #   第二次输入：calculator({'expression': '3*7'})
         #   第二次输出：success=True, result='21'（不再真的执行第二次）
         # ------------------------------------------------------------------
-        self._result_cache: Dict[str, dict] = defaultdict(dict)
-        self._max_calls_per_tool = 5
+        self._result_cache: Dict[str, dict] = defaultdict(dict)   # {会话ID: {去重键: 上次成功的 ToolResult}}
+        self._max_calls_per_tool = 5                              # 单工具累计调用上限 5 次，超出判为死循环
 
+    # 【什么】把工具实例放进注册表
+    # 【作用】登记后工具才能被调度；同名工具后者覆盖前者，只记 warning
     def register(self, tool: BaseTool):
         """
         注册单个工具（本地工具或 MCP 适配器均可）。
@@ -68,6 +72,8 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         _logger.info(f"工具注册: {tool.name} ({tool.tool_type})")
 
+    # 【什么】批量注册工具
+    # 【作用】启动阶段一次性装配，逐个走 register()，重名策略与单个注册一致
     def register_batch(self, tools: List[BaseTool]):
         """
         批量注册工具。
@@ -78,6 +84,8 @@ class ToolRegistry:
         for tool in tools:
             self.register(tool)
 
+    # 【什么】按名称取工具实例
+    # 【作用】执行前的存在性检查入口；取不到返回 None，由上层转成错误 ToolResult
     def get_tool(self, name: str) -> Optional[BaseTool]:
         """
         按名称获取工具实例。
@@ -90,6 +98,8 @@ class ToolRegistry:
         """
         return self._tools.get(name)
 
+    # 【什么】列出全部已注册工具
+    # 【作用】给全量调用或管理接口遍历用，顺序即注册顺序
     def list_tools(self) -> List[BaseTool]:
         """
         列出所有已注册工具。
@@ -99,6 +109,8 @@ class ToolRegistry:
         """
         return list(self._tools.values())
 
+    # 【什么】生成发给模型的工具 schema 列表
+    # 【作用】在此做权限源头过滤：模型看不到的工具就调不到（allowed 优先于 user_level）
     def get_openai_tools_schema(self, user_level: str = "normal", allowed: list = None) -> list:
         """
         生成 OpenAI Function Calling 格式的工具说明书（JSON Schema 列表）。
@@ -129,6 +141,8 @@ class ToolRegistry:
             schemas.append(tool.to_openai_format())
         return schemas
 
+    # 【什么】工具调度的核心流水线
+    # 【作用】存在性→次数上限→同参去重→执行→记账，每步都返回 ToolResult 不抛异常
     def execute_tool(
         self,
         name: str,
@@ -203,7 +217,7 @@ class ToolRegistry:
             call_params.update(context)
         result = tool.run(call_params)
 
-        self._call_counts[name] += 1
+        self._call_counts[name] += 1   # 只在真正发起执行后计数：失败调用不占 5 次配额
         if session_id:
             self._call_records[session_id].add(dedup_key)
             # 【为什么只缓存成功的】失败结果被回传会让模型误以为"答案就是这样"，
@@ -213,6 +227,8 @@ class ToolRegistry:
 
         return result
 
+    # 【什么】生成参数指纹
+    # 【作用】排序后序列化，保证传参顺序不同也能判定为同一次调用
     @staticmethod
     def _hash_params(params: dict) -> str:
         """
@@ -230,6 +246,8 @@ class ToolRegistry:
             return ""
         return str(sorted(params.items()))
 
+    # 【什么】清空某会话的去重账本与结果缓存，并重置全局调用计数
+    # 【作用】新一轮提问前调用，计数不清会把上一轮配额带到下一轮
     def reset_session(self, session_id: str):
         """
         重置调用记录（每轮新提问或开启新会话前调用）。
@@ -247,6 +265,8 @@ class ToolRegistry:
             del self._result_cache[session_id]
         self._call_counts.clear()
 
+    # 【什么】返回两个内置本地工具的新实例
+    # 【作用】函数内延迟 import 兜住循环依赖，装配默认工具集时直接调用
     def get_default_tools(self) -> List[BaseTool]:
         """
         获取内置默认工具集（进程内本地工具）。

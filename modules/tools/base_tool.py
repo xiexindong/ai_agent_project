@@ -30,6 +30,8 @@ from modules.common.exceptions import ToolException
 _logger = get_logger("tool")
 
 
+# 【什么】工具执行结果对象（本地与 MCP 共用）
+# 【作用】把成功值、错误原因、耗时打包成统一返回，调用方不看异常只看它
 @dataclass
 class ToolResult:
     """
@@ -45,11 +47,13 @@ class ToolResult:
         成功: ToolResult(success=True, result=21, duration_ms=12)
         失败: ToolResult(success=False, error="工具不存在: calc", duration_ms=0)
     """
-    success: bool
-    result: Any = None
-    error: str = ""
-    duration_ms: int = 0
+    success: bool            # True=成功 / False=失败（含被安全闸门拦截）
+    result: Any = None       # 成功返回值，任意类型（int / dict / list）
+    error: str = ""          # 失败原因，会回喂给 LLM 让它改策略
+    duration_ms: int = 0     # 执行耗时毫秒，由 run() 自动填充
 
+    # 【什么】把结果对象转成普通字典
+    # 【作用】便于序列化进日志、链路或接口返回体
     def to_dict(self) -> dict:
         return {
             "success": self.success,
@@ -59,6 +63,8 @@ class ToolResult:
         }
 
 
+# 【什么】所有工具的抽象基类
+# 【作用】把「名称/描述/参数schema/执行」统一成一个接口，屏蔽本地与 MCP 差异
 class BaseTool(ABC):
     """
     本地工具基类。
@@ -68,20 +74,26 @@ class BaseTool(ABC):
     把所有工具的"通用骨架"放这里，子类只填自己的业务逻辑。
     """
 
+    # 【什么】构造函数：固化工具的三要素
+    # 【作用】把调用方传进来的原始 parameters 归一成标准 schema
     def __init__(self, name: str, description: str, parameters: dict):
-        self.name = name
-        self.description = description
-        self.parameters_schema = {
-            "type": "object",
-            "properties": parameters.get("properties", {}),
-            "required": parameters.get("required", []),
+        self.name = name                        # 工具名，Function Calling 用它匹配 tool_calls[].name
+        self.description = description          # 给 LLM 看的用途说明，影响它选不选这个工具
+        self.parameters_schema = {              # 对外暴露的标准 schema，只留下面三个字段
+            "type": "object",                   # 固定为 object：JSON Schema 顶层类型
+            "properties": parameters.get("properties", {}),   # 形参说明书；调用方没传则取空 dict
+            "required": parameters.get("required", []),       # 必填参数名列表；没传则取空 list
         }
 
+    # 【什么】工具类型标识
+    # 【作用】区分 local / mcp，注册日志与 mcp 工具的权限码都看这个值
     @property
     def tool_type(self) -> str:
         """工具类型：local / mcp。"""
         return "local"
 
+    # 【什么】转成 OpenAI Function Calling 的工具描述
+    # 【作用】这份 schema 发给模型，决定它能调哪些工具、传什么参数
     def to_openai_format(self) -> dict:
         """转换为 OpenAI Function Calling 标准格式。"""
         return {
@@ -93,6 +105,8 @@ class BaseTool(ABC):
             },
         }
 
+    # 【什么】参数校验：只查必填项是否在且不为 None
+    # 【作用】把非法参数挡在 execute 之前，缺参抛 ToolException
     def validate_params(self, params: dict) -> dict:
         """参数合法性校验：检查必填项（边界2）。"""
         if params is None:
@@ -106,11 +120,15 @@ class BaseTool(ABC):
             )
         return params
 
+    # 【什么】工具真正的业务逻辑（子类必须实现）
+    # 【作用】只负责干活；参数校验与结果封装由 run() 统一代劳
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
         """执行工具逻辑，子类实现。"""
         pass
 
+    # 【什么】统一执行入口（模板方法）
+    # 【作用】校验→执行→补耗时→包成 ToolResult，异常也转成失败结果不向上抛
     def run(self, params: dict) -> ToolResult:
         """统一执行入口：参数校验 → 执行 → 结果封装。"""
         import time

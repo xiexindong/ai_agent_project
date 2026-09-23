@@ -24,44 +24,48 @@ from typing import Dict
 from modules.tools.base_tool import BaseTool, ToolResult
 
 _SAFE_OPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.UAdd: operator.pos,
-    ast.Mod: operator.mod,
-    ast.FloorDiv: operator.floordiv,
+    ast.Add: operator.add,              # 加法 a + b
+    ast.Sub: operator.sub,              # 减法 a - b
+    ast.Mult: operator.mul,             # 乘法 a * b
+    ast.Div: operator.truediv,          # 除法 a / b，除数为 0 会抛 ZeroDivisionError
+    ast.Pow: operator.pow,              # 幂 a ** b，如 2**10 = 1024
+    ast.USub: operator.neg,             # 取负 -a
+    ast.UAdd: operator.pos,             # 正号 +a（值不变，保持表达式可通过）
+    ast.Mod: operator.mod,              # 取模 a % b
+    ast.FloorDiv: operator.floordiv,    # 整除 a // b
 }
 
 _SAFE_FUNCS = {
-    "sin": math.sin, "cos": math.cos, "tan": math.tan,
-    "asin": math.asin, "acos": math.acos, "atan": math.atan,
-    "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
-    "exp": math.exp, "abs": abs, "ceil": math.ceil, "floor": math.floor,
-    "pi": math.pi, "e": math.e, "degrees": math.degrees, "radians": math.radians,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,   # 三角函数（入参为弧度）
+    "asin": math.asin, "acos": math.acos, "atan": math.atan,   # 反三角函数
+    "sqrt": math.sqrt, "log": math.log, "log10": math.log10,   # 开方与自然对数、常用对数
+    "exp": math.exp, "abs": abs, "ceil": math.ceil, "floor": math.floor,   # 指数、绝对值、上下取整
+    "pi": math.pi, "e": math.e, "degrees": math.degrees, "radians": math.radians,   # 常量与角度弧度换算
 }
 
 
+# 【什么】安全数学计算器（AST 白名单求值）
+# 【作用】替代 eval()，只放行白名单运算符与函数，挡住任意代码执行
 class CalculatorTool(BaseTool):
     """安全数学计算器：仅允许数学表达式，禁止任意代码执行。"""
 
     def __init__(self):
         super().__init__(
-            name="calculator",
+            name="calculator",   # 工具名；Permission 里对应 tool:calculator
             description="数学计算器，支持四则运算、幂运算、三角函数等。输入数学表达式字符串，返回计算结果。",
             parameters={
                 "properties": {
                     "expression": {
                         "type": "string",
                         "description": "数学表达式，如 '2+3*4', 'sqrt(16)', 'sin(pi/2)'",
-                    }
+                    }   # 唯一的入参；传非字符串会在 ast.parse 处报错
                 },
-                "required": ["expression"],
+                "required": ["expression"],   # 必填；空串或纯空白会在 execute 里先被拦掉
             },
         )
 
+    # 【什么】递归遍历 AST 求值
+    # 【作用】逐节点对照白名单，白名单外的节点一律抛 ValueError
     def _eval_node(self, node):
         """递归安全求值 AST 节点。"""
         if isinstance(node, ast.Expression):
@@ -94,6 +98,8 @@ class CalculatorTool(BaseTool):
             return val
         raise ValueError(f"不支持的表达式节点: {type(node).__name__}")
 
+    # 【什么】解析并执行数学表达式
+    # 【作用】ast.parse(mode="eval") 后交给 _eval_node，异常一律转成失败 ToolResult
     def execute(self, expression: str, **kwargs) -> ToolResult:
         """安全执行数学表达式。"""
         expr = expression.strip()

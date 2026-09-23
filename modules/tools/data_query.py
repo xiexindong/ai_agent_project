@@ -20,6 +20,8 @@ from typing import Dict
 from modules.tools.base_tool import BaseTool, ToolResult
 from modules.enterprise.masking import mask_record
 
+# 【什么】模拟业务数据集：users 4 条 / orders 3 条 / inventory 3 条
+# 【作用】每条记录都带 owner 与 owner_dept，供行级数据域过滤使用
 _MOCK_DATA = {
     "users": {
         "U001": {"name": "张三", "dept": "技术部", "dept_code": "D_TECH", "level": "高级",
@@ -51,6 +53,8 @@ _MOCK_DATA = {
 }
 
 
+# 【什么】企业内部数据查询工具（Mock 数据）
+# 【作用】演示 Function Calling + 行级数据域（self/dept/all）过滤
 class DataQueryTool(BaseTool):
     """
     企业内部数据查询工具（Mock 数据，演示用）。
@@ -72,9 +76,11 @@ class DataQueryTool(BaseTool):
             → 与"不存在"区分开，模型不会继续探测
     """
 
+    # 【什么】构造函数：声明工具名、说明与参数 schema
+    # 【作用】data_type 必填；record_id 选填，留空表示查可见列表
     def __init__(self):
         super().__init__(
-            name="data_query",
+            name="data_query",   # 工具名；权限码对应 tool:data_query
             description="查询企业内部业务数据（用户信息、订单状态、库存数据）。支持按类型和ID精确查询。只能查询你权限范围内的数据。",
             parameters={
                 "properties": {
@@ -82,18 +88,20 @@ class DataQueryTool(BaseTool):
                         "type": "string",
                         "enum": ["users", "orders", "inventory"],
                         "description": "数据类型: users(用户), orders(订单), inventory(库存)",
-                    },
+                    },   # 必填，三种取值：users / orders / inventory
                     "record_id": {
                         "type": "string",
                         "description": "记录ID，如 'U001', 'O1001', 'SKU-001'。留空返回该类型全部记录",
-                    },
+                    },   # 选填，留空=返回该类型可见记录清单
                 },
-                "required": ["data_type"],
+                "required": ["data_type"],   # 只强校验 data_type；record_id 留空是合法用法
             },
         )
 
 
     @staticmethod
+    # 【什么】按数据域筛出可见记录
+    # 【作用】self 只看本人、dept 只看本部门；owner_dept 为空的记录视为全公司共享
     def _visible_records(dataset: Dict[str, dict], scope: str, dept_code: str, user_code: str) -> Dict[str, dict]:
         """按数据域过滤可见记录；owner_dept 为空的记录视为全公司共享。"""
         visible = {}
@@ -107,6 +115,8 @@ class DataQueryTool(BaseTool):
             visible[rid] = rec
         return visible
 
+    # 【什么】真正执行查询的三分支：列表 / 单条 / 失败
+    # 【作用】私有参数（_data_scope 等）由服务端注入，模型不可见也不可传
     def execute(self, data_type: str, record_id: str = "", **kwargs) -> ToolResult:
         """
         执行数据查询。
@@ -123,14 +133,14 @@ class DataQueryTool(BaseTool):
                 error=f"不支持的数据类型: {data_type}，可选: {list(_MOCK_DATA.keys())}",
             )
 
-        scopes = kwargs.get("_scopes") or {}
-        scope = scopes.get(data_type) or kwargs.get("_data_scope", "all") or "all"
-        dept_code = kwargs.get("_dept_code", "") or ""
-        user_code = kwargs.get("_user_code", "") or ""
+        scopes = kwargs.get("_scopes") or {}                                      # 按数据类型细分的数据域字典（由 Agent 侧注入，见 react_agent._server_params，来源 principal.scope_for），未传则为空 dict
+        scope = scopes.get(data_type) or kwargs.get("_data_scope", "all") or "all"  # 取值优先级：_scopes[data_type] > _data_scope > "all"
+        dept_code = kwargs.get("_dept_code", "") or ""                            # 当前用户部门码，dept 域过滤用
+        user_code = kwargs.get("_user_code", "") or ""                            # 当前用户工号，self 域过滤用
         try:
-            mask_level = int(kwargs.get("_mask_level", 0) or 0)
+            mask_level = int(kwargs.get("_mask_level", 0) or 0)   # 脱敏强度 0/1/2，未注入时按 0（不脱敏）
         except (TypeError, ValueError):
-            mask_level = 0
+            mask_level = 0                                        # 非法取值兜底为不脱敏，不让取值问题中断查询
 
         dataset = _MOCK_DATA[data_type]
         visible = self._visible_records(dataset, scope, dept_code, user_code)

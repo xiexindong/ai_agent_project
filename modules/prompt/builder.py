@@ -33,13 +33,13 @@ _logger = get_logger("prompt.builder")
 
 # 上下文块优先级，从高到低。不在表里的键排在最后（按名字排序，保证顺序稳定）。
 _CONTEXT_PRIORITY = (
-    "permission_context",
-    "tools_desc",
-    "observation",
-    "skill_context",
-    "rag_context",
-    "memory_context",
-    "tool_history",
+    "permission_context",  # 权限边界：硬性约束，丢了会越权，优先级最高
+    "tools_desc",          # 工具清单：没有它模型无从调用工具
+    "observation",         # 工具观察结果：本轮刚拿到的新事实
+    "skill_context",       # 技能 SOP：已激活技能时的作业流程
+    "rag_context",         # 知识库参考：回答的主要依据
+    "memory_context",      # 历史记忆：让回答更贴人，丢了不致命
+    "tool_history",        # 历史工具调用：只在排查重复调用时有用，优先级最低
 )
 
 # 上下文类变量：这类变量"有就给、没有就没有"，调用方不传时填占位，不报错。
@@ -47,10 +47,12 @@ _CONTEXT_PRIORITY = (
 # 那些缺了整个提示词就没意义，必须由模板层的 render() 抛错拦住。
 # 注意这里不含 strategy_block：策略是"指令"不是"上下文"，由 build_record 直接注入，
 # 不参与上下文预算竞争，否则预算一满就会先把"怎么问"丢掉，只剩一堆资料。
-_CONTEXT_KEYS = set(_CONTEXT_PRIORITY)
-_EMPTY_PLACEHOLDER = "（未提供）"
+_CONTEXT_KEYS = set(_CONTEXT_PRIORITY)   # 上下文类变量的集合，用于判断某个键是否参与预算裁剪
+_EMPTY_PLACEHOLDER = "（未提供）"            # 上下文没传时的占位文本，保证模板始终能渲染出来
 
 
+# 【什么】把四层内容拼成最终 messages 的组装器
+# 【作用】统一负责渲染、策略注入、token 预算裁剪，调用方只管传上下文
 @dataclass
 class PromptBuilder:
     """提示词组装器。
@@ -69,17 +71,17 @@ class PromptBuilder:
         registry:         模板注册表，留空用全局单例
     """
 
-    template_name: str = "qa.grounded"
-    template_version: str = ""
-    strategy: str = "zero_shot"
-    role: str = ""
-    output_format: str = "text"
-    output_schema: str = ""
-    max_context_tokens: int = 3000
-    few_shot_store: Optional[FewShotStore] = None
-    few_shot_k: int = 2
-    max_iter: int = 10
-    registry: Optional[PromptRegistry] = None
+    template_name: str = "qa.grounded"             # 用的模板名，默认知识库问答模板
+    template_version: str = ""                     # 指定版本；留空取最后注册的那版
+    strategy: str = "zero_shot"                    # 提问策略，见 strategies.STRATEGIES
+    role: str = ""                                 # 角色指令，拼在 system 开头
+    output_format: str = "text"                    # 输出格式：text / json / markdown
+    output_schema: str = ""                        # json 模式补充的字段说明
+    max_context_tokens: int = 3000                 # 上下文 token 预算，不含 query 与指令本身
+    few_shot_store: Optional[FewShotStore] = None  # few_shot 示例库；为空则退化成 zero_shot
+    few_shot_k: int = 2                            # few_shot 取几条示例
+    max_iter: int = 10                             # react 策略的循环上限，写进策略块
+    registry: Optional[PromptRegistry] = None      # 模板注册表；留空用全局单例
 
     # 残羹冷炙阈值：裁剪后剩下的 token 少于这个值就不塞了，
     # 半截上下文比没有更容易误导模型（看着像有依据，实际是被砍断的）。
@@ -92,10 +94,14 @@ class PromptBuilder:
     #   user 放「渲染后的模板」（随每次提问变化）。
     #   分开的好处：多轮对话时 system 不变，服务端可命中前缀缓存（省 token 也省钱）。
     # ------------------------------------------------------------------
+    # 【什么】对外主入口：返回可直接喂给模型的 messages
+    # 【作用】只要 messages 时用这个；要看 token 与裁剪记录用 build_record
     def build(self, query: str, **context) -> List[Dict[str, str]]:
         rec = self.build_record(query, **context)
         return rec["messages"]
 
+    # 【什么】完整构建：messages + token 数 + 裁剪记录
+    # 【作用】排查慢查询、评测效果时用它，能看到哪块上下文被截断或丢弃
     def build_record(self, query: str, **context) -> dict:
         """完整构建，除 messages 外还返回 token 数与裁剪记录（排查与评测用）。
 
@@ -179,6 +185,8 @@ class PromptBuilder:
     #   输入  role="你是企业级智能AI助手..."  tools_desc=""
     #   输出  "你是企业级智能AI助手...\n\n## 工作流程（ReAct）\n1. Reason...\n\n## 可用工具\n（无可用工具）"
     # ------------------------------------------------------------------
+    # 【什么】只生成 system 段（角色 + 策略 + 输出格式）
+    # 【作用】system 固定、user 每轮变的场景可缓存它，还能命中前缀缓存
     def system_prompt(
         self,
         role: str = "",
@@ -215,6 +223,8 @@ class PromptBuilder:
     #
     # 【为什么不截断 query】问题是本次请求的全部意义，砍它等于换了个问题。
     # ------------------------------------------------------------------
+    # 【什么】按预算装上下文：能塞就塞，塞不下就截断或丢弃
+    # 【作用】保证总 token 不超 max_context_tokens（默认 3000），并记录裁剪动作
     def _fit_context(self, needed, context: dict) -> tuple[dict, List[str]]:
         ordered = [k for k in _CONTEXT_PRIORITY if k in needed and k in _CONTEXT_KEYS]
         ordered += sorted(
@@ -257,6 +267,8 @@ class PromptBuilder:
     #   所以按「token : 字符」的比例估算，再留 12 个字符给省略标记。
     #   截断只是保底手段，真正该做的是上游就别塞这么长的上下文进来。
     # ------------------------------------------------------------------
+    # 【什么】把文本按 token 上限截短
+    # 【作用】超出预算时保留前段并追加「…（已截断）」标记，给模型明确提示
     @staticmethod
     def _clip(text: str, limit_tokens: int) -> str:
         total = count_tokens(text)
@@ -265,6 +277,8 @@ class PromptBuilder:
         keep = max(0, int(len(text) * (limit_tokens / total)) - 12)
         return text[:keep] + "\n…（已截断）"
 
+    # 【什么】生成输出格式约束段
+    # 【作用】json / markdown 才产出指令，text 返回空串即不附加约束
     def _format_instruction(self) -> str:
         """输出格式约束。放 system 而不是 user：
         模型对 system 里的格式要求服从度更高，且多轮时不会随历史被淹没。"""
@@ -291,6 +305,8 @@ class PromptBuilder:
 #   输入 '我觉得这是报销咨询'                            ← 完全不是 JSON
 #   输出 None
 # ----------------------------------------------------------------------
+# 【什么】把模型输出解析成 dict
+# 【作用】配合 output_format=json 收尾；解析不了返回 None 由调用方处理
 def parse_json_output(text: str) -> Optional[dict]:
     if not text:
         return None

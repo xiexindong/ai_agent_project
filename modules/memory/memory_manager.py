@@ -6,6 +6,8 @@
 - 长期记忆：PG pgvector 摘要向量语义召回（跨会话历史匹配）
 覆盖边界4（上下文溢出自动压缩）、边界8（记忆召回阈值过滤）。
 """
+# 【什么】标准库与项目内依赖
+# 【作用】re 做关键词切分、check_token_overflow 判压缩、PGManager 取数、get_settings 读阈值
 import re
 from typing import List, Optional
 from modules.common.logger import get_logger
@@ -16,33 +18,39 @@ from modules.memory.embedding_service import get_embedding_service
 from modules.memory.summary_generator import SummaryGenerator
 from config import get_settings
 
-_logger = get_logger("memory")
+_logger = get_logger("memory")                      # 模块级日志器，前缀 memory
 
 
+# 【什么】双层记忆管理器（短期原文 + 长期向量召回）
+# 【作用】对外只暴露 save_turn 存一轮、build_context 拼上下文两个入口
 class MemoryManager:
     """双层记忆管理器：短期原文 + 长期向量召回。"""
 
+    # 【什么】组装三个下游组件并把 3 个阈值固化成实例属性
+    # 【作用】运行期不再读配置，改配置需重建实例才生效
     def __init__(self, llm_client=None):
-        self.pg = PGManager()
-        self.embedding_service = get_embedding_service()
-        self.summary_generator = SummaryGenerator(llm_client=llm_client)
+        self.pg = PGManager()                                   # PG 读写：会话 / 记忆 / 工具流水
+        self.embedding_service = get_embedding_service()        # 问句转向量，召回前用
+        self.summary_generator = SummaryGenerator(llm_client=llm_client)   # 压缩时合并多条摘要
         s = get_settings()
-        self._max_history_tokens = s.max_history_tokens
-        self._short_rounds = s.short_memory_rounds
-        self._similarity_threshold = s.similarity_threshold
-        self._low_confidence = False
+        self._max_history_tokens = s.max_history_tokens         # 上下文 token 上限，默认 4000，超了触发压缩
+        self._short_rounds = s.short_memory_rounds              # 短期记忆轮数，默认 3 轮
+        self._similarity_threshold = s.similarity_threshold     # 召回相似度下限，默认 0.65，低于它丢弃
+        self._low_confidence = False                            # 本次召回是否低置信，供上层提示人工审核
 
+    # 【什么】保存一轮对话的全量数据
+    # 【作用】原文、摘要、摘要向量、问句向量、工具日志一次落库，缺任一项后续记忆能力会残废
     def save_turn(
         self,
-        session_id: str,
-        user_id: str,
-        user_query: str,
-        llm_full_answer: str,
-        llm_summary: str,
-        summary_embedding: list,
-        tool_call_log: list | None = None,
-        rag_sources: list | None = None,
-        query_embedding: list | None = None,
+        session_id: str,                        # 会话号，定位"哪本笔记本"
+        user_id: str,                           # 用户号，多用户记忆隔离依据
+        user_query: str,                        # 用户这一轮的原话
+        llm_full_answer: str,                   # 完整原文，短期记忆直接读它
+        llm_summary: str,                       # 一句话摘要，上下文投喂用
+        summary_embedding: list,                # 摘要向量（1024 维），长期记忆主检索列
+        tool_call_log: list | None = None,      # 本轮用过的工具流水，None 落库为 []
+        rag_sources: list | None = None,        # 本轮引用的知识库来源，None 落库为 []
+        query_embedding: list | None = None,    # 问句向量，当前不参与检索，预留给重复提问检测
     ) -> int | None:
         """保存一轮对话全量数据（原文+摘要+摘要向量+问句向量+工具日志）。"""
         return self.pg.save_history(
@@ -52,12 +60,14 @@ class MemoryManager:
             query_embedding,
         )
 
+    # 【什么】构建塞给 LLM 的记忆上下文
+    # 【作用】长期召回 + 短期原文拼成一段文本，超 token 就压缩，返回 dict 供 prompt 直接取用
     def build_context(
         self,
-        session_id: str,
-        user_id: str,
-        query: str,
-        query_embedding: list | None = None,
+        session_id: str,                        # 会话号，取短期记忆用
+        user_id: str,                           # 用户号，长期召回限定在此用户内
+        query: str,                             # 本轮提问，用于召回与最终拼接展示
+        query_embedding: list | None = None,    # 传了就省一次 embed 调用
     ) -> dict:
         """
         构建塞给 LLM 的记忆上下文 = 长期向量召回 + 短期原文 + 压缩标记。
@@ -107,6 +117,8 @@ class MemoryManager:
             "low_confidence": self._low_confidence,
         }
 
+    # 【什么】长期记忆召回：向量检索 + 相似度过滤 + 关键词二次校验
+    # 【作用】跨会话找出语义相近的历史摘要；异常返回 []，不中断整个对话
     @handle_exception(default=[], log_msg="长期记忆召回异常")
     def _recall_long_term(
         self, query: str, user_id: str, query_embedding: list | None = None
@@ -142,7 +154,7 @@ class MemoryManager:
 
 
         results = self.pg.search_memory_by_vector(
-            query_embedding, user_id, top_k=5
+            query_embedding, user_id, top_k=5   # 先取语义最近的 5 条，再按相似度阈值与字面重合过滤
         )
         filtered = [
             r for r in results
@@ -172,6 +184,8 @@ class MemoryManager:
         _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")
         return filtered
 
+    # 【什么】关键词二次校验（静态方法，不依赖实例状态）
+    # 【作用】向量相似之外再看字面是否重合，两边有交集才放行这条召回
     @staticmethod
     def _has_keyword_overlap(query: str, text: str) -> bool:
         """
@@ -222,6 +236,8 @@ class MemoryManager:
 
         return bool(grams(query) & grams(text))
 
+    # 【什么】上下文压缩：多条久远摘要合成一条
+    # 【作用】超 token 上限时的兜底手段；合并失败就原样返回，宁可超也不丢内容
     def _compress_long_term(self, long_term: list, user_id: str, query: str) -> list:
         """
         上下文压缩：将多个久远摘要合并为一个全局摘要，减少 token 占用。
@@ -241,6 +257,8 @@ class MemoryManager:
             "merged": True,
         }]
 
+    # 【什么】把两层记忆拼成一段给 LLM 看的文本
+    # 【作用】按「历史摘要 → 近期对话」顺序输出，空的部分整块跳过，不留空标题
     @staticmethod
     def _format_context(long_term: list, short_term: list, query: str) -> str:
         """拼接记忆上下文为文本。"""
@@ -253,5 +271,5 @@ class MemoryManager:
             blocks.append("\n【近期对话】")
             for item in short_term:
                 blocks.append(f"用户: {item.get('query', '')}")
-                blocks.append(f"AI: {item.get('answer', '')[:200]}")
+                blocks.append(f"AI: {item.get('answer', '')[:200]}")    # 回答只取前 200 字，长答案省 token
         return "\n".join(blocks)

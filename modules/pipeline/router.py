@@ -39,10 +39,12 @@ _INTENT_TO_BRANCH = {
 _TOOL_BRANCHES = (Branch.LOCAL_SKILL, Branch.MCP_REMOTE)
 
 
+# 【什么】分支路由总入口：意图 + 召回 → 一条决策
+# 【作用】定支路并给出工具白名单，置信度不足时一律禁工具、清单清空
 def route_branch(
-    intent: IntentResult,
-    recall: Optional[RecallResult] = None,
-    min_confidence: float = -1,
+    intent: IntentResult,                          # 意图识别结果
+    recall: Optional[RecallResult] = None,         # 召回结果；None 时按空结果处理
+    min_confidence: float = -1,                    # 置信度下限；< 0 表示取配置值（默认 0.5）
 ) -> RouteDecision:
     """根据意图与召回结果决定分支与工具白名单。
 
@@ -67,10 +69,11 @@ def route_branch(
             → RouteDecision(branch="reject", tool_calls_allowed=False, tools=[],
                              reason="输入判定为无效，走拒答/澄清支路")
     """
+    # min_confidence<0 是"未指定"的哨兵值，此时回落到配置项的 0.5
     if min_confidence < 0:
         min_confidence = float(get_settings().pipeline_min_confidence)
 
-    branch = _INTENT_TO_BRANCH.get(intent.intent_type, Branch.CHAT)
+    branch = _INTENT_TO_BRANCH.get(intent.intent_type, Branch.CHAT)   # 未知类别兜底为 chat
     recall = recall or RecallResult()
     conf = float(intent.intent_confidence or 0.0)
 
@@ -79,8 +82,8 @@ def route_branch(
     #   注意是"禁工具"不是"改分支"：用户问的还是那件事，
     #   只是系统没有足够把握去调外部能力，让模型空手作答即可。
     # ------------------------------------------------------------------
-    confidence_ok = conf >= min_confidence
-    invalid = branch == Branch.REJECT
+    confidence_ok = conf >= min_confidence   # 置信度达标（>= 阈值）
+    invalid = branch == Branch.REJECT        # 支路为 reject，即输入被判为无效
 
     # ------------------------------------------------------------------
     # 【allowed 的三重条件】置信度够 + 不是无效输入 + 走的是工具支路

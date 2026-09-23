@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -42,48 +42,62 @@ from config import get_settings
 _logger = get_logger("api")
 
 
+# 【什么】POST /chat 的请求体
+# 【作用】带 session_id 表示续聊，不带则由服务端新开一个会话
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
-    query: str
+    session_id: Optional[str] = None   # 已有会话号；不传 = 新会话
+    query: str                         # 用户这一轮的输入
 
 
+# 【什么】对话结果的响应体
+# 【作用】把一轮对话的产出字段固定下来，前端按名字取值
 class ChatResponse(BaseModel):
-    session_id: str
-    answer: str
-    summary: str
-    active_skill: str = ""
-    iterations: int
-    tool_calls: list
+    session_id: str           # 会话号
+    answer: str               # 最终答案
+    summary: str              # 本轮摘要，供长期记忆使用
+    active_skill: str = ""    # 命中的技能名；未命中是空串
+    iterations: int           # ReAct 迭代轮数
+    tool_calls: list          # 本轮工具调用记录
 
 
+# 【什么】POST /agent/team/run 的请求体
+# 【作用】描述要交给团队完成的任务、可选图片与编排后端
 class TeamRunRequest(BaseModel):
     """多 Agent 团队运行请求。images 传 data URL 或 http(s) 图片链接。"""
 
-    query: str
-    session_id: Optional[str] = None
-    images: list[str] = []
-    backend: str = "native"  # native（自研Harness）| crewai（角色扮演编排，需装可选依赖）
+    query: str                         # 交给团队的任务
+    session_id: Optional[str] = None   # 会话号；不传时生成 team-xxxxxxxx
+    images: list[str] = []             # 图片来源；只收 data URL 或 http(s) 链接
+    backend: str = "native"            # native（自研Harness）| crewai（角色扮演编排，需装可选依赖）
 
 
+# 【什么】POST /agent/eval 的请求体
+# 【作用】cases 为空时只跑内置连通性用例，验链路不验质量
 class AgentEvalRequest(BaseModel):
     """多 Agent 评测请求。cases 为空时用内置默认用例跑一次连通性。"""
 
-    cases: list[dict] = []
+    cases: list[dict] = []   # 评测用例；空列表 = 只跑内置默认用例
 
 
+# 【什么】会话信息的响应体
+# 【作用】新建会话后回给前端会话号、归属用户与创建时间
 class SessionResponse(BaseModel):
-    session_id: str
-    user_id: str
-    created_at: str
+    session_id: str   # 会话号
+    user_id: str      # 归属用户工号
+    created_at: str   # 创建时间
 
 
+# 【什么】POST /reviews/{review_id}/review 的请求体
+# 【作用】承载审核动作；通过时可用标准答案反哺标准答案库
 class ReviewRequest(BaseModel):
-    action: str
-    question: str = ""
-    standard_answer: str = ""
-    note: str = ""
+    action: str                 # 审核动作：approved / rejected
+    question: str = ""          # 对应问题；与标准答案一起入库
+    standard_answer: str = ""   # 人工标准答案，作为 Few-shot 来源
+    note: str = ""              # 审核备注
 
 
+# 【什么】全局组件的持有者（进程级单例）
+# 【作用】路由通过 ctx.xxx 拿到 LLM / 记忆 / 工具 / Agent 图等共享组件
 class AppContext:
     """应用全局上下文（单例组件）。"""
     llm: LLMClient = None # 单例 LLM 客户端
@@ -99,6 +113,8 @@ class AppContext:
     crew_backend: object = None # 单例角色扮演编排后端
 
 
+# 【什么】后台对账循环：睡够间隔 → 跑一次对账 → 有不一致就告警
+# 【作用】跨库无事务，MySQL 写失败是静默的，定时对账是发现不一致的兜底手段
 def _reconcile_loop(interval_hours: int):
     """后台对账循环：睡 → 跑一次 → 有不一致就告警。
 
@@ -118,6 +134,8 @@ def _reconcile_loop(interval_hours: int):
             _logger.warning(f"定时对账异常: {e}")
 
 
+# 【什么】FastAPI 生命周期钩子：启动时拉起对账线程
+# 【作用】interval=0 时不启线程；daemon=True 保证主进程退出时线程不拖住退出
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """服务启动/停止钩子：拉起后台对账线程（RECONCILE_INTERVAL_HOURS=0 关闭）。"""
@@ -128,6 +146,8 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# 【什么】创建 FastAPI 应用实例
+# 【作用】配好 CORS 与静态目录挂载，并挂上 lifespan 钩子；路由由 APIServer 注册
 def create_app() -> FastAPI:
     """创建 FastAPI 应用实例。"""
     app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0", lifespan=lifespan)
@@ -146,15 +166,21 @@ def create_app() -> FastAPI:
     return app
 
 
+# 【什么】API 服务封装：建 app、初始化组件、注册路由
+# 【作用】main.py 只需 APIServer().run() 就能起一个完整服务
 class APIServer:
     """API 服务封装：组件初始化 + 路由注册。"""
 
+    # 【什么】构造：建 FastAPI app 并装配全部组件与路由
+    # 【作用】构造完成即处于可服务状态；任何组件失败都走降级而不是中断启动
     def __init__(self): # self.app: FastAPI
         self.app = create_app()
         self.ctx = AppContext()
         self._init_components() # 初始化全局组件
         self._register_routes() # 注册路由
 
+    # 【什么】初始化全局组件（LLM、记忆、工具、技能、网关、Agent 图）
+    # 【作用】每个可选能力都用 try 包住，失败只记 warning 并降级，不让服务起不来
     def _init_components(self):
         """初始化全局组件（LLM、记忆、工具、Agent图）。"""
         s = get_settings()
@@ -198,6 +224,7 @@ class APIServer:
 
             tool_index = None
             if s.tool_rag_enabled:
+                # 召回 top_k 个候选，相似度低于 min_score 的直接丢掉（配置：TOOL_RAG_TOP_K / TOOL_RAG_MIN_SCORE）
                 tool_index = ToolRAGIndex(top_k=s.tool_rag_top_k, min_score=s.tool_rag_min_score)
                 tool_index.index_tools(self.ctx.tool_registry.list_tools())
                 if self.ctx.gateway:
@@ -208,8 +235,8 @@ class APIServer:
                 skill_registry=self.ctx.skill_registry,
                 tool_index=tool_index,
                 gateway=self.ctx.gateway,
-                top_k=s.tool_rag_top_k,
-                max_tools=s.max_tools_per_turn,
+                top_k=s.tool_rag_top_k,            # 语义召回候选数
+                max_tools=s.max_tools_per_turn,    # 单轮最多带进 prompt 的工具数（配置：MAX_TOOLS_PER_TURN）
             )
         except Exception as e:
             _logger.warning(f"技能网关/路由降级（按全部工具运行）: {e}")
@@ -246,11 +273,15 @@ class APIServer:
             self.ctx.harness = None
         _logger.info("后端服务组件初始化完成")
 
+    # 【什么】注册全部 API 路由（本文件的主要部分）
+    # 【作用】路由以闭包形式挂到 self.app 上，共享同一个 ctx
     def _register_routes(self):
         """注册 API 路由。"""
         app = self.app
         ctx = self.ctx
 
+        # 【什么】GET /health —— 真探活（免鉴权，供容器探针调用）
+        # 【作用】逐项探测 PG / MySQL / Milvus；PG 不可用直接 503，让编排能重启容器
         @app.get("/health")
         async def health():
             """真探活：逐项探测 PG / MySQL / Milvus，核心依赖不可用即 503。
@@ -283,6 +314,8 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=payload)
             return payload
 
+        # 【什么】GET /me —— 当前登录者的权限快照
+        # 【作用】排障第一步："我是谁、我有什么权限"；principal 单独展开成 dict
         @app.get("/me")
         async def me(user: dict = Depends(get_current_user)):
             """当前登录者的权限快照：排障时先问"我是谁、我有什么权限"。"""
@@ -292,11 +325,13 @@ class APIServer:
                 "permissions": p.to_dict() if p else None,
             }
 
+        # 【什么】GET /admin/audit —— 查审计日志（需 api:audit:* 权限）
+        # 【作用】按 task_id 或 session_id 串联一次请求在两库留下的记录
         @app.get("/admin/audit")
         async def audit_log(
-            limit: int = 50,
-            session_id: str = "",
-            task_id: str = "",
+            limit: int = 50,       # 最多返回多少条，默认 50
+            session_id: str = "",  # 按会话号过滤；留空不过滤
+            task_id: str = "",     # 按流水号过滤；留空不过滤（优先级高于 session_id）
             user: dict = Depends(RequirePerm("api:audit:*")),
         ):
             """审计日志：谁在什么时候对什么资源做了什么，deny 记录是重点。
@@ -326,6 +361,8 @@ class APIServer:
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"审计库不可用: {e}")
 
+        # 【什么】GET /admin/bill —— 按部门汇总 LLM token 消耗（需 api:admin:* 权限）
+        # 【作用】成本治理与预算控制的数据源；按 tokens 倒序，花得最多的部门在最前
         @app.get("/admin/bill")
         async def bill(user: dict = Depends(RequirePerm("api:admin:*"))):
             """按部门汇总 LLM token 消耗：成本治理与预算控制的数据源。"""
@@ -339,6 +376,8 @@ class APIServer:
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"用量库不可用: {e}")
 
+        # 【什么】GET /admin/offboard/preview —— 离职数据对账预览（只报告不改）
+        # 【作用】列出哪些离职员工的会话还没归档，给管理员决定要不要执行
         @app.get("/admin/offboard/preview")
         async def offboard_preview(user: dict = Depends(RequirePerm("api:admin:*"))):
             """离职数据对账：只看不改，报告哪些离职员工的会话仍未归档。"""
@@ -348,9 +387,12 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=result.get("error"))
             return result
 
+        # 【什么】POST /admin/offboard/run —— 执行离职数据处置
+        # 【作用】离职员工会话归档 + 超保留期数据清理；真正落库的一步
         @app.post("/admin/offboard/run")
         async def offboard_run(
-            retention_days: int = 0, user: dict = Depends(RequirePerm("api:admin:*"))
+            retention_days: int = 0,   # 保留天数；0 表示不传，用配置里的默认值
+            user: dict = Depends(RequirePerm("api:admin:*"))
         ):
             """执行离职数据处置：离职员工会话归档 + 超保留期数据清理。"""
             from modules.enterprise import lifecycle
@@ -359,9 +401,12 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
 
+        # 【什么】GET /admin/reconcile —— 跨库对账（按 task_id 比对两库）
+        # 【作用】列出单边缺失的号：pg_only 是审计丢失，mysql_only 是会话已清理或写库失败
         @app.get("/admin/reconcile")
         async def cross_db_reconcile(
-            hours: int = 24, user: dict = Depends(RequirePerm("api:admin:*"))
+            hours: int = 24,   # 回溯最近多少小时，默认 24
+            user: dict = Depends(RequirePerm("api:admin:*"))
         ):
             """跨库对账：按 task_id 比对 MySQL 与 PG，列出单边缺失的号。
 
@@ -375,9 +420,12 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
 
+        # 【什么】POST /admin/archive/run —— 冷热分离归档
+        # 【作用】超过保留期的会话先导出归档文件，再从 PG 里删掉
         @app.post("/admin/archive/run")
         async def archive_run(
-            retention_days: int = 0, user: dict = Depends(RequirePerm("api:admin:*"))
+            retention_days: int = 0,   # 保留天数；0 表示取配置里的默认值
+            user: dict = Depends(RequirePerm("api:admin:*"))
         ):
             """冷热分离：超过保留期的会话先导出归档文件，再从 PG 删除。"""
             from modules.memory.archiver import archive_expired
@@ -387,6 +435,8 @@ class APIServer:
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
 
+        # 【什么】GET / —— 前端首页（免鉴权）
+        # 【作用】返回 static/index.html；文件不存在时 404 而不是返回空页
         @app.get("/")
         async def index():
             """前端首页：返回 jQuery 界面。"""
@@ -396,6 +446,8 @@ class APIServer:
                 return FileResponse(str(index_file))
             raise HTTPException(status_code=404, detail="前端界面未找到")
 
+        # 【什么】POST /chat —— 对话主接口，SSE 流式返回
+        # 【作用】鉴权 → 会话归属校验 → Agent 推理 → 按事件逐段推给前端
         @app.post("/chat")
         async def chat(
             req: ChatRequest,
@@ -433,6 +485,7 @@ class APIServer:
             set_request_context(task_id=task_id, session_id=session_id, user_code=user_id)
 
             if is_new_session:
+                # 会话标题取用户输入的前 50 个字，够列表展示又不把整段提问塞进标题
                 ctx.pg.create_session(session_id, user_id, title=req.query[:50])
             elif not AuthManager.check_session_owner(user_id, session_id, ctx.pg):
                 raise HTTPException(status_code=403, detail="无权访问该会话")
@@ -445,10 +498,14 @@ class APIServer:
                 task_id=task_id,
             )
 
+            # 【什么】按 SSE 协议拼一个事件帧
+            # 【作用】"event: 名\ndata: JSON\n\n"，结尾空行是帧分隔符，少它前端收不到事件
             def sse_event(event: str, data: dict) -> str:
                 """按 SSE 协议拼一个事件帧：event/data 两行，事件间以空行分隔。"""
                 return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+            # 【什么】SSE 事件生成器：按推理进度 yield 一串事件帧
+            # 【作用】跑在线程池里执行 Agent（不阻塞事件循环），异常时也保证把 done 帧发出去
             async def event_generator():
                 yield sse_event("status", {"message": "Agent 正在思考...", "phase": "thinking"})
                 try:
@@ -476,6 +533,7 @@ class APIServer:
 
                 answer = result.get("final_answer", "") or "（无回答）"
                 yield sse_event("answer_start", {"iterations": result.get("iteration", 0)})
+                # 每片 24 个字，片间停 20 毫秒：既有打字机效果，又不至于把连接刷爆
                 for i in range(0, len(answer), 24):
                     yield sse_event("answer_chunk", {"content": answer[i:i + 24]})
                     await asyncio.sleep(0.02)
@@ -486,11 +544,14 @@ class APIServer:
             return StreamingResponse(
                 event_generator(),
 
-                media_type="text/event-stream",
+                media_type="text/event-stream",   # SSE 固定类型，前端按 text/event-stream 解析
 
+                # no-cache 防止中间层缓存流；X-Accel-Buffering: no 关掉 Nginx 的响应缓冲
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
+        # 【什么】POST /agent/team/run —— 多 Agent 团队协作
+        # 【作用】主管拆任务 → 并行执行 → 汇总 → 终审；图片只收 data URL 或 http(s) 链接
         @app.post("/agent/team/run", response_model=RunResult)
         async def team_run(req: TeamRunRequest, user: dict = Depends(get_current_user)):
             """多 Agent 团队协作：主管拆任务 → 并行执行 → 汇总 → 终审。
@@ -523,9 +584,12 @@ class APIServer:
                 except ValidationError as e:
                     raise HTTPException(status_code=400, detail=f"图片非法: {e.errors()[0]['msg']}")
             mm = MultiModalInput(instruction=req.query, parts=parts) if parts else None
+            # 没传会话号时生成 team-＋8 位十六进制，避免多轮团队会话互相覆盖
             session_id = req.session_id or f"team-{uuid.uuid4().hex[:8]}"
             return runner.run(req.query, mm=mm, session_id=session_id)
 
+        # 【什么】POST /agent/eval —— 多 Agent 回归评测（管理员）
+        # 【作用】改提示词或团队配置后跑一次，通过率掉了说明退化
         @app.post("/agent/eval")
         async def agent_eval(
             req: AgentEvalRequest,
@@ -543,6 +607,8 @@ class APIServer:
             ]
             return ctx.harness.evaluate(cases).model_dump()
 
+        # 【什么】GET /agent/backends —— 可选框架后端探活
+        # 【作用】分清"配了没装"和"装了没配"，前者表现为静默降级
         @app.get("/agent/backends")
         async def agent_backends(user: dict = Depends(get_current_user)):
             """可选框架后端探活：当前配的哪个、库装没装。
@@ -560,10 +626,12 @@ class APIServer:
                 "available": {"llamaindex": li_ok(), "crewai": crewai_ok()},
             }
 
+        # 【什么】GET /history/{session_id} —— 取会话历史（带归属校验）
+        # 【作用】只返回本人会话的历史；不是自己的会话直接 403
         @app.get("/history/{session_id}")
         async def get_history(
             session_id: str,
-            limit: int = 20,
+            limit: int = 20,   # 最多返回多少条，默认 20
             user: dict = Depends(get_current_user),
         ):
             """获取会话历史（会话隔离）。"""
@@ -572,12 +640,19 @@ class APIServer:
             rows = ctx.pg.get_short_term_history(session_id, user["user_id"], limit)
             return {"session_id": session_id, "history": rows}
 
+        # 【什么】POST /knowledge/ingest —— 文档入库（管理员）
+        # 【作用】上传文件先落临时目录再切片入库；kb_code 决定写进哪个知识库
         @app.post("/knowledge/ingest")
         async def ingest_document(
-            file: UploadFile = File(...),
+            file: UploadFile = File(...),      # 上传的文件，必填
+            kb_code: str = Form("public"),     # 目标知识库编码，默认 public
             user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
         ):
-            """知识库文档入库（管理员权限）。"""
+            """知识库文档入库（管理员权限）。
+
+            kb_code: 目标知识库编码。多集合模式下决定写进哪个 Milvus 物理集合；
+                     单集合模式下只作为 kb_code 标量字段写入，不影响落哪个集合。
+            """
             if not ctx.rag:
                 raise HTTPException(status_code=503, detail="RAG模块未启用")
             import tempfile, os
@@ -585,17 +660,27 @@ class APIServer:
             with open(tmp_path, "wb") as f:
                 content = await file.read()
                 f.write(content)
-            count = ctx.rag.ingest_document(tmp_path)
+            count = ctx.rag.ingest_document(tmp_path, kb_code=kb_code)
             os.remove(tmp_path)
-            return {"status": "success", "chunks": count, "file": file.filename}
+            return {"status": "success", "chunks": count, "file": file.filename, "kb_code": kb_code}
 
+        # 【什么】GET /knowledge/stats —— 知识库统计
+        # 【作用】只统计当前用户可见范围内的库，可见范围外的连数量都不暴露
         @app.get("/knowledge/stats")
         async def knowledge_stats(user: dict = Depends(get_current_user)):
-            """知识库统计信息。"""
+            """知识库统计信息（按当前用户可见的知识库范围统计）。
+
+            传 kb_codes 是为了不让普通用户看到"全公司文档总量"——
+            可见范围之外的库连数量都不该暴露。
+            """
             if ctx.rag:
-                return ctx.rag.get_knowledge_stats()
+                principal = user.get("principal")
+                kb_codes = getattr(principal, "kb_codes", None) or None
+                return ctx.rag.get_knowledge_stats(kb_codes=kb_codes)
             return {"status": "RAG模块未启用"}
 
+        # 【什么】GET /skills —— 已注册技能清单
+        # 【作用】列出技能总数与每个技能绑定的函数工具，供前端展示与排障
         @app.get("/skills")
         async def list_skills(user: dict = Depends(get_current_user)):
             """获取已注册技能清单及其绑定的函数工具。"""
@@ -604,15 +689,19 @@ class APIServer:
                 "skills": [s.to_dict() for s in ctx.skill_registry.list_skills()],
             }
 
+        # 【什么】GET /tools/logs —— 工具调用审计（需 ADVANCED 及以上等级）
+        # 【作用】按会话号查工具调用记录；当前只回显入参，实际取数在 PG 侧
         @app.get("/tools/logs")
         async def tool_logs(
-            session_id: Optional[str] = None,
-            limit: int = 50,
+            session_id: Optional[str] = None,   # 按会话号过滤；不传不过滤
+            limit: int = 50,                    # 最多返回多少条，默认 50
             user: dict = Depends(RequirePermission(UserLevel.ADVANCED)),
         ):
             """工具调用审计日志（高级用户+权限）。"""
             return {"status": "audit", "session_id": session_id, "limit": limit}
 
+        # 【什么】GET /reviews/pending —— 待人工审核列表（管理员）
+        # 【作用】把 PG 里待审核的问答取出来，供人工判定并反哺标准答案
         @app.get("/reviews/pending")
         async def pending_reviews(
             user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
@@ -631,10 +720,12 @@ class APIServer:
         except Exception as e:
             _logger.warning(f"流水线端点注册失败: {e}")
 
+        # 【什么】POST /reviews/{review_id}/review —— 提交人工审核结果（管理员）
+        # 【作用】approved 且填了标准答案时，把标准答案存进标准答案库
         @app.post("/reviews/{review_id}/review")
         async def submit_review(
-            review_id: int,
-            req: ReviewRequest,
+            review_id: int,       # 待审核项 id，来自 /reviews/pending
+            req: ReviewRequest,   # 审核动作与标准答案
             user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
         ):
             """人工审核处置：approved / rejected，审核通过的标准答案反哺标准答案库（Few-shot 来源）。"""
@@ -652,6 +743,8 @@ class APIServer:
                 )
             return {"review_id": review_id, "action": req.action, "standard_answer_id": answer_id}
 
+    # 【什么】启动 API 服务（uvicorn）
+    # 【作用】按配置的 APP_HOST / APP_PORT 监听，阻塞当前进程
     def run(self):
         """启动 API 服务。"""
         import uvicorn

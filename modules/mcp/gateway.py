@@ -36,6 +36,8 @@ from modules.common.exceptions import MCPException
 _logger = get_logger("mcp_gateway")
 
 
+# 【什么】一个 MCP Server 的接入配置
+# 【作用】登记"叫什么、怎么启动、启不启用"，网关据此拉起对应子进程
 @dataclass
 class MCPServerConfig:
     """一个 MCP Server 的接入配置。
@@ -46,10 +48,12 @@ class MCPServerConfig:
                  换成 ["node", "server.js"] 就能接 Node 写的 server。
         enabled: False 时登记但不连接，用于临时摘掉一个故障 server。
     """
-    name: str
-    command: List[str]
-    enabled: bool = True
+    name: str                  # 逻辑名；日志与熔断都按它隔离
+    command: List[str]         # 启动命令，如 ["python", "-m", "modules.mcp.mcp_server"]
+    enabled: bool = True       # False 时登记但不连接，用于临时摘掉故障 server
 
+    # 【什么】从配置字典构造配置对象
+    # 【作用】兼容 MCP_SERVERS_JSON 里字段缺失的情况：name/command 兜空，enabled 默认开
     @classmethod
     def from_dict(cls, d: dict) -> "MCPServerConfig":
         """从配置字典构造。
@@ -72,6 +76,8 @@ class MCPServerConfig:
 # 装了 1 个工具」记下来，让 health() 能报出来，用来证明懒加载到底省了多少。
 # 
 # 
+# 【什么】网关的运行计数器
+# 【作用】记录"目录有多大 vs 实际起了几次进程"，用来观测懒加载省了多少
 @dataclass
 class GatewayStats:
     """网关运行计数，用于观测「按需加载到底省了多少」。
@@ -83,14 +89,16 @@ class GatewayStats:
         calls:          真实工具调用次数
         failures:       调用失败次数（记入熔断）
     """
-    catalog_tools: int = 0
-    registered: int = 0
-    connects: int = 0
-    calls: int = 0
-    failures: int = 0
+    catalog_tools: int = 0   # 目录里登记的远程工具总数
+    registered: int = 0      # 已真正注册进 ToolRegistry 的工具数
+    connects: int = 0        # 实际建立子进程连接的次数
+    calls: int = 0           # 真实工具调用次数
+    failures: int = 0        # 调用失败次数
     servers: Dict[str, str] = field(default_factory=dict)   # server 名 → 熔断状态
 
 
+# 【什么】MCP 技能网关：多 server 纳管 + 懒连接 + 按需注册 + 熔断重试
+# 【作用】对外只暴露 catalog / ensure_registered / call_tool，调用方不必知道工具在哪
 class MCPGateway:
     """MCP 技能网关：多 server 纳管 + 懒连接 + 按需注册 + 熔断重试。
 
@@ -107,31 +115,35 @@ class MCPGateway:
 
     def __init__(
         self,
-        servers: Optional[List[MCPServerConfig]] = None,
-        lazy_connect: bool = True,
-        catalog_cache: str = "",
-        connect_retry: int = 2,
-        breaker=None,
+        servers: Optional[List[MCPServerConfig]] = None,   # 初始登记的 server 配置列表
+        lazy_connect: bool = True,                         # True=拉完目录就断开，调用时再连
+        catalog_cache: str = "",                           # 目录缓存文件路径；留空表示不落盘
+        connect_retry: int = 2,                            # 单个 server 的连接重试次数（默认 2）
+        breaker=None,                                      # 熔断器实例；None 表示不做熔断
     ):
-        self._servers: Dict[str, MCPServerConfig] = {}
+        # 【什么】初始化内部四张表与运行开关
+        # 【作用】构造期不建任何子进程连接，全部推迟到 catalog() 或真正调用时
+        self._servers: Dict[str, MCPServerConfig] = {}   # server 名 → 接入配置
         # 值是 MCPClient，延迟 import 避免本模块与 mcp_client 的加载顺序耦合，
         # 所以这里标 Any（类型检查交给调用点的显式用法）
         self._clients: Dict[str, Any] = {}
-        self._tool_index: Dict[str, dict] = {}
-        self._registered: set = set()
-        self._lazy = lazy_connect
-        self._cache_path = Path(catalog_cache) if catalog_cache else None
-        self._retry = max(1, int(connect_retry))
-        self._breaker = breaker
-        self._stats = GatewayStats()
-        self._catalog_loaded = False
-        self._lock = threading.Lock()
+        self._tool_index: Dict[str, dict] = {}           # 工具名 → {"server": 名, "info": 工具元数据}
+        self._registered: set = set()                     # 已注册进 ToolRegistry 的工具名，防重复注册
+        self._lazy = lazy_connect                         # 懒连接开关
+        self._cache_path = Path(catalog_cache) if catalog_cache else None   # 目录缓存文件；留空为 None
+        self._retry = max(1, int(connect_retry))          # 重试次数，最小 1 次
+        self._breaker = breaker                           # 熔断器；None 时不判熔断
+        self._stats = GatewayStats()                      # 运行计数器
+        self._catalog_loaded = False                      # 目录是否已建好
+        self._lock = threading.Lock()                     # 保护目录表与连接表的线程锁
         for cfg in servers or []:
             self.add_server(cfg)
 
     # ------------------------------------------------------------------
     # 【登记 server】只记配置，不建连接
     #   连接推迟到 catalog(refresh=True) 或第一次真正要用它的时候。
+    # 【什么】登记一个 server 配置
+    # 【作用】只写进 _servers 表；缺 name 或 command 直接抛 MCPException
     # ------------------------------------------------------------------
     def add_server(self, cfg: MCPServerConfig) -> None:
         if not cfg.name:
@@ -143,6 +155,8 @@ class MCPGateway:
         self._servers[cfg.name] = cfg
         _logger.info(f"MCP Server 已登记: {cfg.name} | enabled={cfg.enabled}")
 
+    # 【什么】已登记的 server 名列表
+    # 【作用】启动日志用它报"纳管了哪几个 server"，不反映是否已连接
     @property
     def server_names(self) -> List[str]:
         return list(self._servers.keys())
@@ -161,6 +175,8 @@ class MCPGateway:
     #     输入  一个提供了 weather / translate 两个工具的 server
     #     输出  [{"name":"weather","description":"查天气","inputSchema":{...},"server":"geo"},
     #            {"name":"translate","description":"翻译","inputSchema":{...},"server":"geo"}]
+    # 【什么】取全部远程工具的元数据目录
+    # 【作用】Tool-RAG 建索引的原料；只含名字/描述/参数表，不含连接的子进程
     # ------------------------------------------------------------------
     def catalog(self, refresh: bool = False) -> List[dict]:
         """返回全部远程工具的元数据（不含任何连接状态假设）。"""
@@ -216,6 +232,8 @@ class MCPGateway:
     #   【输入输出对照】
     #     输入  registry（已含本地 calculator/data_query），names=["weather","calculator"]
     #     输出  返回 ["weather"]（真正新注册的）；"calculator" 已在 registry 中，跳过
+    # 【什么】把召回名单里的远程工具真正装进 ToolRegistry
+    # 【作用】只装"本轮已决定要用"的工具，返回本次新注册的名字
     # ------------------------------------------------------------------
     def ensure_registered(self, registry, names: List[str]) -> List[str]:
         if registry is None or not names:
@@ -243,6 +261,8 @@ class MCPGateway:
             _logger.info(f"MCP 工具按需加载: {newly}")
         return newly
 
+    # 【什么】统一调用入口：只给工具名，网关自己找它在哪个 server
+    # 【作用】调用成功后给熔断记一次 success；抛异常时按异常类型决定是否记 failure
     def call_tool(self, name: str, arguments: dict) -> dict:
         """统一调用入口：调用方只给工具名，网关负责找到它属于哪个 server。"""
         entry = self._tool_index.get(name)
@@ -277,6 +297,8 @@ class MCPGateway:
     #
     #   【重试次数】默认 2 次（配置 MCP_CONNECT_RETRY）：治的是子进程冷启动偶发抖动；
     #   持续故障交给熔断，避免每次请求都白等一轮超时。
+    # 【什么】取（必要时新建）某个 server 的客户端连接
+    # 【作用】带缓存复用、熔断拦截与重试；连不上返回 None 而不是抛异常
     # ------------------------------------------------------------------
     def _connect(self, server: str):
         existing = self._clients.get(server)
@@ -313,6 +335,8 @@ class MCPGateway:
         _logger.error(f"MCP Server 连接最终失败: {server} | {last_err}")
         return None
 
+    # 【什么】熔断键：给 server 名加前缀
+    # 【作用】熔断按 "mcp:{server}" 计数，不同 server 各自统计、互不连累
     @staticmethod
     def _cb_key(server: str) -> str:
         return f"mcp:{server}"
@@ -320,6 +344,8 @@ class MCPGateway:
     # ------------------------------------------------------------------
     # 【目录缓存落盘】JSON 结构：{"version":1,"tools":[{name,description,inputSchema,server}]}
     #   写失败只记 warning —— 缓存是加速手段，不是正确性依赖，写不进去就下次重连。
+    # 【什么】读落盘的目录缓存
+    # 【作用】命中就直接建索引，一个子进程都不用起；读失败返回 [] 改为实时发现
     # ------------------------------------------------------------------
     def _read_cache(self) -> List[dict]:
         if not self._cache_path or not self._cache_path.exists():
@@ -334,6 +360,8 @@ class MCPGateway:
             _logger.warning(f"MCP 目录缓存读取失败，改为实时发现: {e}")
             return []
 
+    # 【什么】把当前目录写进缓存文件
+    # 【作用】下次启动可直接复用；没配路径或写失败都只记 warning，不影响本次运行
     def _write_cache(self) -> None:
         if not self._cache_path:
             return
@@ -350,6 +378,8 @@ class MCPGateway:
 
     # ------------------------------------------------------------------
     # 【观测与收尾】
+    # 【什么】网关健康快照
+    # 【作用】报各 server 的熔断状态与五项计数，用来确认懒加载是否生效
     # ------------------------------------------------------------------
     def health(self) -> dict:
         """网关健康快照：各 server 的熔断状态 + 目录/注册/调用计数。"""
@@ -380,6 +410,8 @@ class MCPGateway:
     #
     #   【配置项解析失败怎么处理】JSON 写错时记 warning 并回退默认 server，
     #   不让一个配置笔误导致 MCP 整体不可用 —— 配置错误属于可降级故障。
+    # 【什么】按配置装配网关（最常用的构造方式）
+    # 【作用】MCP_SERVERS_JSON 解析失败或留空时，回退到单个默认 server
     # ------------------------------------------------------------------
     @classmethod
     def from_settings(cls, settings=None, breaker=None, default_command: Optional[List[str]] = None) -> "MCPGateway":
@@ -404,6 +436,8 @@ class MCPGateway:
             breaker=breaker,
         )
 
+    # 【什么】断开全部已连接 server 并清空连接表
+    # 【作用】进程退出前调用，避免留下孤儿 MCP 子进程
     def shutdown(self) -> None:
         """断开全部已连接的 server（进程退出前调用，避免残留子进程）。"""
         for name, client in list(self._clients.items()):

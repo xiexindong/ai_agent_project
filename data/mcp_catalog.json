@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "web_search",
+      "description": "网络搜索工具，获取互联网最新信息。输入搜索关键词，返回搜索结果摘要。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "最大返回结果数，默认3"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "server": "enterprise-mcp"
+    },
+    {
+      "name": "get_current_time",
+      "description": "获取当前时间，支持指定时区。返回格式化时间字符串。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "description": "时区，如 'Asia/Shanghai'，默认本机时区"
+          }
+        },
+        "required": []
+      },
+      "server": "enterprise-mcp"
+    },
+    {
+      "name": "knowledge_stats",
+      "description": "获取知识库统计信息（演示企业内部MCP工具）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "server": "enterprise-mcp"
+    }
+  ]
+}

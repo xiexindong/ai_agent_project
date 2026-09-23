@@ -19,6 +19,8 @@
     3. 默认工具回退                    —— 前两步都为空时的兜底，保证不会"无工具可用"
     4. max_tools_per_turn 硬截断       —— 最后一道闸，名单再合理也不超过这个数
 """
+# 【什么】dataclass 与日志器依赖
+# 【作用】dataclass 定义决策结果，get_logger 打 L0 路由日志
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -27,9 +29,11 @@ from modules.common.logger import get_logger
 _logger = get_logger("agent_router")
 
 # 召回全空时兜底带的工具：本地通用能力，保证每轮至少有事可做
-_DEFAULT_TOOLS = ("calculator", "data_query")
+_DEFAULT_TOOLS = ("calculator", "data_query")   # 2 个兜底工具，候选池里没有时才生效
 
 
+# 【什么】一次路由决策的结果快照
+# 【作用】把名单、分数、来源、理由打包，便于打日志、回放和排查"为什么选了它"
 @dataclass
 class RoutingDecision:
     """一次路由决策的完整结果（可解释、可打日志、可回放）。
@@ -43,15 +47,17 @@ class RoutingDecision:
         pool_size:   候选池规模（用于日志里的"从 N 个里选出 k 个"）
         reason:      一句话决策理由
     """
-    tool_names: List[str] = field(default_factory=list)
-    tool_scores: Dict[str, float] = field(default_factory=dict)
-    source: str = "default"
-    skill: Optional[object] = None
-    skill_route: str = ""
-    skill_score: float = 0.0
-    pool_size: int = 0
-    reason: str = ""
+    tool_names: List[str] = field(default_factory=list)             # 最终名单，交给 ReAct
+    tool_scores: Dict[str, float] = field(default_factory=dict)     # 工具名 → 分数
+    source: str = "default"                                         # 名单来源标记
+    skill: Optional[object] = None                                  # 命中的技能实例
+    skill_route: str = ""                                           # 命中层级 keyword/vector/llm/prepared
+    skill_score: float = 0.0                                        # 技能匹配分数
+    pool_size: int = 0                                              # 候选池规模 N
+    reason: str = ""                                                # 一句话决策理由
 
+    # 【什么】把决策压成一行人话
+    # 【作用】日志与 demo 直接读它，能看到"从 N 个里选出 k 个、凭什么"
     def describe(self) -> str:
         """一行摘要，给日志与 demo 用。
 
@@ -71,7 +77,11 @@ class RoutingDecision:
         )
 
 
+# 【什么】层级码 → 中文标签（日志用）
+# 【作用】describe() 里把 keyword/vector/llm/prepared 翻成人话
 _ROUTE_LABEL = {"keyword": "关键词", "vector": "向量", "llm": "LLM", "prepared": "上游已匹配"}
+# 【什么】来源码 → 中文标签（日志用）
+# 【作用】describe() 里把 4 种 source 翻成人话
 _SOURCE_LABEL = {
     "skill_bound": "技能绑定",
     "tool_rag": "语义召回",
@@ -80,6 +90,8 @@ _SOURCE_LABEL = {
 }
 
 
+# 【什么】L0 路由层：把「全部工具」收敛成「本轮工具名单」
+# 【作用】交给 ReAct 的名单越短越准，模型越不容易选错、prompt 也越短
 class AgentRouter:
     """L0 路由：把「全部工具」收敛成「本轮工具名单」。
 
@@ -96,21 +108,23 @@ class AgentRouter:
         这一步之前，远程技能只是目录里的一行描述，模型看不到、进程也没起。
     """
 
+    # 【什么】装配路由所需的三个外部依赖与三个阈值
+    # 【作用】三个依赖都可缺省，缺哪个就退化到「少一层决策」的旧行为
     def __init__(
         self,
-        skill_registry=None,
-        tool_index=None,
-        gateway=None,
-        top_k: int = 5,
-        max_tools: int = 8,
-        default_tools=_DEFAULT_TOOLS,
+        skill_registry=None,            # 技能注册表，命中技能时取它的 bound_tools
+        tool_index=None,                # Tool-RAG 索引，为 None 时不做语义召回
+        gateway=None,                   # MCP 网关，负责目录读取与按需注册
+        top_k: int = 5,                 # 语义召回保留几个
+        max_tools: int = 8,             # 单轮名单硬上限
+        default_tools=_DEFAULT_TOOLS,   # 兜底工具名元组
     ):
-        self.skill_registry = skill_registry
-        self.tool_index = tool_index
-        self.gateway = gateway
-        self.top_k = max(1, int(top_k))
-        self.max_tools = max(1, int(max_tools))
-        self.default_tools = tuple(default_tools)
+        self.skill_registry = skill_registry                  # 技能注册表
+        self.tool_index = tool_index                          # 语义召回索引
+        self.gateway = gateway                                # MCP 网关
+        self.top_k = max(1, int(top_k))                       # 至少取 1 个，防传 0
+        self.max_tools = max(1, int(max_tools))               # 至少留 1 个，防传 0
+        self.default_tools = tuple(default_tools)             # 转成元组，避免外部改到原列表
 
     # ------------------------------------------------------------------
     # 【主入口】一次路由 = 建候选池 → 取种子 → 语义召回 → 合并截断 → 按需加载
@@ -129,16 +143,18 @@ class AgentRouter:
     #                           source="skill_bound+tool_rag", pool_size=32,
     #                           skill=<报销进度查询>, skill_route="keyword", skill_score=0.6)
     # ------------------------------------------------------------------
+    # 【什么】路由主入口：一次调用产出一份本轮名单
+    # 【作用】建候选池 → 取种子 → 语义召回 → 合并截断 → 按需加载，全程只跑一次
     def route(
         self,
-        query: str,
-        registry=None,
-        skill_name: str = "",
-        skill_match=None,
-        query_emb=None,
+        query: str,                 # 本轮用户提问，语义召回用
+        registry=None,              # 工具注册表，为 None 时候选池只剩网关目录
+        skill_name: str = "",       # 上游已定好的技能名，有则直接反查
+        skill_match=None,           # 上游已跑完的匹配结果，有则零开销复用
+        query_emb=None,             # 上游算好的 query 向量，省一次 embedding
     ) -> RoutingDecision:
-        pool: Dict[str, object] = {}
-        pool_names: List[str] = []
+        pool: Dict[str, object] = {}        # 工具名 → 工具对象（本地）或目录条目（远程）
+        pool_names: List[str] = []          # 候选池名字列表，保序去重
 
         for tool in (registry.list_tools() if registry else []):
             name = getattr(tool, "name", "")
@@ -196,8 +212,8 @@ class AgentRouter:
                     rag_hits.append(hit.name)
                     scores[hit.name] = hit.score
 
-        merged = chosen + rag_hits
-        truncated = merged[: self.max_tools]
+        merged = chosen + rag_hits                  # 种子在前、召回在后，技能绑定工具不会被挤掉
+        truncated = merged[: self.max_tools]        # 硬截断：名单再合理也不超过 max_tools
 
         if not truncated:
             truncated = [n for n in self.default_tools if n in pool]

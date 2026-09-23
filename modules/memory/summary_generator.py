@@ -4,14 +4,18 @@
 调用 DeepSeek LLM 为每轮对话生成精简摘要。
 摘要用于向量入库 + 上下文投喂，是长记忆语义召回的核心。
 """
+# 【什么】标准库与项目内依赖
+# 【作用】handle_exception 统一兜异常、count_tokens 判长短、get_registry 取提示词模板
 from modules.common.logger import get_logger
 from modules.common.exceptions import LLMException, handle_exception
 from modules.common.token_counter import count_tokens
 from modules.prompt import get_registry
 
-_logger = get_logger("summary")
+_logger = get_logger("summary")                     # 模块级日志器，前缀 summary
 
 
+# 【什么】调用 LLM 生成 / 合并摘要的生成器
+# 【作用】把长对话压成一句话，是向量入库与上下文投喂的输入源
 class SummaryGenerator:
     """LLM 摘要生成器。
 
@@ -22,12 +26,16 @@ class SummaryGenerator:
     迁走之后，改措辞在 builtin.py 一处改，还能注册 v2 做 A/B 对比。
     """
 
+    # 【什么】持有 LLM 客户端，未传就自建
+    # 【作用】函数内延迟导入避开循环依赖；测试时可注入假 client 替换真实 LLM
     def __init__(self, llm_client=None):
         if llm_client is None:
             from modules.agent.llm import LLMClient
             llm_client = LLMClient()
-        self._llm = llm_client
+        self._llm = llm_client                      # 实际发请求的对象，两个方法都只用它 invoke
 
+    # 【什么】为单轮对话生成一句话摘要
+    # 【作用】短答案直接截断省掉 LLM 调用，长答案才拼提示词交给 LLM 压成一句
     # ------------------------------------------------------------------
     # 【这个装饰器在干什么】handle_exception 是本项目自研的「异常统一处理」装饰器
     #   （实现在 modules/common/exceptions.py），一次干三件事：
@@ -82,11 +90,11 @@ class SummaryGenerator:
     def generate_summary(self, query: str, answer: str) -> str:
         """为一轮对话生成精简摘要。"""
         if not answer:
-            return query[:50]
-        if count_tokens(answer) < 100:
-            return answer[:50].replace("\n", " ").strip()
+            return query[:50]                       # 没有回答时，用提问的前 50 字当摘要
+        if count_tokens(answer) < 100:              # 100 token 以内算短答案，不再调 LLM
+            return answer[:50].replace("\n", " ").strip()    # 取前 50 字，去掉换行与首尾空白
         prompt = get_registry().render(
-            "summary", query=query[:500], answer=answer[:2000]
+            "summary", query=query[:500], answer=answer[:2000]   # 提问截 500 字、回答截 2000 字再入模板
         )
         summary = self._llm.invoke(prompt)
         #"***Hello***" text = "   Hello World!   " text = "\n\t Hello World! \n" ==> hello
@@ -94,6 +102,8 @@ class SummaryGenerator:
         _logger.debug(f"摘要生成: query='{query[:30]}...' -> summary='{summary[:50]}...'")
         return summary
 
+    # 【什么】把多条久远摘要合并成一条全局摘要
+    # 【作用】上下文超阈值时的压缩手段，一条换多条以省 token；失败返回 None 由上层判断
     @handle_exception(default=None, log_msg="历史摘要合并异常")
     def merge_summaries(self, summaries: list[str]) -> str:
         """合并多个久远摘要为全局摘要（上下文压缩用）。"""

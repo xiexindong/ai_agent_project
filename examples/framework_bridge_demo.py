@@ -34,12 +34,21 @@ from modules.rag.llamaindex_adapter import (
     LlamaIndexRAG, parse_expr, is_available as li_ready,
 )
 
-RECORD = {"agents": [], "tasks": [], "crew_kwargs": {}, "retriever_kwargs": {}}
+# 【什么】假模块的行为记录本
+# 【作用】FakeAgent/FakeTask/FakeCrew/FakeRetriever 把构造参数写进来，供人核对依赖顺序
+RECORD = {
+    "agents": [],              # 每次 new FakeAgent 时记一份关键字参数
+    "tasks": [],               # 每次 new FakeTask 时记一份，含依赖 Task 的 id 列表
+    "crew_kwargs": {},         # new FakeCrew 的参数（如 process）
+    "retriever_kwargs": {},    # as_retriever 的参数（如 filters / similarity_top_k）
+}
 
 
 # ==========================================================================
 # 第 1 段：可用性检测
 # ==========================================================================
+# 【什么】第 1 段：可选框架可用性检测
+# 【作用】打印 llama-index 与 crewai 是否安装，未安装时说明各自降级到哪条自研路径
 def demo_availability():
     print("=" * 68)
     print("第 1 段  可选框架可用性（未安装 → 自动降级，主流程不受影响）")
@@ -51,6 +60,8 @@ def demo_availability():
 # ==========================================================================
 # 第 2 段：权限表达式翻译（安全核心，纯 Python 可单测）
 # ==========================================================================
+# 【什么】第 2 段：Milvus 权限表达式翻译
+# 【作用】4 条样例逐个 parse_expr，成功打印结构、失败打印拒绝原因
 def demo_expr():
     print("\n" + "=" * 68)
     print("第 2 段  Milvus 权限表达式 → llama-index 过滤条件")
@@ -76,6 +87,8 @@ def demo_expr():
 # ==========================================================================
 # 第 3 段：团队配置 → crewai IR（不依赖库）
 # ==========================================================================
+# 【什么】第 3 段：团队配置转成 crewai 中间表示
+# 【作用】打印 process、每个 Agent 与 Task 的关键字段，并返回 backend 与 plan 供后面复用
 def demo_crew_spec():
     print("\n" + "=" * 68)
     print("第 3 段  自研 PlanResult → crewai 配置（中间表示 IR）")
@@ -104,13 +117,19 @@ def demo_crew_spec():
 # ==========================================================================
 # 第 4 段：注入假 crewai，跑完整 run()
 # ==========================================================================
+# 【什么】本文件用的极简假 LLM
+# 【作用】只实现主管规划要用的两个接口，固定返回 2 个子任务的计划
 class MockLLM:
     """极简假 LLM：只给主管的规划用。"""
 
+    # 【什么】普通文本调用
+    # 【作用】固定返回一句模拟结论，不联网不花钱
     def invoke(self, prompt: str, system_prompt: str = "", temperature: float = 0.3,
                max_tokens: int = 2048) -> str:
         return "（模拟回答）已完成分析，结论是环比上升 18%。"
 
+    # 【什么】结构化输出调用
+    # 【作用】返回 t1 查数、t2 算环比（依赖 t1）的固定计划
     def invoke_structured(self, prompt: str, system_prompt: str = "", temperature: float = 0.2) -> dict:
         return {
             "thought": "先查后算", "direct_answer": "", "needs_review": False,

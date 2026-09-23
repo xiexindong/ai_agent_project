@@ -28,20 +28,26 @@ from config import get_settings
 _logger = get_logger("mcp_server")
 
 
+# 【什么】独立进程里的 MCP 工具服务端
+# 【作用】收一行 JSON-RPC 请求、回一行响应；对外提供 3 个工具
 class MCPServer:
     """独立 MCP 工具服务（JSON-RPC 2.0 + stdio）。"""
 
+    # 【什么】服务端构造：读配置 + 备好工具清单
+    # 【作用】工具清单在启动时定好，之后 tools/list 一直返回同一份
     def __init__(self):
         s = get_settings()
-        self._tavily_key = s.tavily_api_key
-        self._tools = self._define_tools()
-        self._initialized = False
+        self._tavily_key = s.tavily_api_key    # Tavily API Key；留空时搜索工具返回提示文本
+        self._tools = self._define_tools()     # 本 Server 的工具清单（3 个）
+        self._initialized = False              # 握手标记：收到 initialize 后置 True
 
+    # 【什么】本 Server 提供的工具清单（硬编码 3 个）
+    # 【作用】tools/list 直接返回它；改动这里就是改 Server 对外暴露的能力
         """定义 Server 提供的工具列表。"""
     def _define_tools(self) -> list:
         return [
             {
-                "name": "web_search",
+                "name": "web_search",          # 网络搜索：必填 query，可选 max_results
                 "description": "网络搜索工具，获取互联网最新信息。输入搜索关键词，返回搜索结果摘要。",
                 "inputSchema": {
                     "type": "object",
@@ -59,7 +65,7 @@ class MCPServer:
                 },
             },
             {
-                "name": "get_current_time",
+                "name": "get_current_time",    # 当前时间：可选 timezone，无必填参数
                 "description": "获取当前时间，支持指定时区。返回格式化时间字符串。",
                 "inputSchema": {
                     "type": "object",
@@ -73,7 +79,7 @@ class MCPServer:
                 },
             },
             {
-                "name": "knowledge_stats",
+                "name": "knowledge_stats",     # 知识库统计（演示企业内部工具）：无参数
                 "description": "获取知识库统计信息（演示企业内部MCP工具）。",
                 "inputSchema": {
                     "type": "object",
@@ -84,7 +90,9 @@ class MCPServer:
         ]
 
 
-    def _web_search(self, query: str, max_results: int = 3) -> str:
+    # 【什么】Tavily 网络搜索的实现
+    # 【作用】给 web_search 工具提供能力；没有 API Key 时返回提示文本，不抛异常
+    def _web_search(self, query: str, max_results: int = 3) -> str:   # 默认最多返回 3 条
         """Tavily 网络搜索。"""
         if not self._tavily_key:
             return "搜索工具未配置 Tavily API Key，无法执行网络搜索。"
@@ -98,10 +106,11 @@ class MCPServer:
                     "max_results": max_results,
                     "search_depth": "basic",
                 },
-                timeout=15,
+                timeout=15,        # 请求 Tavily 的超时（秒）
             )
             data = resp.json()
             results = []
+            # 只取前 max_results 条（默认 3），每条正文再截断到 200 字，避免把整页塞进上下文
             for item in data.get("results", [])[:max_results]:
                 results.append(
                     f"标题: {item.get('title', '')}\n"
@@ -112,7 +121,9 @@ class MCPServer:
         except Exception as e:
             return f"搜索失败: {e}"
 
-    def _get_current_time(self, timezone: str = "") -> str:
+    # 【什么】取当前时间的实现
+    # 【作用】给 get_current_time 工具提供能力；时区非法时退回本机时间，不抛异常
+    def _get_current_time(self, timezone: str = "") -> str:   # 时区留空表示用本机时区
         """获取当前时间。"""
         from datetime import timezone as tz
         import pytz
@@ -126,6 +137,8 @@ class MCPServer:
         except Exception:
             return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 【什么】知识库统计的实现（演示用，返回固定内容）
+    # 【作用】给 knowledge_stats 工具提供能力，展示企业内部 MCP 工具长什么样
     def _knowledge_stats(self) -> str:
         """知识库统计（演示企业内部工具）。"""
         return json.dumps({
@@ -135,6 +148,8 @@ class MCPServer:
         }, ensure_ascii=False)
 
 
+    # 【什么】请求分发：按 method 分到不同分支
+    # 【作用】四种 method 各回一条响应；未知方法回 -32601，内部异常回 -32603
     def handle_request(self, msg: dict) -> str:
         """处理 JSON-RPC 请求，返回响应 JSON。"""
         req_id = msg.get("id", 0)
@@ -171,6 +186,8 @@ class MCPServer:
             _logger.error(f"MCP请求处理异常: {method} | {e}")
             return create_error(req_id, INTERNAL_ERROR, str(e))
 
+    # 【什么】tools/call 的具体执行：按工具名分派到本地方法
+    # 【作用】结果统一包成 content:[{type:text}] 回给 Client；工具名不认识回 -32601
     def _handle_tool_call(self, msg: dict, req_id: int) -> str:
         """处理 tools/call 请求。"""
         params = msg.get("params", {})
@@ -194,6 +211,8 @@ class MCPServer:
             "isError": False,
         })
 
+    # 【什么】stdio 事件循环：一行请求 → 一行响应
+    # 【作用】Server 的主循环；空行跳过，解析失败回 -32600，其他异常只记日志不回包
     def run(self):
         """启动 stdio 事件循环，监听 Client 请求。"""
         _logger.info("MCP Server 启动，等待连接...")

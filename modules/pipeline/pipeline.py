@@ -36,9 +36,13 @@ from config import get_settings
 _logger = get_logger("pipeline")
 
 
+# 【什么】流水线编排层：把六个环节串成一条链
+# 【作用】对外只暴露 run()，任一环失败都降级继续，风控是唯一提前终止点
 class RequestPipeline:
     """请求处理流水线。"""
 
+    # 【什么】构造函数：固化外部依赖与两个开关
+    # 【作用】llm/store 留空即内部按需创建，便于离线场景与单测注入替身
     def __init__(self, llm=None, store=None, fallback_tools: Optional[Sequence] = None,
                  use_llm_intent: bool = True, risk_enabled: bool = True):
         """
@@ -49,12 +53,14 @@ class RequestPipeline:
             use_llm_intent: False 时意图识别强制走规则（离线/单测用）
             risk_enabled: False 时跳过风控（只记录，不拦截）
         """
-        self.llm = llm
-        self.store = store
-        self.fallback_tools = list(fallback_tools or [])
-        self.use_llm_intent = use_llm_intent
-        self.risk_enabled = risk_enabled
+        self.llm = llm                                     # LLMClient：意图识别与 LLM 压缩用
+        self.store = store                                 # ToolVectorStore：Tool-RAG 存储层
+        self.fallback_tools = list(fallback_tools or [])  # 本地工具清单，PG 不可用时做关键词兜底
+        self.use_llm_intent = use_llm_intent              # False 时意图识别强制走规则
+        self.risk_enabled = risk_enabled                  # False 时风控只记录不拦截
 
+    # 【什么】往 trace 里追加一条环节执行记录
+    # 【作用】统一记录 step/ok/ms/detail，排障时先看 trace 定位卡在哪一环
     # ------------------------------------------------------------------
     # 【trace 是什么】每一环的执行记录（步骤名 / 是否成功 / 耗时 / 一句话结论）
     #   排障时先看 trace：能一眼看出是卡在哪一环、哪一环走了降级。
@@ -63,6 +69,8 @@ class RequestPipeline:
     def _trace_add(trace: List[dict], step: str, ok: bool, ms: float, detail: str) -> None:
         trace.append({"step": step, "ok": ok, "ms": round(ms, 2), "detail": detail})
 
+    # 【什么】跑完整条流水线（六个环节）
+    # 【作用】返回含每环结果与 trace 的 PipelineResult；除风控拦截外不会中途退出
     def run(self, query: str, extra_exclude: Optional[List[str]] = None) -> PipelineResult:
         """跑完整条流水线。
 
@@ -127,6 +135,7 @@ class RequestPipeline:
         self._trace_add(trace, "risk", risk_ok, (time.perf_counter() - t0) * 1000,
                         f"level={risk.level} action={risk.action} hits={[h['code'] for h in risk.hits]}")
 
+        # risk_enabled=False 时只记录不拦截，带着命中结果继续往下跑
         if risk.passed is False and self.risk_enabled:
             # --------------------------------------------------------------
             # 【拦截后为什么还要填 intent/route】
@@ -143,7 +152,7 @@ class RequestPipeline:
                                          reason=f"风控拦截（level={risk.level}）",
                                          min_confidence=float(s.pipeline_min_confidence))
             result.trace = trace
-            result.stopped_at = "risk"
+            result.stopped_at = "risk"   # 唯一提前终止点：非空的 stopped_at 代表后续环节没跑
             result.degraded = degraded or not risk_ok
             _logger.warning(f"流水线在风控环节终止: {[h['code'] for h in risk.hits]}")
             return result
@@ -161,7 +170,7 @@ class RequestPipeline:
             )
             token_ok = True
         except Exception as e:
-            tokens = TokenResult(text=text[:4000])
+            tokens = TokenResult(text=text[:4000])   # 兜底截断：Token 环节异常时按 4000 字符硬切，不为空
             token_ok = False
             degraded = True
             _logger.warning(f"Token 控制异常，按截断处理: {e}")
@@ -231,6 +240,7 @@ class RequestPipeline:
                         f"tools={len(route.tools)}")
 
         result.trace = trace
+        # degraded = 任一环自己降级过，或 trace 里有任一环节执行失败
         result.degraded = degraded or not all(
             step["ok"] for step in trace
         )

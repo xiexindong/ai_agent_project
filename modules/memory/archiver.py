@@ -25,15 +25,19 @@ PG 只留最近 SESSION_HOT_DAYS（默认 90 天）的热会话，更老的先�
     review_queue 不删（治理证据），但它里的 history_id 会变成悬空 ID，
     查审核队列时不要再回连 chat_history。
 """
+# 【什么】标准库与项目内依赖
+# 【作用】json 写 JSONL、datetime 取当天目录名、Path 拼路径建目录、get_settings 读归档配置
 import json
 from datetime import datetime
 from pathlib import Path
 from modules.common.logger import get_logger
 from config import get_settings
 
-_logger = get_logger("archiver")
+_logger = get_logger("archiver")                    # 模块级日志器，前缀 archiver
 
 
+# 【什么】把一个会话写成一份 JSONL 归档文件
+# 【作用】删库之前先把证据落盘；将来换对象存储只改这一个函数
 def _write_archive(session_id: str, history: list, tool_logs: list) -> str:
     """把一个会话写成一份 JSONL 归档文件，返回路径。
 
@@ -41,21 +45,23 @@ def _write_archive(session_id: str, history: list, tool_logs: list) -> str:
     json.dumps 默认只认识基础类型，不加它会在 datetime 上抛 TypeError。
     """
     s = get_settings()
-    day = datetime.now().strftime("%Y-%m-%d")
-    out_dir = Path(s.archive_dir) / day
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{session_id}.jsonl"
+    day = datetime.now().strftime("%Y-%m-%d")       # 当天日期做子目录名，如 2026-09-20
+    out_dir = Path(s.archive_dir) / day             # 根目录默认 archives，见配置项 ARCHIVE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)      # 目录不存在就建，已存在不报错
+    path = out_dir / f"{session_id}.jsonl"          # 一个会话一个文件，文件名即会话号
     record = {
-        "session_id": session_id,
-        "archived_at": datetime.now().isoformat(),
-        "history": history,
-        "tool_logs": tool_logs,
+        "session_id": session_id,                   # 会话号，回查时用它定位
+        "archived_at": datetime.now().isoformat(),  # 归档时刻，可读时间串
+        "history": history,                         # 该会话的全部对话页
+        "tool_logs": tool_logs,                     # 该会话的全部工具流水
     }
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8") as f:     # 追加写：同一天重复归档同一会话会追加成多行
         f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     return str(path)
 
 
+# 【什么】只导出不删除地归档单个会话
+# 【作用】给"删之前先留证据"的场景用；会话没数据就返回空串，不产生空文件
 def archive_session(session_id: str) -> str:
     """只导出不删除：把一个会话的对话页与工具流水写成归档文件。
 
@@ -65,13 +71,15 @@ def archive_session(session_id: str) -> str:
     from modules.memory.pg_manager import PGManager
 
     pg = PGManager()
-    history = pg.fetch_history_by_session(session_id)
-    tool_logs = pg.fetch_tool_logs_by_session(session_id)
-    if not history and not tool_logs:
+    history = pg.fetch_history_by_session(session_id)        # 对话页列表
+    tool_logs = pg.fetch_tool_logs_by_session(session_id)    # 工具流水列表
+    if not history and not tool_logs:                        # 两边都空 = 会话没内容，不落空文件
         return ""
     return _write_archive(session_id, history, tool_logs)
 
 
+# 【什么】批量只导出不删除地归档多个会话
+# 【作用】离职清理、手工归档用；单个会话失败只记告警，不影响其余会话
 def archive_session_ids(session_ids: list) -> list:
     """批量只导出不删除：给"删之前先留证据"的场景用（离职清理、手工归档）。
 
@@ -93,27 +101,29 @@ def archive_session_ids(session_ids: list) -> list:
     return files
 
 
+# 【什么】冷热分离主入口：超期会话先归档再删除
+# 【作用】控制 PG 体积同时保留可回溯证据；归档开关关闭时整段跳过
 def archive_expired(retention_days: int = 0, limit: int = 500) -> dict:
     """冷热分离主入口：超期会话导出归档 → 从 PG 删除。"""
     s = get_settings()
-    days = int(retention_days or s.session_hot_days)
+    days = int(retention_days or s.session_hot_days)     # 传 0 就用配置的 SESSION_HOT_DAYS（默认 90 天）
     if not s.archive_enabled:
         return {"ok": True, "skipped": "ARCHIVE_ENABLED=False", "retention_days": days}
 
     result = {"ok": True, "retention_days": days, "archived": 0, "deleted": 0,
-              "files": [], "errors": []}
+              "files": [], "errors": []}      # days 是本次实际保留天数；archived / deleted 为计数
     try:
         from modules.memory.pg_manager import PGManager
 
         pg = PGManager()
-        session_ids = pg.list_expired_session_ids(days, limit)
+        session_ids = pg.list_expired_session_ids(days, limit)  # 最多取 limit（默认 500）个超期会话
     except Exception as e:
         result["ok"] = False
         result["errors"].append(f"PG 不可用: {e}")
         return result
 
-    result["files"] = archive_session_ids(session_ids)
-    result["archived"] = len(result["files"])
+    result["files"] = archive_session_ids(session_ids)      # 先落盘，拿到归档文件路径列表
+    result["archived"] = len(result["files"])               # 成功归档的会话数 = 文件路径条数
     if len(result["files"]) != len(session_ids):
         _logger.warning(
             f"归档数量不一致: 待归档 {len(session_ids)} 实际 {len(result['files'])}，"
@@ -121,6 +131,6 @@ def archive_expired(retention_days: int = 0, limit: int = 500) -> dict:
         )
 
     if session_ids:
-        result["deleted"] = pg.delete_sessions(session_ids) or 0
+        result["deleted"] = pg.delete_sessions(session_ids) or 0    # 对话页靠外键 ON DELETE CASCADE 连带删
     _logger.info(f"冷热分离完成: archived={result['archived']} deleted={result['deleted']}")
     return result

@@ -48,6 +48,8 @@ PNG_1PX_B64 = (
 class MockLLM:
     """演示用 LLM：invoke / invoke_structured / invoke_with_tools 三个接口都实现。"""
 
+    # 【什么】主管规划时返回的固定结构
+    # 【作用】2 个子任务、t2 依赖 t1，needs_review=True 触发终审环节
     PLAN_JSON = {
         "thought": "需要先查事实再算环比，最后审核，t2 依赖 t1 的数据",
         "subtasks": [
@@ -56,23 +58,29 @@ class MockLLM:
             {"id": "t2", "assignee": "analyst_1",
              "instruction": "计算 Q4 相对 Q3 的环比增长率", "depends_on": ["t1"], "priority": 2},
         ],
-        "direct_answer": "",
-        "needs_review": True,
+        "direct_answer": "",           # 空串 = 不是直接答，要派任务
+        "needs_review": True,          # True = 跑完让 reviewer 终审
     }
     REVIEW_JSON = {"passed": True, "score": 0.86, "issues": [], "suggestion": "可补充数据来源"}
 
     def __init__(self):
-        self.tool_round = 0
+        self.tool_round = 0           # 第几轮带工具的调用，用来决定返回工具还是结论
 
+    # 【什么】普通文本调用
+    # 【作用】取提问前 36 字拼成一句固定回答，让每次跑的输出完全一致
     def invoke(self, prompt: str, system_prompt: str = "", temperature: float = 0.3,
                max_tokens: int = 2048) -> str:
         head = " ".join(prompt.split())[:36]
         return f"（模拟回答）针对「{head}」：已完成分析，结论是环比上升 12%，建议持续观察。"
 
+    # 【什么】结构化输出调用
+    # 【作用】返回规划或评审用的 JSON，让链路拿到确定结构而不是随机文本
     def invoke_structured(self, prompt: str, system_prompt: str = "", temperature: float = 0.2) -> dict:
         # 按 prompt 里出现的字段名区分"规划"和"评审"两种结构化调用
         return self.PLAN_JSON if "subtasks" in prompt else self.REVIEW_JSON
 
+    # 【什么】带工具的调用
+    # 【作用】第一轮返回工具调用，第二轮返回结论 —— 演示 Function Calling 循环确实转起来了。
     def invoke_with_tools(self, messages: list, tools: list, temperature: float = 0.3) -> dict:
         """第一轮返回工具调用，第二轮返回结论 —— 演示 Function Calling 循环确实转起来了。"""
         self.tool_round += 1
@@ -91,13 +99,17 @@ class MockLLM:
 class DemoCalculator(BaseTool):
     """演示用计算器（只支持加减乘除，纯本地不联网）。"""
 
+    # 【什么】注册工具元信息
+    # 【作用】name/description/parameters 三项决定模型看到的 Function Calling schema
     def __init__(self):
         super().__init__(
-            name="calculator",
-            description="计算数学表达式，如 1250*1.18",
+            name="calculator",                                    # 工具名，权限码 tool:calculator 就按它拼
+            description="计算数学表达式，如 1250*1.18",              # 给模型看的用途说明
             parameters={"properties": {"expression": {"type": "string"}}, "required": ["expression"]},
         )
 
+    # 【什么】真正执行计算
+    # 【作用】成功返回 ToolResult(success=True, result=值)，表达式非法时返回带 error 的失败结果
     def execute(self, **kwargs) -> ToolResult:
         expr = kwargs.get("expression", "")
         try:
@@ -110,6 +122,8 @@ class DemoCalculator(BaseTool):
 # ==========================================================================
 # 第 1 段：多模态输入
 # ==========================================================================
+# 【什么】第 1 段：多模态输入
+# 【作用】演示 pydantic 校验、图片计数、转 Vision 报文，以及两类非法输入被拦截
 def demo_multimodal():
     print("=" * 68)
     print("第 1 段  多模态输入：pydantic 校验 + 转成 Vision 报文")
@@ -153,6 +167,8 @@ def demo_multimodal():
 # ==========================================================================
 # 第 2 段：多 Agent 编排
 # ==========================================================================
+# 【什么】第 2 段：多 Agent 编排
+# 【作用】跑一次完整 run()，打印计划、每个产出的成败与步数、最终答案与 trace 时间线
 def demo_orchestration(harness: AgentHarness):
     print("\n" + "=" * 68)
     print("第 2 段  多 Agent 编排：拆任务 → 并行执行 → 汇总 → 终审")
@@ -187,6 +203,8 @@ def demo_orchestration(harness: AgentHarness):
 # ==========================================================================
 # 第 3 段：直接答路径 + 失败降级
 # ==========================================================================
+# 【什么】第 3 段：直接答路径与失败降级
+# 【作用】先演示简单问题不派活，再演示派给不存在的 Agent 时只降级该任务
 def demo_direct_and_failure(harness: AgentHarness):
     print("\n" + "=" * 68)
     print("第 3 段  直接答路径与失败降级")
@@ -221,6 +239,8 @@ def demo_direct_and_failure(harness: AgentHarness):
 # ==========================================================================
 # 第 4 段：评测
 # ==========================================================================
+# 【什么】第 4 段：Harness 评测
+# 【作用】跑 3 条用例（含一条故意缺词的），打印通过率、每条的分数与原因
 def demo_evaluate(harness: AgentHarness):
     print("\n" + "=" * 68)
     print("第 4 段  Harness 评测：关键词 + 完成率 + 速度（可进 CI）")
@@ -239,6 +259,8 @@ def demo_evaluate(harness: AgentHarness):
 # ==========================================================================
 # 第 5 段：依赖分批
 # ==========================================================================
+# 【什么】第 5 段：依赖分批
+# 【作用】演示正常 DAG 分成 3 批、以及循环依赖被剔除而不是死循环
 def demo_topo():
     print("\n" + "=" * 68)
     print("第 5 段  依赖分批：DAG 拓扑排序（同批并行）")
@@ -263,14 +285,16 @@ def demo_topo():
     print("  → 不剔除就会 while 死循环（不是报错，是卡住，最难排查的那种故障）")
 
 
+# 【什么】脚本入口：按 1→5 段顺序跑完整个演示
+# 【作用】装配工具注册表与 harness，依次调用五段 demo
 def main():
     print("#" * 68)
     print("#  多模态 + 多 Agent + Harness 演示（MockLLM，无需联网）")
     print("#" * 68)
 
     registry = ToolRegistry()
-    registry.register(DemoCalculator())
-    harness = build_harness(llm=MockLLM(), tool_registry=registry, max_workers=2)
+    registry.register(DemoCalculator())                     # 只有 worker 的工具调用路径会用到它
+    harness = build_harness(llm=MockLLM(), tool_registry=registry, max_workers=2)   # 最多 2 个 worker 并行
     print(f"团队: {[a.name for a in harness.agents.values()]}")
 
     demo_multimodal()

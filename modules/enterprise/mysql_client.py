@@ -30,31 +30,41 @@ from config import get_settings
 _logger = get_logger("mysql")
 
 
+# 【什么】MySQL 访问客户端（单例使用，见 get_mysql_client）
+# 【作用】三个方法覆盖全部场景：query_all 查多行、query_one 查单行、execute 写操作
 class MySQLClient:
     """带自动重连的 MySQL 客户端（单例使用，见 get_mysql_client）。"""
 
+    # 【什么】构造客户端：只算参数，不建连接（懒连接）
+    # 【作用】read_only=True 时换成只读账号，并把连接参数固化到 _conn_args
     def __init__(self, read_only: bool = False):
         s = get_settings()
-        self._read_only = read_only
-        user, password = s.mysql_user, s.mysql_password
+        self._read_only = read_only                                  # True = 只读客户端，走 _guard 闸门
+        user, password = s.mysql_user, s.mysql_password              # 默认用读写账号
+
         if read_only and s.mysql_readonly_user:
+            # 【换账号】配了 mysql_readonly_user 就换成它，没配则沿用读写账号
             user, password = s.mysql_readonly_user, s.mysql_readonly_password
-        self._conn_args = dict(
-            host=s.mysql_host,
-            port=s.mysql_port,
-            user=user,
-            password=password,
-            database=s.mysql_database,
-            charset="utf8mb4",
-            autocommit=True,
-            connect_timeout=5,
-            read_timeout=10,
+            
+        self._conn_args: dict[str, str | int] = dict(
+            host=s.mysql_host,          # 主机地址
+            port=s.mysql_port,          # 端口
+            user=user,                  # 账号（只读客户端会被换成只读账号）
+            password=password,          # 密码
+            database=s.mysql_database,  # 默认库
+            charset="utf8mb4",          # 字符集：支持 4 字节字符与完整中文
+            autocommit=True,            # 每条写语句自动提交，不手工开事务
+            connect_timeout=5,          # 建连超时 5 秒，超时即判定不可用
+            read_timeout=10,            # 读超时 10 秒，慢查询最多等这么久
         )
-        self._conn = None
+        self._conn = None               # 连接对象；None 表示还没建过连接
 
 
+    # 【什么】取可用连接，断了就重建
+    # 【作用】所有查询/写入都从这里拿连接；重连逻辑集中在一处，上层不用关心
     def _get_conn(self):
         """取连接；未连接或已断开则重建（最多重试一次）。"""
+        # 【延迟导入】PyMySQL 是可选依赖，用到才 import，未安装也不影响模块导入
         try:
             import pymysql
             from pymysql.cursors import DictCursor
@@ -62,16 +72,19 @@ class MySQLClient:
             raise RuntimeError("未安装 PyMySQL，请执行: pip install pymysql") from e
 
         if self._conn is None:
+            # 【首次建连】DictCursor 让每行直接返回 dict，按字段名取值
             self._conn = pymysql.connect(cursorclass=DictCursor, **self._conn_args)
             return self._conn
 
         try:
-            self._conn.ping(reconnect=True)
+            self._conn.ping(reconnect=True)   # 复用前先探活，断了 pymysql 自己重连
         except Exception:
             _logger.warning("MySQL 连接已断开，尝试重连")
-            self._conn = pymysql.connect(cursorclass=DictCursor, **self._conn_args)
+            self._conn = pymysql.connect(cursorclass=DictCursor, **self._conn_args)   # ping 也失败 → 整体重建
         return self._conn
 
+    # 【什么】健康检查
+    # 【作用】启动自检与 RBAC 可用性探测用；失败返回 False 而不是抛异常
     def ping(self) -> bool:
         """健康检查：启动自检用，失败返回 False 而非抛异常。"""
         try:
@@ -82,8 +95,12 @@ class MySQLClient:
             return False
 
 
+    # 【什么】只读账号允许的头关键字白名单（5 个）
+    # 【作用】_guard 拿它做前缀判定，不在表里的语句一律拒绝
     _READ_OK = ("SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN")
 
+    # 【什么】只读闸门：拦掉非查询语句
+    # 【作用】数据库 GRANT 之外再挡一道，换环境用高权限账号时也不会误写
     def _guard(self, sql: str) -> None:
         """只读闸门：只放行 SELECT/SHOW/EXPLAIN，其余一律拒绝（代码层兜底）。
 
@@ -97,45 +114,59 @@ class MySQLClient:
             _guard("UPDATE sys_user SET status=0")  → PermissionError: 只读账号禁止执行 UPDATE 语句
         """
         if not self._read_only:
-            return
-        stripped = sql.strip()
+            return                      # 读写客户端不做任何限制
+        stripped = sql.strip()          # 去首尾空白
+        # 【取头关键字】跳过开头的左括号再取第一个词并转大写；空 SQL 得到 ""
         head = stripped.lstrip("(").split()[0].upper() if stripped else ""
         if head not in self._READ_OK:
+            # 【拒绝】错误信息里只带前 60 个字符，不把整条 SQL 打进日志
             raise PermissionError(f"只读账号禁止执行 {head or '空'} 语句: {stripped[:60]}")
 
+    # 【什么】查多行
+    # 【作用】返回 list[dict]；无匹配行时是空 list，不是 None
     def query_all(self, sql: str, args: tuple = ()) -> list:
-        self._guard(sql)
-        conn = self._get_conn()
-        with conn.cursor() as cur:
+        self._guard(sql)            # 只读闸门
+        conn = self._get_conn()     # 取/建连接
+        with conn.cursor() as cur:  # 上下文管理器，游标自动关闭
             cur.execute(sql, args)
-            return cur.fetchall()
+            return cur.fetchall()   # 全部结果行
 
+    # 【什么】查单行
+    # 【作用】返回 dict 或 None；惯用法是 `if not row: 拒绝`
     def query_one(self, sql: str, args: tuple = ()) -> Optional[dict]:
         self._guard(sql)
         conn = self._get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, args)
-            return cur.fetchone()
+            return cur.fetchone()   # 只取第一行；没有就是 None
 
+    # 【什么】执行写语句
+    # 【作用】返回受影响行数；autocommit=True 下执行完即落库
     def execute(self, sql: str, args: tuple = ()) -> int:
         self._guard(sql)
         conn = self._get_conn()
         with conn.cursor() as cur:
-            return cur.execute(sql, args)
+            return cur.execute(sql, args)   # 返回值即受影响行数
 
+    # 【什么】关闭连接
+    # 【作用】置回 None，下次查询会重新建连；关闭本身失败也不抛
     def close(self):
         if self._conn is not None:
             try:
                 self._conn.close()
             except Exception:
-                pass
+                pass                   # 关闭失败也无所谓，反正要丢弃这条连接
             self._conn = None
 
 
-_client: Optional[MySQLClient] = None
-_ro_client: Optional[MySQLClient] = None
+# 【什么】两个全局单例槽位
+# 【作用】读写与只读各存一个实例，全进程复用同一条连接，避免反复建连
+_client: Optional[MySQLClient] = None       # 读写客户端
+_ro_client: Optional[MySQLClient] = None    # 只读客户端
 
 
+# 【什么】取全局读写单例
+# 【作用】审计与用量落库走它；懒连接，从没写过库就不建连接
 def get_mysql_client() -> MySQLClient:
     """全局读写单例（懒连接，未用到就不建连接）：审计与用量落库走它。"""
     global _client
@@ -144,6 +175,8 @@ def get_mysql_client() -> MySQLClient:
     return _client
 
 
+# 【什么】取全局只读单例
+# 【作用】权限、知识库授权、账单与对账查询一律走它，等价于"AI 只能看不能改业务库"
 def get_mysql_ro_client() -> MySQLClient:
     """全局只读单例：权限、知识库授权、账单与对账查询一律走它。
 

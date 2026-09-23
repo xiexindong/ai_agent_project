@@ -15,6 +15,8 @@ JavaScript 类比：
     相当于一个 api/llmClient.js 模块，内部 new OpenAI() 后封装三个请求函数，
     并加了「单例 + axios-retry + try/catch 统一抛错」三件套。
 """
+# 【什么】标准库 + 重试库 + 项目内依赖
+# 【作用】json 解参数、time 算耗时、tenacity 自动重试、repair_json 修格式、CircuitBreaker 熔断
 import json
 import time
 from typing import Optional, List, Dict, Any
@@ -30,9 +32,11 @@ _logger = get_logger("llm")
 # 不可降级的 HTTP 状态码：这些是「请求本身有问题」，换个模型结果一模一样。
 #   400 参数错 / 401 认证失败 / 402 欠费 / 403 无权限 / 404 模型不存在 / 405 / 409 / 413 / 422
 # 反过来看：无状态码（网络层超时、连接失败）与 429 限流、5xx 服务端故障，都是「可降级」。
-_NO_DEGRADE_STATUS = {400, 401, 402, 403, 404, 405, 409, 413, 422}
+_NO_DEGRADE_STATUS = {400, 401, 402, 403, 404, 405, 409, 413, 422}   # 9 个状态码，命中即不降级也不熔断
 
 
+# 【什么】判断一次异常值不值得换备用模型重试
+# 【作用】只给瞬时故障降级，请求本身的错直接抛，避免白等一次超时
 def _is_degradable(exc: BaseException) -> bool:
     """这个异常是否值得「换个模型再试一次」。
 
@@ -51,6 +55,8 @@ def _is_degradable(exc: BaseException) -> bool:
     return status not in _NO_DEGRADE_STATUS
 
 
+# 【什么】三个 invoke 方法共用的重试装饰器工厂
+# 【作用】最多重试 llm_max_attempts 次（默认 3），退避从 1 秒指数涨到 8 秒封顶
 def _llm_retry():
     return retry(
         stop=stop_after_attempt(max(1, get_settings().llm_max_attempts)),
@@ -58,6 +64,8 @@ def _llm_retry():
     )
 
 
+# 【什么】DeepSeek Chat 的封装客户端（进程级单例）
+# 【作用】对上层只暴露三个 invoke 方法，内部统一管重试、熔断、降级、用量记账
 class LLMClient:
     """DeepSeek Chat LLM 客户端（兼容 OpenAI 接口）。
 
@@ -65,7 +73,7 @@ class LLMClient:
     复用同一个底层 HTTP 连接（类比 JS 模块里 export 一个全局唯一的 axios 实例）。
     """
 
-    _instance = None
+    _instance = None            # 类级单例槽位：全进程只放一个对象，复用同一条 HTTP 连接
 
 
 
@@ -79,6 +87,8 @@ class LLMClient:
 
 
 
+    # 【什么】单例的创建闸门（在 __init__ 之前执行）
+    # 【作用】槽位空才真正建对象，之后每次 LLMClient() 都返回同一个旧对象
     def __new__(cls):
         """__new__ 负责「创建并返回实例」（在 __init__ 之前执行）。
 
@@ -95,6 +105,8 @@ class LLMClient:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    # 【什么】建底层 OpenAI 客户端与熔断器
+    # 【作用】用 hasattr 守卫保证只初始化一次；单例下每次 LLMClient() 都会再跑本函数
     def __init__(self):
         """初始化底层 SDK 客户端。
 
@@ -107,26 +119,28 @@ class LLMClient:
             try:
                 from openai import OpenAI
                 self._client = OpenAI(
-                    api_key=s.deepseek_api_key,
-                    base_url=s.deepseek_base_url,
+                    api_key=s.deepseek_api_key,          # DeepSeek 的 API Key
+                    base_url=s.deepseek_base_url,        # OpenAI 兼容协议的服务地址
                 )
-                self._model: str = s.deepseek_model
-                self.usage_context: dict = {}
+                self._model: str = s.deepseek_model                     # 主模型名，兜底发给 SDK 的那个
+                self.usage_context: dict = {}                           # 本次调用的归属上下文，记账用
                 # 熔断器跟着单例走：整个进程共用一个，内部按模型名隔离计数
                 self._breaker = CircuitBreaker(
-                    failure_threshold=s.cb_failure_threshold,
-                    recovery_timeout=s.cb_recovery_seconds,
+                    failure_threshold=s.cb_failure_threshold,   # 连续失败多少次后打开熔断
+                    recovery_timeout=s.cb_recovery_seconds,     # 打开后隔多少秒放行一次试探
                 )
                 _logger.info(f"LLM客户端初始化: model={self._model}")
             except Exception as e:
                 raise LLMException("LLM客户端初始化失败", str(e))
 
+    # 【什么】写入本次调用的归属上下文
+    # 【作用】token 用量按人/部门归集；task_id 是 PG 与 MySQL 两侧对账的主键
     def set_usage_context(
         self,
-        user_code: str = "",
-        dept_code: str = "",
-        session_id: str = "",
-        task_id: str = "",
+        user_code: str = "",        # 工号，按人统计用
+        dept_code: str = "",        # 部门码，按部门统计用
+        session_id: str = "",       # 会话 ID
+        task_id: str = "",          # 任务 ID，缺省时从请求上下文取
     ):
         """设置本次调用的归属上下文，供 token 用量按人/部门归集。
 
@@ -134,12 +148,14 @@ class LLMClient:
         靠它指向同一轮对话，缺省时从请求上下文（modules.common.context）取。
         """
         self.usage_context = {
-            "user_code": user_code,
-            "dept_code": dept_code,
-            "session_id": session_id,
-            "task_id": task_id,
+            "user_code": user_code,     # 谁调的
+            "dept_code": dept_code,     # 哪个部门
+            "session_id": session_id,   # 哪轮对话
+            "task_id": task_id,         # 跨库对账主键
         }
 
+    # 【什么】三个 invoke 方法的唯一出口
+    # 【作用】在这里统一做熔断快速失败、备用模型降级、token 用量落库
     def _chat(self, **kwargs):
         """统一出口：熔断快速失败 + 备用模型降级 + token 用量落库。"""
         s = get_settings()
@@ -240,6 +256,8 @@ class LLMClient:
         self._log_usage(resp, latency_ms=int((time.time() - started) * 1000))
         return resp
 
+    # 【什么】本类唯一真正发起 HTTP 请求的地方
+    # 【作用】主模型与备用模型共用这一个出口，避免两处代码各写一遍
     def _request(self, model: str, s, **kwargs):
         """按指定模型发一次请求 —— 本类唯一真正发起 HTTP 的地方。
 
@@ -247,9 +265,11 @@ class LLMClient:
         不会出现「两处 HTTP 代码各写一遍、改一处漏一处」的漂移。
         """
         return self._client.chat.completions.create(
-            model=model, timeout=s.llm_timeout_seconds, **kwargs
+            model=model, timeout=s.llm_timeout_seconds, **kwargs   # 超时取配置；其余 kwargs 由上层 invoke* 传入
         )
 
+    # 【什么】把一次调用的用量写进 sys_llm_usage
+    # 【作用】记账是旁路：写失败只留 debug 日志，绝不把主链路拖挂
     def _log_usage(self, resp, latency_ms: int):
         usage = getattr(resp, "usage", None)
         if not usage or not get_settings().rbac_enabled:
@@ -259,25 +279,27 @@ class LLMClient:
             from modules.common import context as req_ctx
             ctx = getattr(self, "usage_context", {}) or {}
             log_llm_usage(
-                user_code=ctx.get("user_code", ""),
-                model=getattr(resp, "model", self._model),
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-                latency_ms=latency_ms,
-                dept_code=ctx.get("dept_code", ""),
-                session_id=ctx.get("session_id", ""),
-                task_id=ctx.get("task_id", "") or req_ctx.get_task_id(),
+                user_code=ctx.get("user_code", ""),                     # 谁调的
+                model=getattr(resp, "model", self._model),              # 记实际服务的模型，主备单价不同
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,   # 输入 token，缺失记 0
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,  # 输出 token
+                latency_ms=latency_ms,                                  # 端到端耗时，含降级重发那次
+                dept_code=ctx.get("dept_code", ""),                     # 哪个部门
+                session_id=ctx.get("session_id", ""),                   # 哪轮对话
+                task_id=ctx.get("task_id", "") or req_ctx.get_task_id(), # 对账主键，缺省回落到请求上下文
             )
         except Exception as e:
             _logger.debug(f"用量上报失败: {e}")
 
+    # 【什么】最基础的对话调用，只回文本
+    # 【作用】适合纯聊天、收尾总结这类不需要工具的场景
     @_llm_retry()
     def invoke(
         self,
-        prompt: str,
-        system_prompt: str = "",
-        temperature: float = 0.3, 
-        max_tokens: int = 2048,
+        prompt: str,                        # 用户输入
+        system_prompt: str = "",            # 系统提示词，留空则不发 system 消息
+        temperature: float = 0.3,           # 随机性：0 最确定，越高越发散
+        max_tokens: int = 2048,             # 回答长度上限（token）
     ) -> str:
         """基础对话调用，返回文本。
 
@@ -308,12 +330,14 @@ class LLMClient:
             _logger.error(f"LLM调用失败: {e}")
             raise LLMException("LLM调用失败", str(e))
 
+    # 【什么】带 Function Calling 的对话调用
+    # 【作用】ReAct 的主力入口：让模型自己决定「直接答」还是「请求调工具」
     @_llm_retry()
     def invoke_with_tools(
         self,
-        messages: list,
-        tools: list,
-        temperature: float = 0.3,
+        messages: list,                 # 完整对话历史（含 system / user / tool）
+        tools: list,                    # 工具 JSON Schema 列表
+        temperature: float = 0.3,       # 随机性，与 invoke 同默认 0.3
     ) -> dict:
         """
         带工具的对话调用（原生 Function Calling）。
@@ -352,25 +376,25 @@ class LLMClient:
         try:
             resp = self._chat(
                 messages=messages,
-                tools=tools if tools else None,
-                tool_choice="auto" if tools else None,
+                tools=tools if tools else None,             # 空工具列表时不传 tools 字段
+                tool_choice="auto" if tools else None,      # auto = 由模型自主决定是否调工具
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=4096,                            # 比 invoke 的 2048 大，容得下工具参数
             )
             msg = resp.choices[0].message
-            content = msg.content or ""
-            tool_calls = None
+            content = msg.content or ""                     # 模型说的话；调工具时可能为空串
+            tool_calls = None                               # None = 模型没要求调工具
             if msg.tool_calls:
                 tool_calls = []
                 for tc in msg.tool_calls:
-                    args_str = tc.function.arguments
-                    args = repair_json(args_str)
+                    args_str = tc.function.arguments            # 模型给的是参数 JSON 字符串
+                    args = repair_json(args_str)                # 尾逗号/缺括号这类小毛病在这里修掉
                     if args is None:
-                        args = {}
+                        args = {}                               # 修不出来就给空参数，由工具侧追问缺失项
                     tool_calls.append({
-                        "name": tc.function.name,
-                        "arguments": args,
-                        "id": tc.id,
+                        "name": tc.function.name,               # 工具名
+                        "arguments": args,                      # 参数字典
+                        "id": tc.id,                            # 调用 ID，回传工具结果时要带上
                     })
                 _logger.info(f"LLM请求工具调用: {[tc['name'] for tc in tool_calls]}")
             return {"content": content, "tool_calls": tool_calls}
@@ -378,12 +402,14 @@ class LLMClient:
             _logger.error(f"LLM工具调用失败: {e}")
             raise LLMException("LLM工具调用失败", str(e))
 
+    # 【什么】要求模型返回 JSON 的结构化调用
+    # 【作用】给摘要、抽取、分类这类「程序要读结果」的场景用，失败有兜底
     @_llm_retry()
     def invoke_structured(
         self,
-        prompt: str,
-        system_prompt: str = "",
-        temperature: float = 0.2,
+        prompt: str,                        # 用户输入
+        system_prompt: str = "",            # 系统提示词，有则拼在 prompt 前
+        temperature: float = 0.2,           # 比对话更低（0.2），保证输出稳定可解析
     ) -> dict:
         """
         结构化输出调用：要求LLM返回JSON格式。
@@ -398,17 +424,17 @@ class LLMClient:
             resp = self._chat(
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=temperature,
-                max_tokens=2048,
-                response_format={"type": "json_object"},
+                max_tokens=2048,                            # 结构化输出一般较短，2048 够用
+                response_format={"type": "json_object"},    # 让服务端强制返回合法 JSON
             )
             content = resp.choices[0].message.content.strip()
-            result = repair_json(content)
+            result = repair_json(content)                   # 二次修复，防服务端返回夹带多余文本
             if result is None:
                 _logger.error(f"结构化输出解析失败: {content[:200]}")
-                return {"error": "格式解析失败", "raw": content[:500]}
+                return {"error": "格式解析失败", "raw": content[:500]}   # 兜底结构，raw 留前 500 字
             return result
         except Exception as e:
             _logger.warning(f"结构化调用降级: {e}")
-            content = self.invoke(prompt, system_prompt, temperature)
+            content = self.invoke(prompt, system_prompt, temperature)   # 降级为普通对话再修一次
             result = repair_json(content)
             return result if result else {"error": "格式解析失败", "raw": content[:500]}

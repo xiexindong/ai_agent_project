@@ -36,6 +36,8 @@ _NO_DOMAIN_FILTER = ("", "general", "all", "none")
 _KEYWORD_SCORE_BASE = 0.60
 
 
+# 【什么】浮点向量 → pgvector 字符串字面量
+# 【作用】list 直接传参会变成 ARRAY[...] 而报运算符不存在，拼成 "[...]" 才稳
 def to_vector_literal(vector: Sequence[float]) -> str:
     """把 Python 浮点列表转成 pgvector 能直接吃的字符串字面量。
 
@@ -53,18 +55,24 @@ def to_vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vector) + "]"
 
 
+# 【什么】Tool-RAG 存储层：一张表装下工具元数据与向量
+# 【作用】对外只暴露三个动作：建表、入库、检索；PG 不可用时返回空而不抛异常
 class ToolVectorStore:
     """工具元数据的向量存取（PostgreSQL + pgvector）。"""
 
-    def __init__(self, table: str = "", dimension: int = 0):
+    # 【什么】构造函数：确定表名与维度后立刻建连
+    # 【作用】table/dimension 留空即取配置项，运行期不再重复读配置
+    def __init__(self, table: str = "", dimension: int = 0):   # table/dimension 为空时取配置值
         s = get_settings()
-        self._table = self._safe_table(table or s.tool_vector_table)
-        self._dim = dimension or int(s.embedding_dimension)
-        self._conn = None
-        self._cur = None
-        self._ok = False
+        self._table = self._safe_table(table or s.tool_vector_table)  # 表名，非法时回退 tool_catalog
+        self._dim = dimension or int(s.embedding_dimension)  # 向量维度，如 1024
+        self._conn = None   # psycopg2 连接对象
+        self._cur = None    # 数据库游标
+        self._ok = False    # 存储层是否可用；False 时所有方法返回空结果
         self._connect()
 
+    # 【什么】表名安全校验（静态方法）
+    # 【作用】表名是唯一必须拼进 SQL 的标识符，白名单卡死，不合法就回退默认表名
     # ------------------------------------------------------------------
     # 【表名为什么要校验】
     #   表名是唯一必须拼进 SQL 字符串的标识符（psycopg2 的参数占位符只能代替换值，
@@ -78,15 +86,21 @@ class ToolVectorStore:
         _logger.warning(f"非法表名 {table!r}，回退为 tool_catalog")
         return "tool_catalog"
 
+    # 【什么】存储层可用性标识
+    # 【作用】召回层先看它再决定走向量还是关键词/本地兜底
     @property
     def available(self) -> bool:
         """存储层是否可用（PG 连上了才为 True）。"""
         return self._ok
 
+    # 【什么】当前生效的表名
+    # 【作用】建表与检索都用它，排障时确认操作的是哪张表
     @property
     def table(self) -> str:
         return self._table
 
+    # 【什么】建立 PG 连接并注册 pgvector 类型
+    # 【作用】连接失败不抛异常，只置 _ok=False，把"连不上"变成可降级状态
     def _connect(self) -> None:
         """连接 PG 并注册 pgvector 类型适配器。
 
@@ -119,6 +133,8 @@ class ToolVectorStore:
             self._ok = False
             _logger.warning(f"Tool-RAG 存储不可用（将走关键词降级）: {e}")
 
+    # 【什么】探活：执行一次 SELECT 1
+    # 【作用】PG 重启或网络闪断后能自愈一次，避免整批请求都走降级
     def _is_alive(self) -> bool:
         """检查连接是否还活着（PG 重启/网络闪断后能自愈一次）。"""
         if not self._ok or self._conn is None:
@@ -134,6 +150,8 @@ class ToolVectorStore:
                 pass
             return self._ok
 
+    # 【什么】建表 + 建索引（幂等，可重复执行）
+    # 【作用】IVFFlat 向量索引按余弦距离建，lists=100；域索引加速 domain_tag 过滤
     # ------------------------------------------------------------------
     # 【建表】DDL 与 sql/init_tool_rag.sql 保持一致
     #   幂等：IF NOT EXISTS，重复执行无副作用
@@ -176,6 +194,8 @@ class ToolVectorStore:
             _logger.warning(f"建表失败: {e}")
             return False
 
+    # 【什么】拼出用于 embedding 编码的文本
+    # 【作用】只放"名 + 描述 + 参数名"，避免完整 schema 里的类型词稀释语义
     @staticmethod
     def routing_text(name: str, description: str, parameters: Any) -> str:
         """拼出用于编码的文本。
@@ -198,7 +218,9 @@ class ToolVectorStore:
         tail = f"\n参数: {', '.join(names)}" if names else ""
         return f"{name}\n{description}{tail}"
 
-    def upsert_tools(self, tools: Sequence[Dict[str, Any]], embed_fn=None) -> int:
+    # 【什么】工具向量批量入库（同名覆盖）
+    # 【作用】先一次批量编码再逐行 upsert，返回实际写入行数，失败返回 0
+    def upsert_tools(self, tools: Sequence[Dict[str, Any]], embed_fn=None) -> int:  # embed_fn=None 时用智谱 embedding
         """工具向量入库（同名覆盖）。
 
         Args:
@@ -288,14 +310,16 @@ class ToolVectorStore:
             _logger.warning(f"工具向量入库失败: {e}")
             return 0
 
+    # 【什么】按语义召回候选工具（向量检索 + 双重阈值过滤）
+    # 【作用】只用 SQL 取回 top_k，再用绝对/相对两道阈值切掉尾部噪声
     def search(
         self,
-        query_embedding: Sequence[float],
-        domain_tag: str = "",
-        exclude: Optional[List[str]] = None,
-        top_k: int = 3,
-        min_score: float = 0.25,
-        relative_ratio: float = 0.60,
+        query_embedding: Sequence[float],      # 用户提问的向量
+        domain_tag: str = "",                  # 业务域过滤；空/general/all/none 表示不过滤
+        exclude: Optional[List[str]] = None,   # 黑名单工具名，本轮不许被召回
+        top_k: int = 3,                        # 召回数量上限
+        min_score: float = 0.25,               # 绝对相似度下限
+        relative_ratio: float = 0.60,          # 相对下限系数：需 >= 本轮最高分 * 该系数
     ) -> List[Dict[str, Any]]:
         """按语义召回候选工具。
 
@@ -399,12 +423,14 @@ class ToolVectorStore:
         )
         return hits
 
+    # 【什么】关键词降级检索
+    # 【作用】PG 可用但 embedding 不可用时兜底；分数上限 0.60，与向量结果一眼区分
     def search_keyword(
         self,
-        keywords: Sequence[str],
-        domain_tag: str = "",
-        exclude: Optional[List[str]] = None,
-        top_k: int = 3,
+        keywords: Sequence[str],               # 关键词列表，来自意图识别的 keyword_list
+        domain_tag: str = "",                  # 业务域过滤，规则同 search()
+        exclude: Optional[List[str]] = None,   # 黑名单工具名
+        top_k: int = 3,                        # 返回数量上限（先捞 200 行再排序截取）
     ) -> List[Dict[str, Any]]:
         """关键词降级检索（PG 可用但 embedding 不可用，或向量召回为空时用）。
 
@@ -455,6 +481,8 @@ class ToolVectorStore:
         _logger.info(f"关键词降级召回: 命中 {len(hits)} 个 → 取前 {top_k}")
         return hits[:top_k]
 
+    # 【什么】统计表里工具记录条数
+    # 【作用】自检用；查不到返回 -1，区别于"表存在但为空"的 0
     def count(self) -> int:
         """表里有多少条工具记录（-1 表示查不到）。"""
         if not self._is_alive():
@@ -465,6 +493,8 @@ class ToolVectorStore:
         except Exception:
             return -1
 
+    # 【什么】关闭游标与连接
+    # 【作用】进程退出前释放资源；内部吞掉异常，避免退出流程被连接错误打断
     def close(self) -> None:
         """关闭连接（进程退出前调用）。"""
         try:
@@ -477,6 +507,8 @@ class ToolVectorStore:
         self._ok = False
 
 
+# 【什么】延迟导入并返回 embedding 服务单例
+# 【作用】函数内 import，避免本模块在无网络/缺依赖环境下导入即失败
 def get_embedding_service():
     """延迟导入 embedding 服务（避免本模块在无网络环境下导入即失败）。"""
     from modules.memory.embedding_service import get_embedding_service as _get

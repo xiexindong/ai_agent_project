@@ -29,7 +29,7 @@ _logger = get_logger("pipeline.token")
 # 【寒暄套话】压缩时优先去掉的部分：它们对判断意图没有贡献
 #   只去开头的（用户铺垫用），不去中间的（可能是真实诉求的一部分）
 # ----------------------------------------------------------------------
-_SMALL_TALK_PREFIX = ("你好", "您好", "hi", "hello", "请问", "麻烦问一下", "打扰一下", "谢谢", "感谢")
+_SMALL_TALK_PREFIX = ("你好", "您好", "hi", "hello", "请问", "麻烦问一下", "打扰一下", "谢谢", "感谢")  # 9 个开头寒暄词
 
 # LLM 压缩提示词：只要求"保留什么"，不要求"怎么说"，避免模型自由发挥
 _COMPRESS_SYSTEM = (
@@ -40,6 +40,8 @@ _COMPRESS_SYSTEM = (
 )
 
 
+# 【什么】第 ① 级压缩：去重复行 + 去开头寒暄 + 压空白
+# 【作用】零成本零延迟地砍掉冗余，多数超长输入在这一级就能回到预算内
 def _rule_compress(text: str) -> str:
     """规则压缩：去重行 + 去寒暄 + 压空白。
 
@@ -73,6 +75,8 @@ def _rule_compress(text: str) -> str:
     return out
 
 
+# 【什么】第 ② 级压缩：调一次模型做摘要式压缩
+# 【作用】规则压不动时靠模型保留实体与诉求；失败返回 None 交给第 ③ 级
 def _llm_compress(text: str, max_tokens: int, llm) -> Optional[str]:
     """LLM 压缩：调用一次模型做摘要式压缩。
 
@@ -83,6 +87,7 @@ def _llm_compress(text: str, max_tokens: int, llm) -> Optional[str]:
         return None
     try:
         prompt = f"请把下面文本压缩到 {max_tokens} token 以内：\n\n{text}"
+        # temperature=0.1 压低发散；输出上限给预算的 2 倍，避免模型自己把结果写一半截断
         out = llm.invoke(prompt, system_prompt=_COMPRESS_SYSTEM, temperature=0.1, max_tokens=max_tokens * 2)
         out = (out or "").strip()
         return out or None
@@ -91,6 +96,8 @@ def _llm_compress(text: str, max_tokens: int, llm) -> Optional[str]:
         return None
 
 
+# 【什么】第 ③ 级压缩：按比例硬截断
+# 【作用】最后兜底，一定成功；会丢尾部信息但保证 token 一定达标
 def _truncate(text: str, max_tokens: int, tokens_now: int) -> str:
     """硬截断：按 token 超出的比例反推要保留多少字符。
 
@@ -108,11 +115,13 @@ def _truncate(text: str, max_tokens: int, tokens_now: int) -> str:
     return text[:max(1, keep)]
 
 
+# 【什么】Token 长度控制总入口，按 ① 规则 → ② LLM → ③ 硬截断逐级降级
+# 【作用】把输入压到意图识别吃得下的长度，且压缩环节失败也不让流水线挂掉
 def control_tokens(
-    text: str,
-    max_tokens: int = 2000,
-    llm=None,
-    compress_enabled: bool = True,
+    text: str,                       # 清洗 + 风控后的文本
+    max_tokens: int = 2000,          # token 预算，默认取 settings.pipeline_max_input_tokens
+    llm=None,                        # LLMClient；为 None 时跳过第 ② 级
+    compress_enabled: bool = True,   # False 时压缩只走硬截断
 ) -> TokenResult:
     """Token 长度控制与超长压缩。
 

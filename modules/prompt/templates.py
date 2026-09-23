@@ -34,6 +34,8 @@ from modules.common.exceptions import AgentException
 _logger = get_logger("prompt.template")
 
 
+# 【什么】提示词模块的专用异常类型
+# 【作用】变量缺失/模板未注册/版本不存在都抛它，日志能带上 detail
 class PromptError(AgentException):
     """提示词相关的异常：变量缺失、模板未注册、版本不存在。
 
@@ -44,6 +46,8 @@ class PromptError(AgentException):
     """
 
 
+# 【什么】一条提示词模板对象：正文 + 版本 + 策略标签
+# 【作用】让提示词可注册、可按版本回滚，并在渲染前校验变量
 @dataclass
 class PromptTemplate:
     """一条提示词模板。
@@ -56,11 +60,11 @@ class PromptTemplate:
         description: 一句话说明，给人看（列表展示 / 交接文档用）
     """
 
-    name: str
-    template: str
-    version: str = "v1"
-    strategy: str = "zero_shot"
-    description: str = ""
+    name: str                    # 唯一标识，建议「模块.用途」，如 react.system
+    template: str                # 模板正文，变量写 {xxx}；字面花括号要写成 {{ }}
+    version: str = "v1"          # 版本号，同名可注册多版做 A/B
+    strategy: str = "zero_shot"  # 配套策略标签，见 strategies.STRATEGIES
+    description: str = ""        # 一句话说明，给人看（列表展示 / 交接文档）
 
     # ------------------------------------------------------------------
     # 【变量表是怎么算出来的】用 string.Formatter 遍历模板，取出每个 {xxx} 的字段名。
@@ -74,6 +78,8 @@ class PromptTemplate:
     # 【为什么取 split('.') 和 split('[') 后的第一段】
     #   字段名允许 obj.attr / items[0] 这类写法，前段才是真正要传的变量名。
     # ------------------------------------------------------------------
+    # 【什么】模板里所有变量的集合
+    # 【作用】渲染前用它比对传参，builder 也靠它判断模板有没有某个插位
     @property
     def variables(self) -> Set[str]:
         fields: Set[str] = set()
@@ -99,6 +105,8 @@ class PromptTemplate:
     #   输入 render()（什么都不传）
     #   输出 抛 PromptError: 模板 react.system 缺少变量: ['query']
     # ------------------------------------------------------------------
+    # 【什么】渲染：先校验变量再 str.format
+    # 【作用】缺变量立刻抛错避免静默降质；多传的变量只告警并丢弃
     def render(self, **kwargs) -> str:
         need = self.variables
         missing = sorted(need - set(kwargs))
@@ -113,6 +121,8 @@ class PromptTemplate:
             kwargs = {k: v for k, v in kwargs.items() if k in need}
         return self.template.format(**kwargs)
 
+    # 【什么】导出模板元信息（不含正文）
+    # 【作用】给列表接口 / CLI 展示用，避免把长 prompt 打进日志
     def to_dict(self) -> dict:
         """模板元信息（列表展示 / API 返回用，不含正文，避免把长 prompt 打到日志里）。"""
         return {
@@ -124,6 +134,8 @@ class PromptTemplate:
         }
 
 
+# 【什么】模板注册表：name → version → PromptTemplate 两级字典
+# 【作用】集中存放模板，支持同名多版本共存与按版本取用
 @dataclass
 class PromptRegistry:
     """模板注册表：按 name → version → PromptTemplate 两级存放。
@@ -141,7 +153,7 @@ class PromptRegistry:
         reg.get("qa", "v1").template → "问: {q}"
     """
 
-    _items: Dict[str, Dict[str, PromptTemplate]] = field(default_factory=dict)
+    _items: Dict[str, Dict[str, PromptTemplate]] = field(default_factory=dict)   # {模板名: {版本号: 模板对象}}
 
     # ------------------------------------------------------------------
     # 【重复注册怎么处理】同名同版本默认拒绝，必须显式 overwrite=True。
@@ -149,6 +161,8 @@ class PromptRegistry:
     #   线上表现是「改了 A 文件的提示词却没生效」，查起来极其费时。
     #   宁可让第二次注册直接报错，把冲突暴露在启动阶段。
     # ------------------------------------------------------------------
+    # 【什么】注册一个模板到两级字典
+    # 【作用】同名同版本默认拒绝，必须显式 overwrite=True 才能覆盖
     def register(self, tpl: PromptTemplate, overwrite: bool = False) -> None:
         versions = self._items.setdefault(tpl.name, {})
         if tpl.version in versions and not overwrite:
@@ -161,6 +175,8 @@ class PromptRegistry:
         versions[tpl.version] = tpl
         _logger.debug(f"注册模板: {tpl.name}({tpl.version}) 变量={sorted(tpl.variables)}")
 
+    # 【什么】按名字（可选版本）取模板
+    # 【作用】不指定版本取最后注册那版；名字或版本不存在抛 PromptError
     def get(self, name: str, version: str = "") -> PromptTemplate:
         versions = self._items.get(name)
         if not versions:
@@ -174,13 +190,19 @@ class PromptRegistry:
             return tpl
         return list(versions.values())[-1]          # 不指定版本 → 取最后注册的那版
 
+    # 【什么】取模板并渲染的一步式写法
+    # 【作用】给调用方省一行 get()，变量校验规则与 PromptTemplate.render 一致
     def render(self, name: str, version: str = "", **kwargs) -> str:
         """取模板并渲染，等价 get(...).render(**kwargs)，给调用方省一行。"""
         return self.get(name, version).render(**kwargs)
 
+    # 【什么】列出某个模板名下的全部版本
+    # 【作用】给 A/B 切换与版本选择接口用，未注册时返回空列表
     def versions(self, name: str) -> List[str]:
         return list(self._items.get(name, {}))
 
+    # 【什么】列出全部模板的元信息（按名字排序）
+    # 【作用】给管理接口或 CLI 展示用，不含正文避免日志里刷长 prompt
     def list_all(self) -> List[dict]:
         """列出全部模板元信息，按 name 排序（给 /admin 或 CLI 展示用）。"""
         out: List[dict] = []
@@ -189,9 +211,13 @@ class PromptRegistry:
                 out.append(tpl.to_dict())
         return out
 
+    # 【什么】列出所有已注册的模板名
+    # 【作用】报错信息里回显「已注册: [...]」，也用于快速清点
     def names(self) -> List[str]:
         return sorted(self._items)
 
+    # 【什么】取某个模板最新注册的版本号
+    # 【作用】展示默认生效版本；模板未注册则返回 None
     def latest_version(self, name: str) -> Optional[str]:
         versions = self._items.get(name)
         return list(versions)[-1] if versions else None

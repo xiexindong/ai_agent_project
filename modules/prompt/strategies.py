@@ -27,9 +27,11 @@ from modules.common.logger import get_logger
 
 _logger = get_logger("prompt.strategy")
 
-STRATEGIES = ("zero_shot", "few_shot", "cot", "react")
+STRATEGIES = ("zero_shot", "few_shot", "cot", "react")   # 四种可选策略；未知名按 zero_shot 兜底并记 warning
 
 
+# 【什么】一条少样本示例：问题 + 期望答复
+# 【作用】给 few_shot 策略提供「照着这么答」的口径样例
 @dataclass
 class FewShotExample:
     """一条少样本示例：问法 + 期望答法。
@@ -38,11 +40,13 @@ class FewShotExample:
     select() 会先看 tags 有没有命中，命中则加分。
     """
 
-    question: str
-    answer: str
-    tags: List[str] = field(default_factory=list)
+    question: str                                          # 示例问题，参与相似度比对
+    answer: str                                            # 期望答复，作为口径样例拼进 prompt
+    tags: List[str] = field(default_factory=list)          # 领域标签；命中给 0.2 加成，默认空列表
 
 
+# 【什么】少样本示例库：加入、检索、渲染
+# 【作用】给 few_shot 策略提供「挑最像的 k 条」的能力，零外部依赖
 class FewShotStore:
     """少样本示例库：零依赖的相关度检索。
 
@@ -59,16 +63,24 @@ class FewShotStore:
         ex2   = "今天天气怎么样"     交集为空 → 0.0
     """
 
+    # 【什么】构造空示例库
+    # 【作用】示例全放内存列表，检索时对全量打分再排序
     def __init__(self):
-        self._items: List[FewShotExample] = []
+        self._items: List[FewShotExample] = []   # 全部示例，顺序即加入顺序
 
+    # 【什么】往库里加一条示例
+    # 【作用】tags 不传时记空列表（list 不能做默认参数，只能这样兜）
     def add(self, question: str, answer: str, tags: Optional[List[str]] = None) -> None:
         self._items.append(FewShotExample(question, answer, tags or []))
 
+    # 【什么】示例总条数
+    # 【作用】空库判断与日志统计用，避免外部直接摸内部列表
     @property
     def size(self) -> int:
         return len(self._items)
 
+    # 【什么】返回全部示例的副本
+    # 【作用】调用方拿到的是新列表，改它不影响库内部数据
     def all(self) -> List[FewShotExample]:
         return list(self._items)
 
@@ -91,6 +103,8 @@ class FewShotStore:
     #
     # 【边界】query 或示例为空 → 分母为 0，直接返回 0.0，不除零。
     # ------------------------------------------------------------------
+    # 【什么】把文本切成相邻二字组（bigram）
+    # 【作用】滤掉标点后取 2-gram，短文本（少于 2 字）原样返回单元素集合
     @staticmethod
     def _grams(text: str) -> set:
         cleaned = "".join(ch for ch in (text or "") if ch.isalnum())
@@ -98,6 +112,8 @@ class FewShotStore:
             return {cleaned} if cleaned else set()
         return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
 
+    # 【什么】算 query 与一条示例的相关度（0~1）
+    # 【作用】Jaccard 为基础分，命中 tags 再加 0.2，上限 1.0，保留 4 位小数
     @staticmethod
     def similarity(query: str, example: FewShotExample) -> float:
         a = FewShotStore._grams(query)
@@ -108,6 +124,8 @@ class FewShotStore:
         bonus = 0.2 if any(t in (query or "") for t in example.tags) else 0.0
         return round(min(1.0, base + bonus), 4)
 
+    # 【什么】挑出最像的若干条示例
+    # 【作用】默认取 2 条、门槛 0.15，一条都不够相似就返回空列表
     def select(self, query: str, k: int = 2, min_score: float = 0.15) -> List[FewShotExample]:
         """挑出最像的 k 条示例；得分低于 min_score 的直接不要（宁缺毋滥）。
 
@@ -129,6 +147,8 @@ class FewShotStore:
         )
         return picked
 
+    # 【什么】把示例列表渲染成 prompt 片段
+    # 【作用】每条编成「示例 N / 问 / 答」，空列表返回"（无参考示例）"
     def format_block(self, examples: List[FewShotExample]) -> str:
         """把示例渲染成 prompt 片段：编号 + 问 + 答。
 
@@ -144,6 +164,8 @@ class FewShotStore:
         )
 
 
+# 【什么】生成「怎么问」这段指令文本
+# 【作用】按策略名产出对应片段，拼进 system 或模板的 {strategy_block}
 def build_strategy_block(
     strategy: str,
     query: str = "",
@@ -198,7 +220,7 @@ def build_strategy_block(
     return _ZERO_SHOT
 
 
-_ZERO_SHOT = "直接给出答案，不要复述问题，不要编造。"
+_ZERO_SHOT = "直接给出答案，不要复述问题，不要编造。"   # zero_shot 正文：一行，约 20 token
 
 _FEW_SHOT_HEAD = "先参考以下示例的口径与格式，再回答用户问题。\n\n"
 _FEW_SHOT_TAIL = "\n\n以上示例仅供参考口径，不要照抄示例中的具体数值。"

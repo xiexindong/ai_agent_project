@@ -5,6 +5,8 @@ ReAct Agent 模块
 整合 RAG 知识库、向量记忆、本地工具、MCP远程工具全链路。
 覆盖边界2（输出校验）、边界3（死循环拦截）、边界6（Prompt防护）。
 """
+# 【什么】标准库 + 校验器 + LLM 客户端 + 提示词注册表
+# 【作用】清洗输入、检测注入、修 JSON、取提示词模板，都是 ReAct 每轮要用的东西
 import time
 from typing import Optional
 from modules.common.logger import get_logger
@@ -17,6 +19,8 @@ from modules.prompt import PromptBuilder, get_registry
 _logger = get_logger("react")
 
 
+# 【什么】ReAct 推理引擎（Reason-Action-Observation 循环）
+# 【作用】一轮一轮地「思考 → 调工具 → 看结果」，直到模型决定直接作答
 class ReActAgent:
     """ReAct 推理引擎（Reason-Action-Observation 循环）。
 
@@ -35,25 +39,27 @@ class ReActAgent:
         一致，react.reason(v1) 与旧 REASON_PROMPT 逐字一致，需要原文时按名取用即可。
     """
 
+    # 【什么】装配五个可选依赖与轮次上限
+    # 【作用】依赖都可以不给：缺哪个就退化到「不做这件事」的旧行为
     def __init__(
         self,
-        llm_client: LLMClient | None = None,
-        tool_registry=None,
-        rag_chain=None,
-        memory_manager=None,
-        skill_registry=None,
-        router=None,
+        llm_client: LLMClient | None = None,       # 不给就自建单例客户端
+        tool_registry=None,                        # 工具注册表，为 None 则无工具可用
+        rag_chain=None,                            # RAG 链，为 None 则不召回知识库
+        memory_manager=None,                       # 记忆管理器，为 None 则不召回记忆
+        skill_registry=None,                       # 技能注册表，为 None 则不走 SOP
+        router=None,                               # L0 路由层，为 None 则每轮面对全部工具
     ):
-        self.llm = llm_client or LLMClient()
-        self.tool_registry = tool_registry
-        self.rag = rag_chain
-        self.memory = memory_manager
-        self.skill_registry = skill_registry
+        self.llm = llm_client or LLMClient()        # LLM 客户端
+        self.tool_registry = tool_registry          # 工具注册表
+        self.rag = rag_chain                        # RAG 链
+        self.memory = memory_manager                # 记忆管理器
+        self.skill_registry = skill_registry        # 技能注册表
         # L0 路由层（可选）：没有它时退化为「全部工具」，行为与改造前一致
         self.router = router
         from config import get_settings
         s = get_settings()
-        self._max_iter = s.max_react_iterations
+        self._max_iter = s.max_react_iterations     # ReAct 轮次上限，写进提示词与 state.max_iterations
 
         # ------------------------------------------------------------------
         # 【提示词装配在这里定型，之后每轮只重拼 user】
@@ -70,21 +76,23 @@ class ReActAgent:
         # ------------------------------------------------------------------
         role = get_registry().render("react.role", max_iter=self._max_iter)
         self._builder = PromptBuilder(
-            template_name="react.reason",
-            strategy="react",
-            role=role,
-            max_iter=self._max_iter,
-            max_context_tokens=s.max_prompt_context_tokens,
+            template_name="react.reason",                             # 8 个上下文槽位的模板
+            strategy="react",                                          # Reason→Action→Observation 流程块
+            role=role,                                                 # 上面渲染好的角色文案
+            max_iter=self._max_iter,                                   # 写进模板变量 max_iter
+            max_context_tokens=s.max_prompt_context_tokens,            # 上下文 token 预算，超了由 builder 裁剪
         )
-        self.system_prompt = self._builder.system_prompt()
+        self.system_prompt = self._builder.system_prompt()             # 每轮都一样，算一次存着复用
 
+    # 【什么】开跑前的准备工作：清洗、注入检测、技能、记忆、RAG
+    # 【作用】把这些一次性召回塞进 state，ReAct 每轮只读不再重算
     def prepare_state(
         self,
-        query: str,
-        session_id: str,
-        user_id: str,
-        user_level: str = "normal",
-        principal=None,
+        query: str,                         # 用户原始提问
+        session_id: str,                    # 会话 ID
+        user_id: str,                       # 用户标识
+        user_level: str = "normal",         # 用户等级，默认 normal
+        principal=None,                     # 权限载体，None = 未启用权限
     ) -> AgentState:
         """
         初始化 Agent 状态：输入清洗 → Prompt注入检测 → 记忆召回 → RAG召回。
@@ -158,7 +166,7 @@ class ReActAgent:
 
         if self.memory and self.memory.pg:
             try:
-                stds = self.memory.pg.match_standard_answers(clean_query, limit=2)
+                stds = self.memory.pg.match_standard_answers(clean_query, limit=2)   # 最多取 2 条标准答案
                 if stds:
                     std_text = "\n".join(
                         f"【标准答案{i + 1}】问：{s['question']}\n答：{s['answer']}"
@@ -174,6 +182,8 @@ class ReActAgent:
         return state
 
 
+    # 【什么】生成知识库过滤表达式
+    # 【作用】让 RAG 只在可见库里捞；生成失败返回 None，按不限制处理
     @staticmethod
     def _kb_expr(principal) -> Optional[str]:
         """生成知识库过滤表达式；生成失败返回 None（宁可放开检索也不能让对话失败）。"""
@@ -186,6 +196,8 @@ class ReActAgent:
             _logger.warning(f"知识库权限表达式生成失败（按不限制处理）: {e}")
             return None
 
+    # 【什么】按权限过滤本轮工具
+    # 【作用】越权的工具根本不进 schema；principal 为空时原样返回，方便 CLI 调试
     @staticmethod
     def _allowed_tools(principal, tools: list) -> list:
         """按权限过滤工具；principal 为空时返回原样（CLI 调试场景）。"""
@@ -198,6 +210,8 @@ class ReActAgent:
             _logger.warning(f"工具权限过滤失败（按最小权限处理）: {e}")
             return []
 
+    # 【什么】把权限边界写成一段 prompt 文本
+    # 【作用】模型得先知道自己的边界，才谈得上不越界
     @staticmethod
     def _permission_context(principal) -> str:
         """把权限边界写进 prompt：模型必须先知道自己的边界，才谈得上不越界。"""
@@ -212,6 +226,8 @@ class ReActAgent:
             "- 越权内容一律视为不存在：不得提及、不得暗示其存在",
         ])
 
+    # 【什么】构造注入工具的私有参数
+    # 【作用】这些下划线参数不出现在 Function Calling schema 里，只在执行时注入
     @staticmethod
     def _tool_context(principal) -> Optional[dict]:
         """
@@ -225,12 +241,14 @@ class ReActAgent:
         if principal is None:
             return None
         return {
-            "_scopes": {dt: principal.scope_for(dt) for dt in ("users", "orders", "inventory")},
-            "_dept_code": principal.dept_code,
-            "_user_code": principal.user_code,
-            "_mask_level": principal.mask_level,
+            "_scopes": {dt: principal.scope_for(dt) for dt in ("users", "orders", "inventory")},   # 三类数据各自的可见范围
+            "_dept_code": principal.dept_code,      # 部门域过滤用
+            "_user_code": principal.user_code,      # 本人域过滤用
+            "_mask_level": principal.mask_level,    # 字段脱敏强度：0 不脱敏 / 1 部分 / 2 强
         }
 
+    # 【什么】工具调用审计：一次调用一条记录
+    # 【作用】成功记 allow、失败记 error，带入参与耗时，供事后追责
     @staticmethod
     def _audit_tool_call(principal, tool_name: str, arguments: dict, result, session_id: str = ""):
         """工具调用审计：成功记 allow，失败记 error，并带上入参与耗时。
@@ -246,17 +264,19 @@ class ReActAgent:
                 "tool_call",
                 f"tool:{tool_name}",
                 "allow" if result.success else "error",
-                dept_code=principal.dept_code,
-                session_id=session_id,
+                dept_code=principal.dept_code,                          # 按部门归集
+                session_id=session_id,                                  # 与 PG 侧工具流水对齐
                 detail={
-                    "arguments": arguments,
-                    "duration_ms": getattr(result, "duration_ms", 0),
-                    "error": (result.error if not result.success else ""),
+                    "arguments": arguments,                             # 原始入参
+                    "duration_ms": getattr(result, "duration_ms", 0),   # 耗时，缺失记 0
+                    "error": (result.error if not result.success else ""),   # 失败才带错误信息
                 },
             )
         except Exception as e:
             _logger.warning(f"工具审计写入失败: {e}")
 
+    # 【什么】ReAct 的 Reason 步骤：让模型决定调工具还是直接答
+    # 【作用】一次调用改写 need_tool_call / action / final_answer，决定图的下一跳
     def reason_step(self, state: AgentState) -> AgentState:
         """
         ReAct Reason 步骤：让 LLM 看 query + 历史 + 工具清单，决定"调工具还是直接答"。
@@ -411,6 +431,8 @@ class ReActAgent:
 
         return state
 
+    # 【什么】在历史里找「同名同参且成功过」的那次调用
+    # 【作用】给重复调用刹车提供依据；找不到就返回 None，表示本动作是新的
     @staticmethod
     def _last_same_success_call(state: AgentState, call: dict) -> Optional[dict]:
         """在历史里找与本次动作完全相同（工具名+参数）且执行成功过的那次记录。
@@ -429,11 +451,13 @@ class ReActAgent:
                 return log
         return None
 
+    # 【什么】ReAct 的 Action 步骤：真正执行工具
+    # 【作用】把执行结果写回 observation 与两条日志，供下一轮 Reason 参考
     def act_step(self, state: AgentState) -> AgentState:
         """ReAct Action 步骤：执行工具调用（本地 or MCP）。"""
-        action = state.action
-        tool_name = action.get("name", "")
-        arguments = action.get("arguments", {})
+        action = state.action                        # 本轮待执行动作
+        tool_name = action.get("name", "")           # 工具名
+        arguments = action.get("arguments", {})      # 参数字典
 
         _logger.info(f"工具调用: {tool_name} | args={arguments}")
 
@@ -468,14 +492,14 @@ class ReActAgent:
         self._audit_tool_call(state.principal, tool_name, arguments, result, state.session_id)
 
         log_entry = {
-            "name": tool_name,
-            "arguments": arguments,
-            "result": str(result.result)[:500] if result.success else result.error,
-            "success": result.success,
-            "duration_ms": result.duration_ms,
+            "name": tool_name,                  # 工具名
+            "arguments": arguments,             # 入参，重复调用检测靠它比对
+            "result": str(result.result)[:500] if result.success else result.error,   # 成功截前 500 字，失败存错误
+            "success": result.success,          # 是否成功
+            "duration_ms": result.duration_ms,  # 耗时（毫秒）
         }
-        state.tool_calls_history.append(log_entry)
-        state.tool_call_logs.append(log_entry)
+        state.tool_calls_history.append(log_entry)   # 供下一轮 prompt 与重复检测
+        state.tool_call_logs.append(log_entry)       # 供 save 节点落 tool_call_log 表
 
         if result.success:
             state.observation = str(result.result)
@@ -486,10 +510,12 @@ class ReActAgent:
         state.action = {}
         return state
 
+    # 【什么】生成最终完整答案
+    # 【作用】模型已给答案就直接沿用，否则汇总 RAG/观察/推理再问一次模型
     def generate_answer(self, state: AgentState) -> AgentState:
         """生成最终完整答案。"""
         if state.final_answer and not state.need_tool_call:
-            pass
+            pass                                # 已有答案且不再调工具：原样保留，不多花一次调用
         else:
             prompt = (
                 f"## 用户提问\n{state.user_query}\n\n"
@@ -506,15 +532,17 @@ class ReActAgent:
         state.finished = True
         return state
 
+    # 【什么】生成一句话摘要（用于向量入库）
+    # 【作用】优先抠模型自带的【摘要】标签，其次调摘要生成器，都不行就截提问前 50 字
     def generate_summary(self, state: AgentState) -> str:
         """生成精简摘要（用于向量入库）。"""
         if not state.final_answer:
-            return state.user_query[:50]
+            return state.user_query[:50]        # 兜底：没有答案时用提问前 50 字
         if "【摘要】" in state.final_answer:
             import re
             m = re.search(r'【摘要】(.+?)(?:$|\n)', state.final_answer, re.S)
             if m:
-                return m.group(1).strip()[:100]
+                return m.group(1).strip()[:100]     # 标签里的摘要最多留 100 字
         if self.memory:
             try:
                 summary = self.memory.summary_generator.generate_summary(
