@@ -14,6 +14,7 @@ pytest 全局夹具
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -148,7 +149,9 @@ def fake_team(monkeypatch):
 
         # 【什么】按 outcome 演一次任务执行
         # 【作用】ok/可调用对象返回成功产出，fail 返回失败产出，hang/数字先睡再返回
-        def run(self, task: SubTask, ctx):
+        # 参数形态与 BaseAgent.run 对齐（task 可为 None），否则类型检查器判覆写不兼容
+        # 测试桩的返回值取决于 outcome（可能直接回 callable 的结果），故不严格对齐基类返回类型
+        def run(self, task: Optional[SubTask], ctx):   # type: ignore
             import time
             outcome = self._outcome
             if callable(outcome):

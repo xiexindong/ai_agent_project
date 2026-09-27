@@ -12,7 +12,7 @@ import time
 import asyncio
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Union, TYPE_CHECKING
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +38,18 @@ from modules.multimodal.media import MultiModalInput, ImagePart
 from modules.multiagent.harness import build_harness
 from modules.multiagent.models import EvalCase, RunResult
 from config import get_settings
+
+# 【什么】只在类型检查阶段执行的导入（TYPE_CHECKING 恒为 False，运行时不导入）
+# 【作用】给 AppContext 字段标注真实类型，避免退化成 object 导致调用方法被判错；
+#        运行时不导入，防止拉起 pymilvus / crewai 等重型可选依赖，也避免循环导入
+if TYPE_CHECKING:
+    from modules.rag.rag_chain import RAGChain
+    from modules.rag.llamaindex_adapter import LlamaIndexRAG
+    from modules.skills.skill_registry import SkillRegistry
+    from modules.multiagent.harness import AgentHarness
+    from modules.multiagent.crewai_backend import CrewAIBackend
+    from modules.mcp.gateway import MCPGateway
+    from modules.mcp.mcp_client import MCPClient
 
 _logger = get_logger("api")
 
@@ -100,17 +112,21 @@ class ReviewRequest(BaseModel):
 # 【作用】路由通过 ctx.xxx 拿到 LLM / 记忆 / 工具 / Agent 图等共享组件
 class AppContext:
     """应用全局上下文（单例组件）。"""
-    llm: LLMClient = None # 单例 LLM 客户端
-    memory: MemoryManager = None # 单例记忆管理器
-    pg: PGManager = None # 单例 Postgres 管理器
-    rag: object = None # 单例 RAG 链路
-    tool_registry: ToolRegistry = None  # 单例工具注册表
-    skill_registry: object = None # 单例技能注册表
-    gateway: object = None       # MCP 技能网关（多 server 纳管，远程技能不直连 LLM）
-    mcp_client: object = None    # 兼容旧字段：直连模式下的 MCP 客户端（现由网关管理）
-    agent_graph: AgentGraph = None # 单例 Agent 图
-    harness: object = None # 单例多 Agent 运行时
-    crew_backend: object = None # 单例角色扮演编排后端
+    # 【类型说明】字段一律 Optional[...] + None：这些组件在 lifespan 里才装配，
+    #   声明成裸类型却赋 None 会让类型检查器报赋值不匹配；声明成 object 则调用方法时全报错
+    llm: Optional[LLMClient] = None             # 单例 LLM 客户端
+    memory: Optional[MemoryManager] = None      # 单例记忆管理器
+    pg: Optional[PGManager] = None              # 单例 Postgres 管理器
+    # RAG_BACKEND=llamaindex 时工厂返回 LlamaIndexRAG，两种实现接口一致，故注解成联合类型
+    rag: Optional[Union["RAGChain", "LlamaIndexRAG"]] = None  # 单例 RAG 链路
+    tool_registry: Optional[ToolRegistry] = None  # 单例工具注册表
+    tool_harness: Optional[Any] = None            # 工具运行时（能力/校验/审批/沙箱/预算）
+    skill_registry: Optional["SkillRegistry"] = None  # 单例技能注册表
+    gateway: Optional["MCPGateway"] = None      # MCP 技能网关（多 server 纳管，远程技能不直连 LLM）
+    mcp_client: Optional["MCPClient"] = None    # 兼容旧字段：直连模式下的 MCP 客户端（现由网关管理）
+    agent_graph: Optional[AgentGraph] = None    # 单例 Agent 图
+    harness: Optional["AgentHarness"] = None    # 单例多 Agent 运行时
+    crew_backend: Optional["CrewAIBackend"] = None  # 单例角色扮演编排后端
 
 
 # 【什么】后台对账循环：睡够间隔 → 跑一次对账 → 有不一致就告警
@@ -175,7 +191,7 @@ class APIServer:
     # 【作用】构造完成即处于可服务状态；任何组件失败都走降级而不是中断启动
     def __init__(self): # self.app: FastAPI
         self.app = create_app()
-        self.ctx = AppContext()
+        self.ctx: AppContext = AppContext()
         self._init_components() # 初始化全局组件
         self._register_routes() # 注册路由
 
@@ -190,8 +206,32 @@ class APIServer:
         self.ctx.pg = PGManager()
         self.ctx.memory = MemoryManager(llm_client=self.ctx.llm)
 
-        self.ctx.tool_registry = ToolRegistry()
+        # ------------------------------------------------------------------
+        # 【工具 Harness】能力声明 / 调用前校验 / 人工审批 / 沙箱 / 预算 / 结果过滤
+        #   装配失败或开关关闭时 harness=None，ToolRegistry 退化为改造前行为。
+        #   gate 只在开启 HITL 时注入：高风险工具（high/critical）需要真人拍板，
+        #   没开 HITL 时按 tool_on_no_gate 处理（默认 deny，安全优先）。
+        # ------------------------------------------------------------------
+        harness = None
+        try:
+            if s.tool_harness_enabled:
+                from modules.harness import build_tool_harness
+                gate = None
+                if s.hitl_enabled:
+                    from modules.hitl import get_global_gate
+                    gate = get_global_gate()
+                harness = build_tool_harness(s, gate=gate)
+        except Exception as e:
+            _logger.warning(f"工具 Harness 装配失败（按无治理运行）: {e}")
+            harness = None
+        self.ctx.tool_harness = harness
+
+        self.ctx.tool_registry = ToolRegistry(harness=harness)
         self.ctx.tool_registry.register_batch(self.ctx.tool_registry.get_default_tools())
+        if harness is not None:
+            # 绑定后 SchemaMiddleware 才能按工具名取到 JSON Schema（延迟注入避免循环依赖）
+            harness.bind_registry(self.ctx.tool_registry)
+            _logger.info(f"工具 Harness 已装配: 中间件={harness.chain.names()} | 闸门={'开' if harness.gate else '关'}")
 
         from modules.skills import SkillRegistry, get_default_skills
         self.ctx.skill_registry = SkillRegistry()
@@ -220,7 +260,8 @@ class APIServer:
                     breaker=CircuitBreaker(s.cb_failure_threshold, s.cb_recovery_seconds),
                     default_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
                 )
-                _logger.info(f"MCP 网关已就绪: servers={self.ctx.gateway.server_names}")
+                _logger.info(f"MCP 网关已就绪: servers={self.ctx.gateway.server_names} | "
+                             f"传输={self.ctx.gateway.transports}")
 
             tool_index = None
             if s.tool_rag_enabled:
@@ -258,6 +299,7 @@ class APIServer:
             memory_manager=self.ctx.memory,
             skill_registry=self.ctx.skill_registry,
             router=router,
+            tool_harness=self.ctx.tool_harness,     # 预算账本与拦截逻辑与 registry 共用同一实例
         )
         self.ctx.agent_graph = AgentGraph(react_agent)
 
@@ -434,6 +476,20 @@ class APIServer:
             if not result.get("ok"):
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
+
+        # 【什么】Human-in-the-Loop 审批端点：/hitl/pending、/hitl/reply、/hitl/records
+        # 【作用】给"人"这一侧一个可操作的入口：看待办、点决策、查留痕。
+        #   闸门必须用进程级共享的那个（get_global_gate），
+        #   否则人在这边点批准、Agent 链路等在另一个 store 上，永远收不到。
+        #   注册失败只告警不抛出：审批是增强能力，不能因为它拖垮主服务。
+        try:
+            from modules.api.hitl_routes import register_hitl_routes
+            from modules.hitl import get_global_gate
+
+            register_hitl_routes(app, get_global_gate(), RequirePerm("api:admin:*"))
+            _logger.info("HITL 审批端点已注册: /hitl/pending /hitl/stream /hitl/reply /hitl/records")
+        except Exception as e:
+            _logger.warning(f"HITL 端点注册失败（不影响主流程）: {e}")
 
         # 【什么】GET / —— 前端首页（免鉴权）
         # 【作用】返回 static/index.html；文件不存在时 404 而不是返回空页
@@ -656,7 +712,8 @@ class APIServer:
             if not ctx.rag:
                 raise HTTPException(status_code=503, detail="RAG模块未启用")
             import tempfile, os
-            tmp_path = os.path.join(tempfile.gettempdir(), file.filename)
+            # file.filename 可能是 None（客户端没带文件名），兜底一个名字，避免拼路径时类型不兼容
+            tmp_path = os.path.join(tempfile.gettempdir(), file.filename or "upload.tmp")
             with open(tmp_path, "wb") as f:
                 content = await file.read()
                 f.write(content)

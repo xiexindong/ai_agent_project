@@ -17,7 +17,7 @@ MCP 协议交互流程（JSON-RPC 2.0 + stdio）：
 import sys
 import json
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 from modules.common.logger import get_logger
 from modules.mcp.protocol import (
     parse_message, create_response, create_error,
@@ -150,8 +150,10 @@ class MCPServer:
 
     # 【什么】请求分发：按 method 分到不同分支
     # 【作用】四种 method 各回一条响应；未知方法回 -32601，内部异常回 -32603
-    def handle_request(self, msg: dict) -> str:
-        """处理 JSON-RPC 请求，返回响应 JSON。"""
+    # 【返回值为什么是 Optional[str]】notifications/* 这类"通知"按 JSON-RPC 规范不该响应，
+    #   走的是 return None 分支；其余 method 都返回响应 JSON 字符串。
+    def handle_request(self, msg: dict) -> Optional[str]:
+        """处理 JSON-RPC 请求，返回响应 JSON；通知类消息返回 None（不发响应）。"""
         req_id = msg.get("id", 0)
         method = msg.get("method", "")
 

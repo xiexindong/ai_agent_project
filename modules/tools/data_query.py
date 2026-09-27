@@ -59,6 +59,10 @@ class DataQueryTool(BaseTool):
     """
     企业内部数据查询工具（Mock 数据，演示用）。
 
+    【能力声明】只读查询，但涉及 users / orders / inventory 三类业务数据，
+    因此声明 data_scopes，由 Harness 的 ScopeMiddleware 校验
+    参数里的 dept_code / user_code 是否超出当前身份的可见范围。
+
     【三种查询场景的结果对比】
         ✓ 查单条存在的记录（data_type="users", record_id="U001"）：
             ToolResult(success=True, result={"id":"U001", "name":"张三", "dept":"技术部", ...})
@@ -75,6 +79,16 @@ class DataQueryTool(BaseTool):
             ToolResult(success=False, error="无权访问该记录: users/U002（数据范围: self）")
             → 与"不存在"区分开，模型不会继续探测
     """
+
+    # 【能力声明】只读查询；data_scopes 让 Harness 校验参数里的
+    #   dept_code / user_code 是否越出当前身份的数据域（self / dept / all）
+    capability = {
+        "risk": "low",
+        "side_effect": False,
+        "sandbox": "none",
+        "data_scopes": ("users", "orders", "inventory"),
+        "description": "只读业务数据查询，按身份数据域过滤",
+    }
 
     # 【什么】构造函数：声明工具名、说明与参数 schema
     # 【作用】data_type 必填；record_id 选填，留空表示查可见列表

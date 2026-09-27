@@ -15,7 +15,20 @@ from modules.multiagent.models import (
     EvalCase,
     EvalResult,
     EvalReport,
+    AgentMessage,
+    ConsensusResult,
+    MessageKind,
     json_schema_hint,
+)
+# 【什么】从 coordination 导入三个协调组件与相似度工具
+# 【作用】消息总线（横向对话）、一致性判定（谁和谁打架）、
+#        仲裁者与重规划器（打架怎么办、没干成怎么办）
+from modules.multiagent.coordination import (
+    Arbitrator,
+    Consensus,
+    MessageBus,
+    ReplanController,
+    text_overlap,
 )
 # 【什么】从 agents 导入 Agent 基类、三类角色实现与构造工厂
 # 【作用】建团队只需 build_default_team / build_agent 两个入口
@@ -28,20 +41,44 @@ from modules.multiagent.agents import (
     build_agent,
     build_default_team,
 )
-# 【什么】从 harness 导入运行时与一行构造工厂
-# 【作用】API / demo 直接 build_harness() 就能跑一次多 Agent 协作
-from modules.multiagent.harness import AgentHarness, build_harness
-# 【什么】导入 crewai 编排后端（可选依赖，默认不启用）
-# 【作用】与自研 harness 二选一，两者对外都返回同一个 RunResult
-from modules.multiagent.crewai_backend import CrewAIBackend
+
+# ---------------------------------------------------------------------------
+# 【为什么 harness 与 crewai 后端改成按需加载】
+#   harness 依赖 modules.orchestration（中心化编排层），
+#   而 orchestration.protocol 反过来又依赖本包的 models（Envelope 继承 AgentMessage）。
+#   如果在包初始化时就 import harness，会形成一条环：
+#       protocol → multiagent/__init__ → harness → orchestration.bus → protocol（还没定义完）
+#   结果是"先 import 谁"决定成败——先 import multiagent 能跑，
+#   先 import orchestration 就报 ImportError，属于最难查的那类问题。
+#   改成按需加载后：包初始化只依赖 models / coordination / agents，
+#   AgentHarness 在真正被用到时才加载，那时两边都已就绪，两个方向都安全。
+# ---------------------------------------------------------------------------
+_LAZY_MODULES = {
+    "AgentHarness": "modules.multiagent.harness",
+    "build_harness": "modules.multiagent.harness",
+    "CrewAIBackend": "modules.multiagent.crewai_backend",
+}
+
+
+def __getattr__(name: str):
+    """PEP 562 模块级懒加载：from modules.multiagent import AgentHarness 依然可用。"""
+    mod_path = _LAZY_MODULES.get(name)
+    if mod_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    return getattr(import_module(mod_path), name)
+
 
 # 【什么】对外可见的名字清单
 # 【作用】from modules.multiagent import * 时只导出这些，不泄露内部符号
 __all__ = [
     "AgentRole", "AgentSpec", "SubTask", "PlanResult", "AgentOutput", "TraceEvent",
     "RunResult", "RunStatus", "TeamConfig", "EvalCase", "EvalResult", "EvalReport",
+    "AgentMessage", "ConsensusResult", "MessageKind",
     "json_schema_hint",
     "BaseAgent", "SupervisorAgent", "WorkerAgent", "ReviewerAgent", "RunContext",
     "build_agent", "build_default_team",
     "AgentHarness", "build_harness", "CrewAIBackend",
+    "MessageBus", "Consensus", "Arbitrator", "ReplanController", "text_overlap",
 ]

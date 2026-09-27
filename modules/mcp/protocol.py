@@ -96,7 +96,7 @@ class JSONRPCResponse:
 
 # 【什么】构造一条请求的 JSON 字符串
 # 【作用】Client 侧统一入口；req_id 默认 1，多请求并发时应显式传不同 id
-def create_request(method: str, params: dict = None, req_id: int = 1) -> str:
+def create_request(method: str, params: Optional[dict] = None, req_id: int = 1) -> str:
     """创建 JSON-RPC 请求 JSON 字符串。"""
     req = JSONRPCRequest(method=method, params=params or {}, id=req_id)
     return req.to_json()

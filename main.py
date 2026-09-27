@@ -81,8 +81,25 @@ def cmd_chat(args):
     pg = PGManager()                         # PG：会话与记忆存储
     memory = MemoryManager(llm_client=llm)   # 记忆管理：摘要 + 向量召回
 
-    tool_registry = ToolRegistry()           # 工具注册表
-    tool_registry.register_batch(tool_registry.get_default_tools())   # 注册内置工具
+    # 【工具 Harness】能力声明 / 调用前校验 / 人工审批 / 沙箱 / 预算 / 结果过滤
+    #   CLI 场景默认无人工闸门（hitl_enabled 默认 False），高风险工具按 tool_on_no_gate 处理
+    tool_harness = None
+    try:
+        if s.tool_harness_enabled:
+            from modules.harness import build_tool_harness
+            tool_harness = build_tool_harness(s)
+    except Exception as e:
+        _logger.warning(f"工具 Harness 装配失败（按无治理运行）: {e}")
+        tool_harness = None
+
+    tool_registry = ToolRegistry(harness=tool_harness)   # 工具注册表
+    tool_registry.register_batch(tool_registry.get_default_tools())   # 注册内置工具  _tools
+    if tool_harness is not None:
+        tool_harness.bind_registry(tool_registry)        # 让参数校验能取到 JSON Schema
+        # 【沙箱跑在哪】remote 模式下把远端地址打出来：留空会静默降级本机子进程，
+        #   不打印的话"配了 remote 但没生效"很难排查
+        _logger.info(f"工具沙箱: 默认模式={s.tool_sandbox_mode} | "
+                     f"远程地址={s.tool_sandbox_remote_url or '（未配置，remote 将降级本机子进程）'}")
 
     skill_registry = SkillRegistry()         # 技能注册表（SOP 流程）
     skill_registry.register_batch(get_default_skills())               # 注册内置技能
@@ -111,7 +128,8 @@ def cmd_chat(args):
                 breaker=CircuitBreaker(s.cb_failure_threshold, s.cb_recovery_seconds),
                 default_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
             )
-            _logger.info(f"MCP 网关已就绪: servers={gateway.server_names}")
+            _logger.info(f"MCP 网关已就绪: servers={gateway.server_names} | "
+                         f"传输={gateway.transports}")
 
         tool_index = None
         if s.tool_rag_enabled:
@@ -149,6 +167,7 @@ def cmd_chat(args):
         memory_manager=memory,
         skill_registry=skill_registry,
         router=router,
+        tool_harness=tool_harness,
     )
     agent_graph = AgentGraph(react_agent)
 
@@ -326,6 +345,56 @@ def cmd_mcp_server(args):
     MCPServer().run()
 
 
+# 【什么】mcp-http-server 子命令：把本项目跑成一个「远程」MCP Server（HTTP 传输）
+# 【作用】 常驻监听 /mcp，供远程机器上的 Agent（MCPHttpClient）连接；
+#         真部署时这一端跑在另一台机器上，本项目自带的那份工具就变成"远程工具"
+def cmd_mcp_http_server(args):
+    """
+    启动远程 MCP Server（HTTP 传输，JSON-RPC 2.0）。
+
+    与 `mcp-server` 的区别只在传输层：
+        mcp-server       stdio：由本机 MCPClient 拉起子进程（进程隔离）
+        mcp-http-server  HTTP ：常驻服务，供远程机器的 Agent 连接（远程执行）
+    工具清单与协议处理是同一份（modules/mcp/mcp_server.py），换传输不改业务，
+    所以两种模式暴露的工具、参数 schema、错误码完全一致。
+
+    客户端侧配置：MCP_REMOTE_URL=http://<host>:<port>/mcp
+    """
+    import uvicorn
+    from modules.mcp.mcp_http_server import app     # 延迟导入：uvicorn/fastapi 只在这个子命令里才需要
+
+    host = args.host or "127.0.0.1"                # 远程部署时传 --host 0.0.0.0
+    port = int(args.port or 8800)
+    print(f"远程 MCP Server 启动中（HTTP模式）: http://{host}:{port}/mcp")
+    print("客户端配置: MCP_REMOTE_URL=http://%s:%d/mcp" % (host, port))
+    uvicorn.run(app, host=host, port=port)
+
+
+# 【什么】sandbox-server 子命令：启动远程沙箱服务
+# 【作用】 给 TOOL_SANDBOX_MODE=remote 的 Agent 当对端（收类坐标、起 worker 执行、回 JSON）；
+#         真部署时把这一端放到另一台机器上，工具就真的不在 Agent 本机跑了
+def cmd_sandbox_server(args):
+    """
+    启动远程沙箱服务（HTTP 传输）。
+
+    与子进程沙箱传的是同一份"类坐标"：{"module","class","params"}，
+    本服务收到后在自己这边起一个 sandbox_worker 子进程执行，把结果 JSON 原样回传。
+    换真远程时，把这一层子进程换成容器集群 / 沙箱池即可，调用方协议一行都不用改。
+
+    客户端侧配置：TOOL_SANDBOX_MODE=remote
+                TOOL_SANDBOX_REMOTE_URL=http://<host>:<port>/run
+    """
+    import uvicorn
+    from modules.harness.remote_sandbox_server import app     # 延迟导入同上
+
+    host = args.host or "127.0.0.1"
+    port = int(args.port or 8899)
+    print(f"远程沙箱服务启动中: http://{host}:{port}/run")
+    print("客户端配置: TOOL_SANDBOX_MODE=remote")
+    print("            TOOL_SANDBOX_REMOTE_URL=http://%s:%d/run" % (host, port))
+    uvicorn.run(app, host=host, port=port)
+
+
 # 【什么】web-demo 子命令：起一个纯 Mock 的前端预览服务
 # 【作用】 不连 PG/Milvus/DeepSeek 也能看界面与对话流程，用于演示与前端联调
 def cmd_web_demo(args):
@@ -372,7 +441,7 @@ def main():
     """
     命令行入口。
 
-    使用 argparse 注册 7 个子命令，根据用户输入分发到对应的 cmd_xxx 函数。
+    使用 argparse 注册 12 个子命令，根据用户输入分发到对应的 cmd_xxx 函数。
     类比 Express 的 app.get('/chat', handler) — 路由 + 处理器模式。
     """
     setup_langsmith()   # 必须第一行执行：LangChain 只在启动时读一次追踪开关
@@ -399,6 +468,18 @@ def main():
     sub.add_parser("stats", help="知识库统计")
 
     sub.add_parser("mcp-server", help="独立启动MCP Server")
+
+    p_mcp_http = sub.add_parser("mcp-http-server", help="启动远程MCP Server（HTTP，供远程Client连接）")
+
+    p_mcp_http.add_argument("--host", default="127.0.0.1", help="监听地址，远程部署用 0.0.0.0")
+
+    p_mcp_http.add_argument("--port", type=int, default=8800, help="监听端口，默认 8800")
+
+    p_sandbox = sub.add_parser("sandbox-server", help="启动远程沙箱服务（供 TOOL_SANDBOX_MODE=remote 连接）")
+
+    p_sandbox.add_argument("--host", default="127.0.0.1", help="监听地址，远程部署用 0.0.0.0")
+
+    p_sandbox.add_argument("--port", type=int, default=8899, help="监听端口，默认 8899")
 
     sub.add_parser("web-demo", help="启动前端预览服务（Mock模式，不依赖数据库）")
 
@@ -436,7 +517,9 @@ def main():
         "serve": cmd_serve,            # 启动 API 服务
         "ingest": cmd_ingest,          # 知识库入库
         "stats": cmd_stats,            # 知识库统计
-        "mcp-server": cmd_mcp_server,  # 独立启动 MCP Server
+        "mcp-server": cmd_mcp_server,              # 独立启动 MCP Server（stdio）
+        "mcp-http-server": cmd_mcp_http_server,    # 启动远程 MCP Server（HTTP）
+        "sandbox-server": cmd_sandbox_server,      # 启动远程沙箱服务（HTTP）
         "web-demo": cmd_web_demo,      # 前端 Mock 预览
         "skills": cmd_skills,          # 技能清单 / 匹配测试
         "offboard": cmd_offboard,      # 离职数据处置

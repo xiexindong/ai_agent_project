@@ -47,7 +47,23 @@ _SAFE_FUNCS = {
 # 【什么】安全数学计算器（AST 白名单求值）
 # 【作用】替代 eval()，只放行白名单运算符与函数，挡住任意代码执行
 class CalculatorTool(BaseTool):
-    """安全数学计算器：仅允许数学表达式，禁止任意代码执行。"""
+    """安全数学计算器：仅允许数学表达式，禁止任意代码执行。
+
+    【输入输出对照】
+        run({"expression": "3*7"})            → ToolResult(success=True,  result=21)
+        run({"expression": "sqrt(16)+2**10"}) → ToolResult(success=True,  result=1028)
+        run({"expression": ""})               → ToolResult(success=False, error="表达式为空")
+        run({"expression": "__import__('os').system('echo hi')"})
+                                              → ToolResult(success=False, error="计算失败: 不支持的函数: None")
+    """
+
+    # 【能力声明】纯计算、无副作用、只读，Harness 直接放行
+    capability = {
+        "risk": "low",
+        "side_effect": False,
+        "sandbox": "none",          # 本身已是 AST 白名单求值，无需额外隔离
+        "description": "只读计算，无外部副作用",
+    }
 
     def __init__(self):
         super().__init__(
@@ -86,7 +102,7 @@ class CalculatorTool(BaseTool):
             return op(self._eval_node(node.operand))
         if isinstance(node, ast.Call):
             func_name = node.func.id if isinstance(node.func, ast.Name) else None
-            func = _SAFE_FUNCS.get(func_name)
+            func = _SAFE_FUNCS.get(func_name) if func_name else None   # 属性调用时 func_name 是 None
             if not func:
                 raise ValueError(f"不支持的函数: {func_name}")
             args = [self._eval_node(a) for a in node.args]

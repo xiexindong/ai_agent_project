@@ -36,24 +36,43 @@ from modules.common.exceptions import MCPException
 _logger = get_logger("mcp_gateway")
 
 
+# 【什么】两种传输方式
+# 【作用】stdio = 本机子进程（原有方式）；http = 远程机器上的常驻 MCP Server
+TRANSPORT_STDIO = "stdio"
+TRANSPORT_HTTP = "http"
+
+
 # 【什么】一个 MCP Server 的接入配置
-# 【作用】登记"叫什么、怎么启动、启不启用"，网关据此拉起对应子进程
+# 【作用】登记"叫什么、怎么连、启不启用"，网关据此拉子进程或连远程端点
 @dataclass
 class MCPServerConfig:
     """一个 MCP Server 的接入配置。
 
     Attributes:
-        name:    逻辑名，用于日志与熔断隔离（不同 server 各自计数，互不连累）。
-        command: 启动命令，如 ["python", "-m", "modules.mcp.mcp_server"]；
-                 换成 ["node", "server.js"] 就能接 Node 写的 server。
-        enabled: False 时登记但不连接，用于临时摘掉一个故障 server。
+        name:      逻辑名，用于日志与熔断隔离（不同 server 各自计数，互不连累）。
+        command:   启动命令（transport=stdio），如 ["python", "-m", "modules.mcp.mcp_server"]；
+                   换成 ["node", "server.js"] 就能接 Node 写的 server。
+        enabled:   False 时登记但不连接，用于临时摘掉一个故障 server。
+        transport: stdio（本机子进程）/ http（远程 MCP Server）。
+        endpoint:  transport=http 时的 /mcp 地址，如 http://10.0.0.7:8800/mcp。
+        token:     transport=http 时的 Bearer 令牌，可空。
+        timeout_seconds: 单次调用超时；0 = 用全局 TOOL_TIMEOUT_SECONDS。
+
+    【两种传输怎么选】
+        stdio  工具跑在本机子进程里 —— 要的是进程隔离，Server 仍在本机。
+        http   工具跑在远程机器上 —— 要的是远程执行，也是 MCP 的本意（跨机器、跨语言）。
     """
-    name: str                  # 逻辑名；日志与熔断都按它隔离
-    command: List[str]         # 启动命令，如 ["python", "-m", "modules.mcp.mcp_server"]
-    enabled: bool = True       # False 时登记但不连接，用于临时摘掉故障 server
+    name: str                                  # 逻辑名；日志与熔断都按它隔离
+    command: List[str] = field(default_factory=list)   # stdio：启动命令
+    enabled: bool = True                       # False 时登记但不连接，用于临时摘掉故障 server
+    transport: str = TRANSPORT_STDIO           # stdio / http
+    endpoint: str = ""                         # http：远程 /mcp 地址
+    token: str = ""                            # http：Bearer 令牌
+    timeout_seconds: float = 0.0               # 0 = 用全局 TOOL_TIMEOUT_SECONDS
 
     # 【什么】从配置字典构造配置对象
-    # 【作用】兼容 MCP_SERVERS_JSON 里字段缺失的情况：name/command 兜空，enabled 默认开
+    # 【作用】兼容 MCP_SERVERS_JSON 里字段缺失的情况；
+    #         没写 transport 时按"给了 endpoint 就是 http"推断，老配置一行不用改
     @classmethod
     def from_dict(cls, d: dict) -> "MCPServerConfig":
         """从配置字典构造。
@@ -61,13 +80,23 @@ class MCPServerConfig:
         【输入输出对照】
             输入  {"name": "enterprise", "command": ["python", "-m", "mod"], "enabled": true}
             输出  MCPServerConfig(name="enterprise", command=["python","-m","mod"], enabled=True)
+            输入  {"name": "remote", "endpoint": "http://10.0.0.7:8800/mcp"}
+            输出  MCPServerConfig(name="remote", transport="http",
+                                 endpoint="http://10.0.0.7:8800/mcp")
 
         【为什么要求 name】name 是熔断与日志的 key；缺失时无法定位是哪个 server 出问题。
         """
+        transport = str(d.get("transport", "") or "").strip().lower()
+        if not transport:                       # 老配置只有 command；新配置只给 endpoint 也能推断
+            transport = TRANSPORT_HTTP if d.get("endpoint") else TRANSPORT_STDIO
         return cls(
             name=str(d.get("name", "")),
             command=list(d.get("command", [])),
             enabled=bool(d.get("enabled", True)),
+            transport=transport,
+            endpoint=str(d.get("endpoint", "") or ""),
+            token=str(d.get("token", "") or ""),
+            timeout_seconds=float(d.get("timeout_seconds", 0) or 0),
         )
 
 
@@ -148,18 +177,30 @@ class MCPGateway:
     def add_server(self, cfg: MCPServerConfig) -> None:
         if not cfg.name:
             raise MCPException("MCP Server 配置缺少 name", str(cfg))
-        if not cfg.command:
-            raise MCPException("MCP Server 配置缺少 command", f"name={cfg.name}")
+        # 【按传输校验必填】stdio 要启动命令，http 要远端地址；两样都没有就不知道怎么连
+        if cfg.transport == TRANSPORT_HTTP:
+            if not cfg.endpoint:
+                raise MCPException("MCP Server 配置缺少 endpoint", f"name={cfg.name}(http)")
+        elif not cfg.command:
+            raise MCPException("MCP Server 配置缺少 command", f"name={cfg.name}(stdio)")
         if cfg.name in self._servers:
             _logger.warning(f"MCP Server 重复登记，覆盖: {cfg.name}")
         self._servers[cfg.name] = cfg
-        _logger.info(f"MCP Server 已登记: {cfg.name} | enabled={cfg.enabled}")
+        _logger.info(f"MCP Server 已登记: {cfg.name} | transport={cfg.transport} | "
+                     f"enabled={cfg.enabled}")
 
     # 【什么】已登记的 server 名列表
     # 【作用】启动日志用它报"纳管了哪几个 server"，不反映是否已连接
     @property
     def server_names(self) -> List[str]:
         return list(self._servers.keys())
+
+    # 【什么】各 server 用的传输方式
+    # 【作用】启动日志据此报"本机子进程 / 远程 HTTP"，一眼看出 MCP 工具到底跑在哪
+    #   输出形如 {"enterprise-mcp": "stdio", "remote-mcp": "http"}
+    @property
+    def transports(self) -> Dict[str, str]:
+        return {name: cfg.transport for name, cfg in self._servers.items()}
 
     # ------------------------------------------------------------------
     # 【工具目录】召回的原料：只要名字/描述/参数表，不生成 function schema
@@ -193,7 +234,7 @@ class MCPGateway:
                 self._catalog_loaded = True
                 self._stats.catalog_tools = len(self._tool_index)
                 _logger.info(f"MCP 工具目录来自缓存: {self._cache_path} | 工具数={len(self._tool_index)}")
-                return [dict(e["info"], server=e["server"]) for e in self._tool_index.values()]
+                return [dict[str, Any](e["info"], server=e["server"]) for e in self._tool_index.values()]
 
             for name, cfg in self._servers.items():
                 if not cfg.enabled:
@@ -212,8 +253,9 @@ class MCPGateway:
                 # 【拉完目录就断开】目录是元数据，不需要子进程常驻；
                 #   真正调用时 _connect 会重新拉起（同一份配置，行为一致）。
                 #   lazy=False 时保留连接，用于「调用极频繁、不想反复握手」的场景。
+                #   http 传输没有子进程要养，断开只是白扔一次握手，所以不断。
                 # ------------------------------------------------------------------
-                if self._lazy:
+                if self._lazy and cfg.transport != TRANSPORT_HTTP:
                     client.disconnect()
                     self._clients.pop(name, None)
 
@@ -311,10 +353,9 @@ class MCPGateway:
             _logger.warning(f"MCP Server 熔断中，跳过连接: {server}")
             return None
 
-        from modules.mcp.mcp_client import MCPClient
         last_err = None
         for attempt in range(1, self._retry + 1):
-            client = MCPClient(server_command=list(cfg.command), name=server)
+            client = self._new_client(server, cfg)
             try:
                 client.connect()
                 self._clients[server] = client
@@ -335,6 +376,19 @@ class MCPGateway:
         _logger.error(f"MCP Server 连接最终失败: {server} | {last_err}")
         return None
 
+    # 【什么】按传输方式 new 一个客户端
+    # 【作用】stdio → 本机子进程 MCPClient；http → 远程 MCPHttpClient；
+    #         两个类方法名一致（connect/discover_tools/call_tool/disconnect），
+    #         所以下面的连接流程与上层调用一行都不用改
+    @staticmethod
+    def _new_client(server: str, cfg: "MCPServerConfig"):
+        if cfg.transport == TRANSPORT_HTTP:
+            from modules.mcp.mcp_http_client import MCPHttpClient
+            return MCPHttpClient(endpoint=cfg.endpoint, name=server,
+                                 token=cfg.token, timeout_seconds=cfg.timeout_seconds)
+        from modules.mcp.mcp_client import MCPClient
+        return MCPClient(server_command=list(cfg.command), name=server)
+
     # 【什么】熔断键：给 server 名加前缀
     # 【作用】熔断按 "mcp:{server}" 计数，不同 server 各自统计、互不连累
     @staticmethod
@@ -351,8 +405,43 @@ class MCPGateway:
         if not self._cache_path or not self._cache_path.exists():
             return []
         try:
+            # ------------------------------------------------------------------
+            # 【什么】open()：把磁盘上的一个文件"打开"，返回一个可往下读的句柄 f
+            #   open(路径, 模式, encoding) 三个入参逐个说：
+            #     self._cache_path —— 缓存文件路径（Path 对象，__init__ 第 133 行由 catalog_cache 转来）
+            #     "r"              —— 只读模式（read）；文件不存在会抛 FileNotFoundError
+            #     encoding="utf-8" —— 按 UTF-8 把字节解码成字符
+            #
+            # 【with 的作用】with 块一结束（正常走完 / 中途抛异常）都会自动 f.close()
+            #   不用 with 就得自己写 try/finally 关文件；漏一次 close 就漏一个文件句柄，
+            #   Windows 上还会一直锁着这个文件，导致删不掉、别人也写不进去
+            #
+            # 【输入输出对照】
+            #   输入：data/mcp_catalog.json（config.py:128 的默认值）
+            #         {"version": 1, "tools": [{"name": "web_search", "server": "enterprise-mcp"}]}
+            #   输出：f —— 文件对象；交给下一行 json.load(f) 读完得到 dict
+            #
+            # 【依赖警告】这里的 encoding 必须与 _write_cache 里 open(..., "w", encoding="utf-8") 一致，
+            #   两边不一致时中文工具描述会解码失败，被下面的 except 接住并降级为「实时发现」
+            # ------------------------------------------------------------------
             with open(self._cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # ------------------------------------------------------------------
+            # 【tools 是哪来的】就是上面 data 里的 "tools" 字段
+            #   链条：_write_cache（第 384 行）把 _tool_index 落成
+            #         {"version":1,"tools":[{name,description,inputSchema,server}, ...]}
+            #         _tool_index 又来自两条路：本文件缓存命中（第 188 行）或
+            #         实时 discover_tools（第 205 行，需真连一次 server）
+            #
+            # 【为什么用 .get 带兜底】文件被手改坏、只写了半截时可能没有 "tools" 键，
+            #   写 data["tools"] 会抛 KeyError；.get(..., []) 缺键就当空目录，
+            #   由调用方 catalog() 走实时发现那条路补上
+            #
+            # 【输入输出对照】
+            #   输入：data = {"version":1,"tools":[{"name":"web_search","server":"enterprise-mcp"}, ...]}
+            #   输出：tools = [{"name":"web_search","server":"enterprise-mcp"}, ...]
+            #   缺键时：data = {"version":1}  ->  tools = []
+            # ------------------------------------------------------------------
             tools = data.get("tools", [])
             _logger.info(f"MCP 目录缓存命中: {self._cache_path} | 工具数={len(tools)}")
             return tools
@@ -404,8 +493,12 @@ class MCPGateway:
     #
     #   【输入输出对照】
     #     输入  MCP_SERVERS_JSON='[{"name":"geo","command":["python","-m","geo_server"]}]'
-    #     输出  网关登记 1 个 server：geo
-    #     输入  MCP_SERVERS_JSON=''（留空）
+    #     输出  网关登记 1 个 server：geo（stdio，本机子进程）
+    #     输入  MCP_SERVERS_JSON='[{"name":"remote","endpoint":"http://10.0.0.7:8800/mcp"}]'
+    #     输出  网关登记 1 个 server：remote（http，远程机器上的常驻 Server）
+    #     输入  MCP_REMOTE_URL='http://10.0.0.7:8800/mcp'（MCP_SERVERS_JSON 留空）
+    #     输出  网关登记 1 个 server：remote-mcp（http）
+    #     输入  两者都留空
     #     输出  网关登记默认 server：enterprise-mcp（与改造前同一个）
     #
     #   【配置项解析失败怎么处理】JSON 写错时记 warning 并回退默认 server，
@@ -419,13 +512,21 @@ class MCPGateway:
             from config import get_settings
             settings = get_settings()
         servers: List[MCPServerConfig] = []
-        raw = str(getattr(settings, "mcp_servers_json", "") or "").strip()
+        raw: str = str(getattr(settings, "mcp_servers_json", "") or "").strip()
         if raw:
             try:
                 servers = [MCPServerConfig.from_dict(d) for d in json.loads(raw)]
             except Exception as e:
                 _logger.warning(f"MCP_SERVERS_JSON 解析失败，回退默认 server: {e}")
                 servers = []
+        # 【远程 MCP Server】只配一个 MCP_REMOTE_URL 就能接远程机器上的 Server，
+        #   不必写完整的 MCP_SERVERS_JSON（与沙箱远程地址的用法保持一致）
+        remote_url = str(getattr(settings, "mcp_remote_url", "") or "").strip()
+        if not servers and remote_url:
+            servers = [MCPServerConfig(
+                name="remote-mcp", transport=TRANSPORT_HTTP, endpoint=remote_url,
+                token=str(getattr(settings, "mcp_remote_token", "") or ""),
+            )]
         if not servers and default_command:
             servers = [MCPServerConfig(name="enterprise-mcp", command=list(default_command))]
         return cls(

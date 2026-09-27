@@ -228,3 +228,65 @@ tool_registry.register(adapter)
 | 重名策略 | ⚠️ 静默覆盖，暂无冲突但机制上有隐患 |
 
 **一句话记住**：本地保底、MCP 扩展、适配器抹平——**思路满分，差在 `user_level` 那一行没传下去**。
+
+---
+
+## 7. 真·远程 MCP：HTTP 传输（新增）
+
+前面讲的 MCP 走的是 **stdio**：`subprocess.Popen` 在本机拉起一个 Server 子进程。
+那解决的是**进程隔离**，不是远程——Server 还跑在本机。
+
+要"远程机器部署 MCP Server、Agent 当 Client 调它"，把传输层换成 HTTP 即可，
+**协议一行不用改**（还是 initialize / tools/list / tools/call，还是 JSON-RPC 2.0）：
+
+```
+Agent ──POST /mcp {"jsonrpc":"2.0","method":"tools/call",...}──▶ 远端常驻 MCP Server
+     ◀──── {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"..."}]}} ──
+```
+
+### 怎么用
+
+```bash
+# 远端机器上（本机模拟就本机跑）
+python main.py mcp-http-server --host 127.0.0.1 --port 8800    # 远程部署时 --host 0.0.0.0
+
+# Agent 侧，两种配置二选一
+MCP_REMOTE_URL=http://10.0.0.7:8800/mcp
+# 或写全
+MCP_SERVERS_JSON='[{"name":"remote","transport":"http","endpoint":"http://10.0.0.7:8800/mcp"}]'
+```
+
+### 新增的三处代码
+
+| 位置 | 作用 |
+|---|---|
+| `modules/mcp/mcp_http_client.py` | `MCPHttpClient`：与 `MCPClient` **方法名完全一致**，换传输不改上层 |
+| `modules/mcp/mcp_http_server.py` | 模拟远程 Server：把项目自带的 `MCPServer` 挂到 HTTP 上（复用同一份工具与协议处理） |
+| `modules/mcp/gateway.py` | `MCPServerConfig` 新增 `transport/endpoint/token`；`_new_client()` 按传输选客户端 |
+
+因为适配器只要求"有 `call_tool`"，`MCPToolAdapter` 接哪个 client 都行：
+
+```python
+MCPToolAdapter(MCPClient(...),   info)   # 本机子进程
+MCPToolAdapter(MCPHttpClient(...), info) # 远程机器
+```
+
+对 `ToolRegistry` 和 ReAct 来说两者完全等价 —— 这就是「适配器抹平」的价值。
+
+### 降级与鉴权
+
+| 情况 | 行为 |
+|---|---|
+| 远端连不上 / 401 / 500 | 抛 `MCPException`，网关接住后**该 server 不可用**，其余 server 与本地工具照常 |
+| 目录建不出来 | `catalog()` 返回空目录，不抛异常（局部故障局部降级） |
+| 服务端设了 `MCP_SERVER_TOKEN` | 客户端必须带 `Authorization: Bearer <token>`，否则 401 |
+| 工具业务性失败 | 走协议 `isError`，不算 server 故障，不触发熔断 |
+
+### 和「远程沙箱 runner」怎么选
+
+| | 远程沙箱 `mode=remote` | 远程 MCP（HTTP） |
+|---|---|---|
+| 传什么 | 类坐标 `{"module","class","params"}` | MCP 协议（工具名 + 参数，元数据/错误码协议定好） |
+| 对面是什么 | 自己写的执行服务 | 任意语言实现的 MCP Server（生态现成的都能接） |
+| 适合 | 把自己的本地工具搬到别处跑 | 接外部/第三方工具服务 |
+| 协议成本 | 自研（小） | 0（用标准协议，跨语言跨机器通用） |

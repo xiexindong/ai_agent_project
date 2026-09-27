@@ -16,10 +16,33 @@
   "reportUnannotatedClassAttribute": "none",    // 类属性必须标注类型 → 关
   "reportUninitializedInstanceVariable": "none",// 实例变量未在 __init__ 初始化 → 本项目 _conn 在 _connect() 里赋值，关
   "reportDeprecated": "none",                   // List/Optional 弃用提醒 → 关
+  "reportOptionalMemberAccess": "none",         // Optional 未判空就访问 → 项目大量使用（单例懒加载字段），关
+  "reportOptionalSubscript": "none",            // Optional 下标访问 → 同上，关
+  "reportIncompatibleVariableOverride": "none", // 子类 Literal['text'] 覆写基类 str → pydantic 判别联合的既定写法，关
+  "reportUnusedCoroutine": "none",              // pymilvus 同步 API 被推断成协程 → 库类型标注问题，关
 
   // ---- 保留的有用检测（standard 默认开启，显式写出以示重视）----
   "reportArgumentType": "error",                // 参数类型不匹配（真 bug）
   "reportReturnType": "error",                  // 返回类型不匹配（真 bug）
   "reportAttributeAccessIssue": "error",        // 访问不存在的属性（真 bug）
-  "reportCallIssue": "error"                    // 调用参数个数/名称错误（真 bug）
+  "reportCallIssue": "error",                 // 调用参数个数/名称错误（真 bug）
+
+  // ---- 按目录放宽：examples / tests 是演示与用例，不是交付链路 ----
+  //   demo 里会往模块对象挂 mock 类、故意传 None 触发边界分支，这类写法类型检查器必然报红。
+  //   只对这两个目录放宽，modules/ 下的正式代码仍走上面全套严格检查。
+  "executionEnvironments": [
+    {
+      "root": "examples",
+      "extraPaths": ["."],                    // 必须显式指回项目根，否则 modules.* 解析不到
+      "reportAttributeAccessIssue": "none",   // 往模块对象挂 mock 类 → 属性未知
+      "reportArgumentType": "none",           // demo 传字面量构造对象 → 与 Literal 形参不匹配
+      "reportMissingImports": "none"          // crewai 等可选框架没装也要能跑 demo
+    },
+    {
+      "root": "tests",
+      "extraPaths": ["."],                    // 同上：让 tests 里的 modules.* 继续按项目根解析
+      "reportAttributeAccessIssue": "none",   // 给对象塞 _outcome / _client 等私有属性做桩
+      "reportArgumentType": "none"            // 故意传 None 验边界分支（如 kb_expr(None)）
+    }
+  ]
 }

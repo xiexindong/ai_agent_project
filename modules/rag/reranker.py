@@ -15,7 +15,7 @@ BGE 精排模块
     ✗ 模型不可用（包没装/下载失败/显存不足）：
         降级为"向量相似度 * 0.7 + 关键词命中 * 0.3"加权打分，精度差但不崩
 """
-from typing import List
+from typing import List, Optional
 from modules.common.logger import get_logger
 from modules.common.exceptions import handle_exception
 
@@ -37,7 +37,7 @@ class BGEReranker:
     def _init_model(self):
         """尝试加载本地 BGE-Reranker 模型，失败则降级。"""
         try:
-            from FlagEmbedding import FlagReranker
+            from FlagEmbedding import FlagReranker   # type: ignore   # 可选依赖，未安装由下面 except 兜底降级
             self._model = FlagReranker(self._model_name, use_fp16=True)
             _logger.info(f"BGE-Reranker加载成功: {self._model_name}")
         except ImportError:
@@ -48,7 +48,7 @@ class BGEReranker:
             self._model = None
 
     @handle_exception(default=None, log_msg="BGE精排异常")
-    def rerank(self, query: str, documents: List[dict], top_k: int = None) -> List[dict]:
+    def rerank(self, query: str, documents: List[dict], top_k: Optional[int] = None) -> List[dict]:
         """
         对召回文档二次精排，返回 top_k 篇最相关文档。
 

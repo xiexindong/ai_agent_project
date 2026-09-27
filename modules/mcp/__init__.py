@@ -15,6 +15,11 @@ from modules.mcp.protocol import (
 # 【什么】Client 侧：连子进程、发现工具、把远程工具适配成本地 BaseTool
 # 【作用】Agent 侧只认 MCPClient / MCPToolAdapter 两个入口
 from modules.mcp.mcp_client import MCPClient, MCPToolAdapter
+# 【什么】Client 侧（HTTP 传输版）：连远程机器上的 MCP Server
+# 【作用】与 MCPClient 同接口；配 MCP_REMOTE_URL 或 transport=http 时由网关自动选用。
+#   注意：模拟远程 Server（modules.mcp.mcp_http_server）依赖 fastapi，不在这里导入，
+#   需要时 `from modules.mcp.mcp_http_server import app`
+from modules.mcp.mcp_http_client import MCPHttpClient
 # 【什么】Server 侧：独立进程里提供工具的那一端
 # 【作用】python -m modules.mcp.mcp_server 时跑的就是它
 from modules.mcp.mcp_server import MCPServer
@@ -27,6 +32,6 @@ from modules.mcp.gateway import MCPGateway, MCPServerConfig
 __all__ = [
     "JSONRPCRequest", "JSONRPCResponse", "JSONRPCError",
     "parse_message", "create_request", "create_response", "create_error",
-    "MCPClient", "MCPToolAdapter", "MCPServer",
+    "MCPClient", "MCPHttpClient", "MCPToolAdapter", "MCPServer",
     "MCPGateway", "MCPServerConfig",
 ]

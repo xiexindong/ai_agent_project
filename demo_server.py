@@ -267,7 +267,8 @@ def _generate_mock_response(query: str):
 # 【作用】 对外只暴露这一个工厂函数，main.py 的 web-demo 命令就是调它
 def create_demo_app() -> Starlette:
     """创建 Mock 模式 Starlette 应用（前端预览用）。"""
-    routes = [
+    # 显式写成 list 而不是让它被推断成 list[Route]：下面还要往里 append Mount（静态目录挂载）
+    routes: list = [
         Route("/", index),                                          # 首页
         Route("/health", health),                                   # 健康检查（免鉴权）
         Route("/knowledge/stats", kb_stats),                        # 知识库统计

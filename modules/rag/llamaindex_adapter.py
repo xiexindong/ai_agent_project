@@ -149,7 +149,9 @@ class LlamaIndexRAG:
             for p in parsed
         ])
 
-    def ingest_document(self, file_path: str) -> int:
+    # 【kb_code 为什么收下但不用】llama-index 后端是独立落盘的单一索引，没有分库概念；
+    #   加这个参数只为与自研 RAGChain.ingest_document 签名一致，调用方才不用区分后端。
+    def ingest_document(self, file_path: str, kb_code: str = "public") -> int:
         """文档入库：返回切片数（与自研 RAGChain.ingest_document 同签名）。"""
         docs = self._li["SimpleDirectoryReader"](input_files=[file_path]).load_data()
         if not docs:

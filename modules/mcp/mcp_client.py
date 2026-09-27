@@ -8,7 +8,7 @@ MCP 标准化工具协议客户端：连接独立 MCP Server，发现工具、�
 import json
 import subprocess
 import threading
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 from queue import Queue, Empty
 from modules.common.logger import get_logger
 from modules.common.exceptions import MCPException, handle_exception
@@ -166,7 +166,7 @@ class MCPClient:
             line = self._process.stdout.readline()
             if not line:
                 raise MCPException("MCP Server 无响应", "")
-            resp = parse_message(raw=line)
+            resp: dict[Any, Any] = parse_message(raw=line)
             if "error" in resp:
                 err = resp["error"]
                 raise MCPException(
@@ -255,12 +255,25 @@ class MCPToolAdapter(BaseTool):
     注意：不走 BaseTool.__init__（它要求 parameters dict），
     这里直接从 MCP 的 inputSchema 组装同名属性。
     """
+
+    # 【能力声明】远程工具默认 medium：它跑在外部 server 里，可能有副作用，
+    #   比本地只读工具高一级（仍可直接执行，不自动触发人工审批）。
+    #   真正的高危远程工具用 TOOL_RISK_OVERRIDES 单独提级为 high/critical。
+    capability = {
+        "risk": "medium",
+        "side_effect": True,
+        "sandbox": "none",          # 远程工具本身已在 MCP server 子进程中执行
+        "description": "MCP 远程工具，执行发生在外部 server",
+    }
     # 【什么】适配器构造：从 MCP 工具元数据组装成本地工具属性
     # 【作用】不走 BaseTool.__init__，直接用 inputSchema 拼同名属性；缺 inputSchema 时兜空 schema
-    def __init__(self, mcp_client: MCPClient, tool_info: dict):
+    # 【参数类型为什么是 Any】适配器只要求客户端有 call_tool 方法：
+    #   stdio 的 MCPClient 与远程的 MCPHttpClient 都能传，换传输不用改适配器
+    def __init__(self, mcp_client: Any, tool_info: dict):
         self._client = mcp_client                 # 复用的 MCP 客户端；真正调用走它
         self._tool_info = tool_info               # Server 返回的原始工具元数据
-        self.name = tool_info["name"]             # 工具名，必填；缺失会直接 KeyError
+        self.name = tool_info["name"]  
+                   # 工具名，必填；缺失会直接 KeyError
         self.description = tool_info.get("description", "")   # 描述；缺失兜空串
         self.parameters_schema = tool_info.get("inputSchema", {   # 参数 JSON Schema
             "type": "object", "properties": {}, "required": []    # 兜底：空对象、无必填

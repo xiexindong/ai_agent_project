@@ -276,10 +276,45 @@ class MilvusVectorStore:
         query_vec = emb_service.embed(text=query)
         k = top_k or self._top_k
 
-        # expr 里的 kb_code in [...] 在多集合模式下转为"搜哪几个集合"，
-        # 剩下的条件（如 dept_code）仍然是集合内的过滤表达式
-        codes = list(kb_codes) if kb_codes else self._parse_kb_codes(expr)
-        inner_expr = self._strip_kb_expr(expr) if self._multi else expr
+        # ------------------------------------------------------------------
+        # 【拆分 expr】一条权限表达式在这里被劈成两半，分别驱动"搜哪个集合"和"集合内怎么过滤"
+        #
+        #   【处理前】expr = 'kb_code in ["public","finance"] and dept_code == "D_FIN"'
+        #            （由 RBACService.kb_expr(principal) 生成，见 rbac_service.py:326）
+        #            另可传 kb_codes=['public','finance']，优先级高于 expr 里的 kb_code 条件
+        #
+        #   【处理后】
+        #     codes      = ['public', 'finance']        ← 库名列表 → 下一行决定搜哪几个集合
+        #     inner_expr = 'dept_code == "D_FIN"'       ← 去掉 kb_code 后的残余条件
+        #                                                 （剥空后残留的 and/or 也被清掉，
+        #                                                  全剥完则返回 None = 集合内不加过滤）
+        #
+        #   【为什么要劈开】多集合模式下 kb_code 已体现在集合名上（kb_finance），
+        #     集合里再过滤 kb_code 既多余、在老集合上还会因缺字段报错；
+        #     所以 kb_code 条件翻译成"路由到哪几个集合"，其余条件才留给集合内过滤。
+        #
+        #   【实测对照表】_parse_kb_codes(expr) / _strip_kb_expr(expr)
+        #     'kb_code in ["public","finance"]'                        → ['public','finance'] | None
+        #     'kb_code in ["public","finance"] and dept_code == "D_FIN"' → ['public','finance'] | 'dept_code == "D_FIN"'
+        #     'dept_code == "D_FIN" and kb_code in ["hr"]'             → ['hr'] | 'dept_code == "D_FIN"'
+        #     'updated_at > "2026-01-01"'（无 kb_code）                 → [] | 原样返回
+        #     None / ''                                                → [] | None（不限制）
+        #
+        #   【两种模式的取值差异】
+        #     单集合（_multi=False）：inner_expr = expr 原样 —— kb_code 是标量字段，必须过滤
+        #     多集合（_multi=True） ：inner_expr = 剥离后的残余条件 —— kb_code 由集合名承担
+        #
+        #   【易踩边界】
+        #     ① 只认 `kb_code in [...]` 写法；写成 kb_code == "finance" 解析不出 codes，
+        #        且 strip 不会剥掉它 → 多集合下拿不存在的字段过滤 → 触发 _search_in 的
+        #        无过滤回退（308-312 行）
+        #     ② 'kb_code in []' → codes=[] → _target_collections([]) 退回默认知识库，
+        #        不等于"什么都搜不到"；想表达无可见库应让 kb_expr 返回 None 并由上层拒绝
+        # ------------------------------------------------------------------
+        # 【什么】把 expr 拆成「搜哪几个库」+「库内过滤条件」两个产物
+        # 【作用】让同一条 RBAC 表达式在单集合 / 多集合两种模式下都不用改就能生效
+        codes = list(kb_codes) if kb_codes else self._parse_kb_codes(expr)   # 库名：优先用显式 kb_codes，否则从 expr 反解析
+        inner_expr = self._strip_kb_expr(expr) if self._multi else expr      # 库内条件：多集合剥掉 kb_code，单集合原样保留
         targets = self._target_collections(codes)
 
         hits = []
@@ -313,7 +348,8 @@ class MilvusVectorStore:
 
         kb = self.kb_of_collection(name)
         hits = []
-        for hit in results[0]:
+        # pymilvus 的 search 返回类型被标注成 Future/Coroutine 联合，实际是同步结果列表
+        for hit in results[0]:   # type: ignore
             score = hit.score
             if score < self._threshold:
                 _logger.debug(f"低相关结果过滤: score={score:.4f} < {self._threshold}")
@@ -382,7 +418,7 @@ class MilvusVectorStore:
                 "kb_code": kb,
                 "collection": name,
                 "recall_type": "keyword",
-            } for r in rows)
+            } for r in rows)   # type: ignore
 
         hits.sort(key=lambda h: h["score"], reverse=True)
         hits = hits[:limit]

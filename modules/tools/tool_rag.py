@@ -105,7 +105,36 @@ class ToolRAGIndex:
         if self._vector_available:
             try:
                 from modules.memory.embedding_service import get_embedding_service
+                # 一句话：把所有待编码的工具画像文本一次性批量转成向量，按入参顺序等长返回。
                 vectors = get_embedding_service().embed_batch([t for _, t in pending])
+                # ------------------------------------------------------------------
+                # 【什么】zip(pending, vectors)：把两个等长序列像拉链一样一对一咬合
+                #   每次循环吐出一对 (pending[i], vectors[i])，i 从 0 走到末尾：
+                #     pending  —— 上面第 101 行攒的 [(工具名, 画像文本), ...]
+                #     vectors  —— 上面第 108 行 embed_batch 批量编码的 [[float,...], ...]
+                #
+                # 【为什么敢直接配对】embed_batch 严格按入参顺序返回向量，
+                #   第 i 个向量一定对应第 i 个工具，不需要再按名字回查一次。
+                #
+                # 【两层解包】(name, _), vec
+                #   外层拆 zip 的一对：左边是 pending 元素，右边是对应向量
+                #   内层拆 pending 元素：name = 工具名，_ = 画像文本（这里用不上，丢弃）
+                #
+                # 【输入输出对照】
+                #   输入 pending  = [("web_search", "web_search。网络搜索..."),
+                #                    ("get_current_time", "get_current_time。获取当前时间...")]
+                #   输入 vectors  = [[0.012, -0.034, ...], [0.045, 0.021, ...]]
+                #   输出 _vectors["web_search"]       = [0.012, -0.034, ...]
+                #        _vectors["get_current_time"] = [0.045, 0.021, ...]
+                #
+                # 【依赖警告一】zip 以"更短的那个"为准截断：两边长度不一致时，
+                #   多出来的尾部被直接丢掉，不报错也不告警（要严格校验得显式传 strict=True）
+                # 【依赖警告二】zip 后面不要加类型下标写成 zip[...](...)。
+                #   实测 Python 3.13 下 zip 无 __class_getitem__，会抛
+                #   "TypeError: type 'zip' is not subscriptable"，而本行在 try 里，
+                #   异常会被下面的 except 接住，表现是"向量不可用，降级为关键词召回"——
+                #   看日志像是 embedding 服务挂了，实际是这一行写法的问题。
+                # ------------------------------------------------------------------
                 for (name, _), vec in zip(pending, vectors):
                     self._vectors[name] = vec
                 _logger.info(f"Tool-RAG 已编码 {len(pending)} 个工具向量 | 索引总数={len(self._texts)}")
@@ -196,8 +225,12 @@ class ToolRAGIndex:
     #
     #   【输入输出对照】
     #     输入  "北京天气 3*7"
-    #     输出  ['北京', '京天', '天气', '3']
-    #           （"3*7" 被正则切成 ['3','7']，长度 <2 的片段不参与）
+    #     输出  ['北京', '京天', '天气']
+    #
+    #   【实测】ToolRAGIndex._fragments("北京天气 3*7") → ['北京', '京天', '天气']
+    #       英文/数字要求「连续 ≥2 位」（正则 [a-z0-9_]{2,}），
+    #       "3" 与 "7" 被 * 隔开，各自只有 1 位，因此不产出片段；
+    #       写成 "37" 才会得到 ['37']。
     # ------------------------------------------------------------------
     # 【什么】把文本切成可比对片段
     # 【作用】中文走 2-gram、英文数字走词，供关键词召回做重合统计

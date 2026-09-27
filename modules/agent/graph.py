@@ -33,6 +33,7 @@ LangGraph 图构建模块
 # 【作用】建图、跑图、落库都要它们；check_sensitive 只在自动初审里用
 from typing import Annotated, Any
 from langgraph.graph import StateGraph, END
+from langchain_core.runnables import RunnableConfig   # 给 invoke/get_state 的 config 标注类型
 from modules.common.logger import get_logger
 from modules.common.validator import check_sensitive
 from modules.agent.state import AgentStateDict
@@ -83,11 +84,14 @@ class AgentGraph:
         """
         workflow = StateGraph(AgentStateDict)
 
-        workflow.add_node("prepare", self._prepare_node)
-        workflow.add_node("reason", self._reason_node)
-        workflow.add_node("act", self._act_node)
-        workflow.add_node("answer", self._answer_node)
-        workflow.add_node("save", self._save_node)
+        # 【为什么下面 5 行要 type: ignore】langgraph 1.2 把 add_node 的 action 形参
+        #   收窄成 StateNode（Runnable 体系），传绑定方法（MethodType）会被判不兼容；
+        #   运行期 langgraph 会把它包成 RunnableCallable，行为完全正常。
+        workflow.add_node("prepare", self._prepare_node)   # type: ignore
+        workflow.add_node("reason", self._reason_node)     # type: ignore
+        workflow.add_node("act", self._act_node)           # type: ignore
+        workflow.add_node("answer", self._answer_node)     # type: ignore
+        workflow.add_node("save", self._save_node)         # type: ignore
 
         workflow.set_entry_point("prepare")
         workflow.add_conditional_edges(
@@ -127,7 +131,7 @@ class AgentGraph:
 
     # 【什么】prepare 节点：召回记忆/技能/RAG，初始化 state
     # 【作用】只跑一次（靠 prepared 标记），避免循环回来重复召回
-    def _prepare_node(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_node(self, state: dict[str, Any]) -> "AgentStateDict":
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
 
@@ -359,7 +363,8 @@ class AgentGraph:
             "principal": principal,         # 权限载体
             "prepared": False,              # False = 本轮还没跑 prepare
         }
-        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 30}   # 30 = 图内最大跳转步数
+        # RunnableConfig 是 TypedDict，标成它之后传给 invoke/get_state 才不会被判成普通 dict
+        config: RunnableConfig = {"configurable": {"thread_id": session_id}, "recursion_limit": 30}   # 30 = 图内最大跳转步数
 
         if resume and self._checkpointer is not None:
             try:

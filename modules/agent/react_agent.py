@@ -49,6 +49,7 @@ class ReActAgent:
         memory_manager=None,                       # 记忆管理器，为 None 则不召回记忆
         skill_registry=None,                       # 技能注册表，为 None 则不走 SOP
         router=None,                               # L0 路由层，为 None 则每轮面对全部工具
+        tool_harness=None,                         # 工具 Harness；为 None 则不做能力裁决/预算/沙箱治理
     ):
         self.llm = llm_client or LLMClient()        # LLM 客户端
         self.tool_registry = tool_registry          # 工具注册表
@@ -57,6 +58,8 @@ class ReActAgent:
         self.skill_registry = skill_registry        # 技能注册表
         # L0 路由层（可选）：没有它时退化为「全部工具」，行为与改造前一致
         self.router = router
+        # 工具 Harness（可选）：为 None 时不做能力裁决、预算控制与沙箱隔离（改造前行为）
+        self.tool_harness = tool_harness
         from config import get_settings
         s = get_settings()
         self._max_iter = s.max_react_iterations     # ReAct 轮次上限，写进提示词与 state.max_iterations
@@ -103,6 +106,11 @@ class ReActAgent:
                        决定本次请求能看哪些知识库、能调哪些工具、能看多少数据。
                        None = 未启用权限（CLI 调试场景），按不放宽也不加严处理。
         """
+        # 【开一本预算账】新一轮提问 = 新预算：调用次数 / token / 墙钟时间都从这里开始算
+        #   Harness 为 None 时整段跳过（改造前行为）
+        if self.tool_harness is not None:
+            self.tool_harness.begin_run(session_id)
+
         if check_prompt_injection(query):
             return AgentState(
                 session_id=session_id,
@@ -313,6 +321,24 @@ class ReActAgent:
         state.iteration += 1
         _logger.info(f"ReAct循环 iteration={state.iteration}/{state.max_iterations}")
 
+        # ------------------------------------------------------------------
+        # 【预算闸门：轮次开始先看账本】
+        #   墙钟超时或 token 预算打满时不再问模型（问了也只会再要一次工具），
+        #   直接收尾出答案——这对应"上下文膨胀"的最后一道防线。
+        # ------------------------------------------------------------------
+        if self.tool_harness is not None:
+            budget = self.tool_harness.budget(state.session_id)
+            if budget.expired or budget.tokens >= budget.spec.token_budget:
+                _logger.warning(f"运行预算已用尽，强制收尾: {budget.snapshot()}")
+                state.need_tool_call = False
+                state.action = {}
+                state.finished = True
+                state.final_answer = (
+                    state.final_answer
+                    or "已达到本次运行的工具调用预算（时间或上下文额度用尽），以下基于已有信息作答。"
+                )
+                return state
+
         tools_schema = []
         tools_desc = "（无可用工具）"
         if self.tool_registry:
@@ -487,6 +513,9 @@ class ReActAgent:
             params=arguments,
             session_id=state.session_id,
             context=self._tool_context(state.principal),
+            principal=state.principal,          # 交给 Harness 做权限/业务范围/脱敏/审计
+            user_id=state.user_id,
+            iteration=state.iteration,
         )
 
         self._audit_tool_call(state.principal, tool_name, arguments, result, state.session_id)

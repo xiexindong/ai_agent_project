@@ -130,7 +130,10 @@ class Settings(BaseSettings):
     #   多 server 配置，JSON 数组：[{"name":"enterprise","command":["python","-m","x"]}]
     #   留空则回退到 main.py 里的默认单 server（向后兼容）
     mcp_servers_json: str = Field(default="", alias="MCP_SERVERS_JSON")
-
+    #   远程 MCP Server（HTTP 传输）：远端机器部署常驻 Server，Agent 当 Client 连它
+    #   只配这一个 URL 就能用，不必写完整 MCP_SERVERS_JSON
+    mcp_remote_url: str = Field(default="", alias="MCP_REMOTE_URL")                              # 远端 /mcp 地址，空=走 stdio 子进程
+    mcp_remote_token: str = Field(default="", alias="MCP_REMOTE_TOKEN")                          # Bearer 令牌（服务端设了 MCP_SERVER_TOKEN 才需要）
     # ---- Tool-RAG：按语义只召回本轮用得上的工具 ----
     tool_rag_enabled: bool = Field(default=True, alias="TOOL_RAG_ENABLED")                      # 关掉则每轮把全部工具塞给模型
     tool_rag_top_k: int = Field(default=5, alias="TOOL_RAG_TOP_K")                              # 语义召回几个工具
@@ -146,6 +149,41 @@ class Settings(BaseSettings):
     tool_rag_relative_ratio: float = Field(default=0.6, alias="TOOL_RAG_RELATIVE_RATIO")
     #   单轮最多暴露几个工具（技能绑定 + 语义召回合计），最后一道硬上限
     max_tools_per_turn: int = Field(default=8, alias="MAX_TOOLS_PER_TURN")
+
+    # ---- 工具 Harness：能力声明 / 调用前校验 / 人工审批 / 沙箱 / 预算 / 结果过滤 ----
+    # 【这一组配置在管什么】
+    #   模型只有"发起申请"的权利，能不能执行由这里决定：
+    #     风险等级 → 禁止执行 / 需人工批准 / 直接放行
+    #     调用前   → 参数、权限、业务范围、限流、预算五道中间件
+    #     执行时   → 按能力声明选沙箱；执行后 → 结果裁剪脱敏 + 审计
+    tool_harness_enabled: bool = Field(default=True, alias="TOOL_HARNESS_ENABLED")            # 总开关；关掉=改造前行为
+    tool_default_risk: str = Field(default="low", alias="TOOL_DEFAULT_RISK")                  # 工具未声明风险时的兜底等级
+    #   形如 "web_search:medium,mysql_exec:critical"，按名字/前缀覆盖工具自己声明的等级
+    tool_risk_overrides: str = Field(default="", alias="TOOL_RISK_OVERRIDES")
+    tool_deny_levels: str = Field(default="critical", alias="TOOL_DENY_LEVELS")               # 这些等级一律禁止执行
+    tool_approve_levels: str = Field(default="high,critical", alias="TOOL_APPROVE_LEVELS")    # 这些等级需人工批准
+    tool_deny_tools: str = Field(default="", alias="TOOL_DENY_TOOLS")                         # 工具名黑名单，支持 drop_* 前缀
+    tool_approve_tools: str = Field(default="", alias="TOOL_APPROVE_TOOLS")                   # 工具名审批白名单，支持前缀
+    tool_on_no_gate: str = Field(default="deny", alias="TOOL_ON_NO_GATE")                     # 需审批但未启用闸门时：deny|allow
+    # ---- 执行预算与循环控制 ----
+    tool_max_calls_per_run: int = Field(default=8, alias="TOOL_MAX_CALLS_PER_RUN")            # 单次会话最多调几次工具
+    tool_max_calls_per_tool: int = Field(default=5, alias="TOOL_MAX_CALLS_PER_TOOL")          # 单工具最多几次（防死循环）
+    tool_token_budget: int = Field(default=6000, alias="TOOL_TOKEN_BUDGET")                   # 回灌上下文的累计 token 预算
+    tool_run_timeout_seconds: float = Field(default=120.0, alias="TOOL_RUN_TIMEOUT_SECONDS")  # 单次运行墙钟超时
+    tool_result_max_chars: int = Field(default=2000, alias="TOOL_RESULT_MAX_CHARS")           # 工具返回值裁剪上限
+    # ---- 沙箱：none（进程内）/ subprocess（子进程）/ docker（容器）----
+    tool_sandbox_mode: str = Field(default="none", alias="TOOL_SANDBOX_MODE")                 # 全局默认隔离方式，工具可单独声明
+    tool_sandbox_timeout_seconds: float = Field(default=15.0, alias="TOOL_SANDBOX_TIMEOUT_SECONDS")
+    tool_sandbox_image: str = Field(default="python:3.11-slim", alias="TOOL_SANDBOX_IMAGE")   # 容器沙箱镜像（mode=docker）
+    # 远程沙箱（mode=remote）：把同一份类坐标 POST 给远端执行服务；连不上自动降级子进程
+    tool_sandbox_remote_url: str = Field(default="", alias="TOOL_SANDBOX_REMOTE_URL")         # 远端 /run 地址，空=未启用
+    tool_sandbox_remote_token: str = Field(default="", alias="TOOL_SANDBOX_REMOTE_TOKEN")     # 鉴权令牌，写到 X-Sandbox-Token 头
+    tool_sandbox_remote_timeout: float = Field(default=15.0, alias="TOOL_SANDBOX_REMOTE_TIMEOUT")
+    # ---- 工具调用限流（令牌桶）----
+    tool_rate_per_sec: float = Field(default=5.0, alias="TOOL_RATE_PER_SEC")                  # 全局补充速率（次/秒）
+    tool_rate_burst: int = Field(default=20, alias="TOOL_RATE_BURST")                         # 全局桶容量
+    tool_rate_per_user: float = Field(default=2.0, alias="TOOL_RATE_PER_USER")                # 单用户补充速率
+    tool_rate_burst_per_user: int = Field(default=8, alias="TOOL_RATE_BURST_PER_USER")        # 单用户桶容量
 
     # ---- 请求处理流水线（清洗 → 风控 → Token控制 → 意图识别 → 分支路由）----
     pipeline_risk_enabled: bool = Field(default=True, alias="PIPELINE_RISK_ENABLED")            # 风控节点（敏感词/注入检测）开关
@@ -189,6 +227,51 @@ class Settings(BaseSettings):
     multiagent_max_total_steps: int = Field(default=30, alias="MULTIAGENT_MAX_TOTAL_STEPS")     # 全团队总步数上限
     multiagent_timeout_seconds: float = Field(default=120.0, alias="MULTIAGENT_TIMEOUT_SECONDS")  # 团队总超时秒数
     multiagent_review_enabled: bool = Field(default=True, alias="MULTIAGENT_REVIEW_ENABLED")    # 团队结果是否再过一遍复核
+
+    # ---- 多 Agent 协调（一致性 / 仲裁 / 重规划）----
+    multiagent_consensus_enabled: bool = Field(default=True, alias="MULTIAGENT_CONSENSUS_ENABLED")    # 是否检测多个产出之间的一致性
+    multiagent_consensus_threshold: float = Field(default=0.35, alias="MULTIAGENT_CONSENSUS_THRESHOLD")  # 相似度低于此值判为冲突
+    multiagent_arbitration_enabled: bool = Field(default=True, alias="MULTIAGENT_ARBITRATION_ENABLED")  # 冲突时是否让审核者仲裁
+    multiagent_share_findings: bool = Field(default=True, alias="MULTIAGENT_SHARE_FINDINGS")            # 是否把成员产出共享到消息总线
+    multiagent_replan_enabled: bool = Field(default=False, alias="MULTIAGENT_REPLAN_ENABLED")           # 有人失败时是否让主管重规划（要多调一次 LLM）
+    multiagent_max_replans: int = Field(default=1, alias="MULTIAGENT_MAX_REPLANS")                      # 最多重规划几次
+
+    # ---- Human-in-the-Loop 人工介入 ----
+    # 【为什么默认关】开启后链路会在敏感动作处停下来等人，
+    #   没有人值守的场合会一直等到超时。这是需要人排班的运行模式，
+    #   必须由部署方显式打开，不能靠默认值悄悄生效。
+    hitl_enabled: bool = Field(default=False, alias="HITL_ENABLED")
+    hitl_kinds: str = Field(default="", alias="HITL_KINDS")                       # 启用哪些中断点，逗号分隔；留空=全部
+    hitl_sensitive_tools: str = Field(default="", alias="HITL_SENSITIVE_TOOLS")   # 需人工批准的工具名，逗号分隔；支持 mysql_* 前缀
+    hitl_timeout_seconds: float = Field(default=60.0, alias="HITL_TIMEOUT_SECONDS")   # 单次等待上限，超时按默认动作兜底
+
+    # ---- HITL 通知：中断抛出的那一刻怎么通知到人 ----
+    # 【为什么需要单独一组开关】中断请求登记后只是躺在内存里等人来取，
+    #   没有通知就是"系统自己按兜底动作处理了，人全程不知情"。
+    #   console 面向本地/CLI，webhook 面向钉钉飞书，SSE 面向审批页（无需开关，连上就有）。
+    hitl_notify_console: bool = Field(default=True, alias="HITL_NOTIFY_CONSOLE")                 # 中断时打印到终端(stderr)
+    hitl_notify_webhook: str = Field(default="", alias="HITL_NOTIFY_WEBHOOK")                    # 机器人地址；留空=不推送
+    hitl_notify_webhook_kind: str = Field(default="auto", alias="HITL_NOTIFY_WEBHOOK_KIND")      # auto/dingtalk/feishu/wecom/generic
+    hitl_notify_webhook_timeout: float = Field(default=3.0, alias="HITL_NOTIFY_WEBHOOK_TIMEOUT") # 推送超时（后台线程，不吃等待时间）
+
+    # ---- 中心化编排（限流 / 配额 / 防环 / 安全校验 / 观测）----
+    # 【这套参数调什么】
+    #   消息发不出去 → 先看 rate_per_sec / burst（限流）与 max_per_sender_round（配额）
+    #   两个 Agent 互相踢皮球 → 调小 max_hops 与 pingpong_limit
+    #   担心敏感信息外传 → 填 sensitive_words，并把 on_sensitive 设为 reject
+    orchestration_enabled: bool = Field(default=True, alias="ORCHESTRATION_ENABLED")                      # 关掉则消息直连总线（不推荐）
+    orchestration_max_hops: int = Field(default=2, alias="ORCHESTRATION_MAX_HOPS")                        # 一条对话链最多几跳
+    orchestration_max_per_run: int = Field(default=100, alias="ORCHESTRATION_MAX_PER_RUN")                 # 单次运行消息总量
+    orchestration_max_per_round: int = Field(default=30, alias="ORCHESTRATION_MAX_PER_ROUND")              # 单轮消息上限
+    orchestration_max_per_sender_round: int = Field(default=3, alias="ORCHESTRATION_MAX_PER_SENDER_ROUND") # 同一发送者单轮上限
+    orchestration_rate_per_sec: float = Field(default=20.0, alias="ORCHESTRATION_RATE_PER_SEC")            # 全局消息速率（条/秒）
+    orchestration_burst: int = Field(default=40, alias="ORCHESTRATION_BURST")                              # 令牌桶容量（瞬时突发）
+    orchestration_repeat_limit: int = Field(default=2, alias="ORCHESTRATION_REPEAT_LIMIT")                 # 相同内容最多几次
+    orchestration_pingpong_limit: int = Field(default=2, alias="ORCHESTRATION_PINGPONG_LIMIT")             # 双向各几次算踢皮球
+    orchestration_sensitive_words: str = Field(default="", alias="ORCHESTRATION_SENSITIVE_WORDS")          # 敏感词，逗号分隔
+    orchestration_on_sensitive: str = Field(default="redact", alias="ORCHESTRATION_ON_SENSITIVE")          # redact|reject
+    orchestration_max_content_chars: int = Field(default=4000, alias="ORCHESTRATION_MAX_CONTENT_CHARS")    # 单条正文上限
+    orchestration_trace_enabled: bool = Field(default=True, alias="ORCHESTRATION_TRACE_ENABLED")           # 是否记消息级 span
 
     # ---- 可选框架桥接（未安装也照常跑，装了按开关切换）----
     # 两个后端都不设为默认：llama-index 用独立索引（切过去旧知识库就空了），

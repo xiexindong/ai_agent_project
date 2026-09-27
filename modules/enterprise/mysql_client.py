@@ -46,7 +46,10 @@ class MySQLClient:
             # 【换账号】配了 mysql_readonly_user 就换成它，没配则沿用读写账号
             user, password = s.mysql_readonly_user, s.mysql_readonly_password
             
-        self._conn_args: dict[str, str | int] = dict(
+        # 【类型说明】这里必须是 Any 而不是 str | int：
+        #   下面 pymysql.connect(**self._conn_args) 会把字典解包成 host/port/user/... 等形参，
+        #   它们的类型各不相同（int/str/bool 都有），写成联合类型会导致解包时逐形参报类型不兼容
+        self._conn_args: dict[str, Any] = dict(
             host=s.mysql_host,          # 主机地址
             port=s.mysql_port,          # 端口
             user=user,                  # 账号（只读客户端会被换成只读账号）
@@ -129,7 +132,7 @@ class MySQLClient:
         conn = self._get_conn()     # 取/建连接
         with conn.cursor() as cur:  # 上下文管理器，游标自动关闭
             cur.execute(sql, args)
-            return cur.fetchall()   # 全部结果行
+            return list(cur.fetchall())   # 全部结果行；pymysql 返回 tuple，统一成 list 交付
 
     # 【什么】查单行
     # 【作用】返回 dict 或 None；惯用法是 `if not row: 拒绝`

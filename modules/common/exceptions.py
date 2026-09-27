@@ -62,7 +62,10 @@ class MCPException(AgentException):
 # 【作用】告诉类型检查器这条分支返回值仍是 R，调用方不用再判 None
 @overload
 def handle_exception(
-    default: R = ...,                  # 兜底值；类型需与被装饰函数返回值一致
+    # 【为什么是 Any 而不是 R】default 一旦参与 R 的推断，写 @handle_exception(default=None)
+    #   时 R 会被锁成 None，于是"被装饰函数必须返回 None"，所有带返回值的函数都会报类型不兼容。
+    #   改成 Any 后，R 只从被装饰函数本身推断，包装后返回值类型原样保留。
+    default: Any = ...,                # 兜底值；不参与返回值类型推断
     log_msg: str = "操作异常",        # 日志前缀，标明是哪个调用点出错
     reraise: Literal[False] = False,  # 固定 False：吞掉异常，返回 default
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...

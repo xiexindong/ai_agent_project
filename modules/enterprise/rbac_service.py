@@ -112,7 +112,11 @@ class RBACService:
         # 【边界】成功/失败结果都会进缓存，改权限最多延迟 60 秒生效；立即生效调 invalidate()
         # 【依赖警告】同一个 ck 被 _record_auth 用作审计里的 Key 摘要，改算法会对不上日志
         # ------------------------------------------------------------------
-        ck = hashlib.sha256(data=api_key.encode()).hexdigest()[:16]
+        # 【依赖警告】sha256 的入参必须按位置传，不能写成 sha256(data=...)。
+        #   实测 Python 3.13 下会抛 TypeError: openssl_sha256() got an unexpected
+        #   keyword argument 'data'；而本方法在 FastAPI 依赖里，异常没人接，
+        #   直接变成 HTTP 500 —— 表现是"带了 API Key 就 500，不带反而 401"。
+        ck = hashlib.sha256(api_key.encode()).hexdigest()[:16]
         hit = self._cache.get(ck)
         if hit and time.time() - hit[0] < self._ttl:
             return hit[1]
@@ -169,18 +173,67 @@ class RBACService:
         if row["user_status"] != 1:
             return AuthResult(False, None, "resigned", "账号已停用（离职/冻结）")
 
+        # ------------------------------------------------------------------
+        # 【查询 2/4】查这个人名下的全部角色（连角色自带的数据域与脱敏强度一起取）
+        #
+        #   【为什么 roles 语句要带 data_scope / mask_level】
+        #   这两个字段不属于"能不能做"（那是下面 perms 的事），而属于
+        #   "能看到多少、看到多清楚"，它们挂在角色上（见 mysql_init.sql 的 sys_role）：
+        #     data_scope  self 仅本人 / dept 本部门 / all 全公司
+        #     mask_level  0 不脱敏 / 1 部分脱敏 / 2 强脱敏
+        #   一人多角色时由下面第 205-206 行合并：域取最宽、脱敏取最强。
+        #
+        #   【为什么要单独查一次而不是并进上面那条 SQL】
+        #   上面 key→user 是一对一，user→role 是一对多，合并会让行重复且
+        #   user/tenant/dept 字段被复制多份；分两次查询读起来也更清楚。
+        #
+        #   【输入输出对照】
+        #     输入  user_id = 3（王五，财务专员 + 部门经理）
+        #     sys_user_role → [(3,2),(3,4)] → sys_role 取 R_FINANCE / R_MANAGER
+        #     输出  [{'role_code':'R_FINANCE','data_scope':'dept','mask_level':0},
+        #            {'role_code':'R_MANAGER','data_scope':'dept','mask_level':0}]
+        #           没分配角色时 → []：role_codes 空、data_scope 兜底 'self'（最窄）、mask_level 兜底 0
+        # ------------------------------------------------------------------
+        # 【什么】查用户名下的角色码 + 每个角色的数据域与脱敏强度
+        # 【作用】填充 Principal.roles / data_scope / mask_level 三个字段
         roles = db.query_all(
-            "SELECT r.role_code, r.data_scope, r.mask_level"
-            "  FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id"
-            " WHERE ur.user_id = %s",
-            (row["user_id"],),
+            "SELECT r.role_code, r.data_scope, r.mask_level"   # 角色码 / 数据域 / 脱敏强度
+            "  FROM sys_user_role ur JOIN sys_role r ON r.id = ur.role_id"  # 关联表：人 → 角色
+            " WHERE ur.user_id = %s",                          # 只查当前这个人
+            (row["user_id"],),                                 # 上面那条 key 查询拿到的 u.id
         )
+        # ------------------------------------------------------------------
+        # 【查询 3/4】查这个人名下的全部权限码（四表联查：人 → 角色 → 角色权限 → 权限点）
+        #
+        #   【为什么要 DISTINCT】一人多角色时，两个角色可能都挂着同一个权限点，
+        #   JOIN 会产出两行同样的 perm_code；不去重就会出现重复项。
+        #   （下面第 203 行又用 `{p["perm_code"] for p in perms}` 集合兜了一层，双保险）
+        #
+        #   【JOIN 链路】
+        #     sys_user_role       ur.user_id = %s        找出他的所有角色 id
+        #       → sys_role        r.id = ur.role_id      角色主体
+        #       → sys_role_permission rp.role_id = r.id  角色挂了哪些权限 id
+        #       → sys_permission  p.id = rp.perm_id      取出权限码 perm_code
+        #
+        #   【输入输出对照】
+        #     输入  user_id = 3（R_FINANCE + R_MANAGER）
+        #     输出  [{'perm_code':'tool:calculator'}, {'perm_code':'data:orders:dept'},
+        #            {'perm_code':'kb:finance:read'}, ...]
+        #           一个权限码一行；DISTINCT 保证不重复
+        #           没有任何权限时 → []，Principal.can() 对一切返回 False（默认拒绝）
+        #
+        #   【结果用在哪】permissions 集合 → Principal.can() 判定能不能调这个工具 /
+        #   查这份数据 / 用这个模型；权限码形如 tool:calculator、data:orders:all、
+        #   api:admin:*、model:deepseek-chat（* 支持前缀通配，见 models.py:62-63）
+        # ------------------------------------------------------------------
+        # 【什么】查用户名下的全部权限码（已去重）
+        # 【作用】填充 Principal.permissions，是"能不能做"的判据
         perms = db.query_all(
-            "SELECT DISTINCT p.perm_code"
-            "  FROM sys_user_role ur"
-            "  JOIN sys_role r ON r.id = ur.role_id"
-            "  JOIN sys_role_permission rp ON rp.role_id = r.id"
-            "  JOIN sys_permission p ON p.id = rp.perm_id"
+            "SELECT DISTINCT p.perm_code"                      # DISTINCT：多角色共有的权限只留一条
+            "  FROM sys_user_role ur"                          # ① 人 → 角色关联
+            "  JOIN sys_role r ON r.id = ur.role_id"           # ② 角色主体
+            "  JOIN sys_role_permission rp ON rp.role_id = r.id"  # ③ 角色 → 权限关联
+            "  JOIN sys_permission p ON p.id = rp.perm_id"     # ④ 权限点，取 perm_code
             " WHERE ur.user_id = %s",
             (row["user_id"],),
         )

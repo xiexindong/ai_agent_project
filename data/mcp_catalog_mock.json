@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "finance_reimbursement_query",
+      "description": "查询报销单状态与审批进度，返回当前审批节点与预计到账时间",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bill_id": {
+            "type": "string",
+            "description": "报销单号"
+          }
+        },
+        "required": [
+          "bill_id"
+        ]
+      },
+      "server": "finance-mcp"
+    },
+    {
+      "name": "finance_budget_balance",
+      "description": "查询部门预算余额与使用率，返回年度预算、已用额度、剩余额度",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dept_code": {
+            "type": "string",
+            "description": "部门编码"
+          }
+        },
+        "required": [
+          "dept_code"
+        ]
+      },
+      "server": "finance-mcp"
+    },
+    {
+      "name": "finance_invoice_submit",
+      "description": "提交发票并校验真伪，返回校验结果与发票明细",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "invoice_code": {
+            "type": "string",
+            "description": "发票代码"
+          },
+          "amount": {
+            "type": "string",
+            "description": "开票金额"
+          }
+        },
+        "required": [
+          "invoice_code"
+        ]
+      },
+      "server": "finance-mcp"
+    },
+    {
+      "name": "hr_leave_balance",
+      "description": "查询员工年假与调休余额，返回可用天数与过期时间",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "user_code": {
+            "type": "string",
+            "description": "员工工号"
+          }
+        },
+        "required": [
+          "user_code"
+        ]
+      },
+      "server": "hr-mcp"
+    },
+    {
+      "name": "hr_attendance_query",
+      "description": "查询员工考勤打卡记录，返回当日上下班打卡时间",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "user_code": {
+            "type": "string",
+            "description": "员工工号"
+          },
+          "date": {
+            "type": "string",
+            "description": "日期，如 2026-09-23"
+          }
+        },
+        "required": [
+          "user_code"
+        ]
+      },
+      "server": "hr-mcp"
+    },
+    {
+      "name": "hr_org_chart",
+      "description": "查询组织架构与汇报关系，返回部门负责人与上级部门",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dept_code": {
+            "type": "string",
+            "description": "部门编码"
+          }
+        },
+        "required": [
+          "dept_code"
+        ]
+      },
+      "server": "hr-mcp"
+    },
+    {
+      "name": "it_ticket_create",
+      "description": "创建 IT 运维工单，返回工单号与受理人",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "工单标题"
+          },
+          "priority": {
+            "type": "string",
+            "description": "优先级：高/中/低"
+          }
+        },
+        "required": [
+          "title"
+        ]
+      },
+      "server": "it-mcp"
+    },
+    {
+      "name": "it_asset_query",
+      "description": "查询办公资产与领用记录，返回资产型号与领用人",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "asset_id": {
+            "type": "string",
+            "description": "资产编号"
+          }
+        },
+        "required": [
+          "asset_id"
+        ]
+      },
+      "server": "it-mcp"
+    },
+    {
+      "name": "it_server_health",
+      "description": "查询服务器健康与负载，返回 CPU、内存、磁盘使用率",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "主机名或 IP"
+          }
+        },
+        "required": [
+          "host"
+        ]
+      },
+      "server": "it-mcp"
+    },
+    {
+      "name": "data_city_weather",
+      "description": "查询指定城市的实时天气与温度，返回天气状况与气温",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "城市名"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "server": "data-mcp"
+    },
+    {
+      "name": "data_stock_quote",
+      "description": "查询股票实时行情与涨跌幅，返回最新价与涨跌百分比",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "股票代码"
+          }
+        },
+        "required": [
+          "symbol"
+        ]
+      },
+      "server": "data-mcp"
+    },
+    {
+      "name": "data_text_translate",
+      "description": "多语言文本互译，返回翻译后的文本",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "待翻译文本"
+          },
+          "target_lang": {
+            "type": "string",
+            "description": "目标语言，如 en / ja"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "server": "data-mcp"
+    }
+  ]
+}

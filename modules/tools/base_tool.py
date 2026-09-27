@@ -51,6 +51,9 @@ class ToolResult:
     result: Any = None       # 成功返回值，任意类型（int / dict / list）
     error: str = ""          # 失败原因，会回喂给 LLM 让它改策略
     duration_ms: int = 0     # 执行耗时毫秒，由 run() 自动填充
+    # 【什么】附加信息（Harness 写入：风险等级、是否被裁剪/脱敏、拦截码）
+    # 【作用】不改主字段就能带上治理信息；默认空字典，旧代码无感
+    meta: dict = field(default_factory=dict)
 
     # 【什么】把结果对象转成普通字典
     # 【作用】便于序列化进日志、链路或接口返回体
@@ -60,6 +63,7 @@ class ToolResult:
             "result": self.result,
             "error": self.error,
             "duration_ms": self.duration_ms,
+            "meta": dict(self.meta or {}),
         }
 
 
@@ -73,6 +77,19 @@ class BaseTool(ABC):
     【继承关系类比】类似前端 React 的 BaseComponent / 后端 NestJS 的 BaseController——
     把所有工具的"通用骨架"放这里，子类只填自己的业务逻辑。
     """
+
+    # ------------------------------------------------------------------
+    # 【能力声明】Harness 据此裁决：风险多高、要不要人批准、在哪执行、需要什么权限
+    #
+    #   子类可用三种写法之一覆盖：
+    #     capability = {"risk": "high", "side_effect": True, "sandbox": "subprocess"}
+    #     capability = ToolCapability(name="xxx", risk=RiskLevel.HIGH, ...)
+    #     def capability(self): return ToolCapability(...)
+    #
+    #   不声明 = None，Harness 按 TOOL_DEFAULT_RISK（默认 low）处理，
+    #   即"只读、可直接执行"——与接入 Harness 之前的行为一致。
+    # ------------------------------------------------------------------
+    capability: Any = None
 
     # 【什么】构造函数：固化工具的三要素
     # 【作用】把调用方传进来的原始 parameters 归一成标准 schema
@@ -122,8 +139,10 @@ class BaseTool(ABC):
 
     # 【什么】工具真正的业务逻辑（子类必须实现）
     # 【作用】只负责干活；参数校验与结果封装由 run() 统一代劳
+    # 【签名为什么是 *args, **kwargs】各工具入参不同（calculator 收 expression、
+    #   data_query 收 sql 等），基类只能放开参数形态，具体参数由子类声明。
     @abstractmethod
-    def execute(self, **kwargs) -> ToolResult:
+    def execute(self, *args, **kwargs) -> ToolResult:
         """执行工具逻辑，子类实现。"""
         pass
 
