@@ -18,6 +18,8 @@ from modules.multiagent.models import (
     AgentMessage,
     ConsensusResult,
     MessageKind,
+    DelegationRecord,
+    DelegationDecision,
     json_schema_hint,
 )
 # 【什么】从 coordination 导入三个协调组件与相似度工具
@@ -40,6 +42,14 @@ from modules.multiagent.agents import (
     RunContext,
     build_agent,
     build_default_team,
+)
+# 【什么】从 delegation 导入委派的三个组件
+# 【作用】策略（四条边界）、台账（记账 + 防环）、执行器（真跑一次并回传）
+from modules.multiagent.delegation import (
+    DelegationExecutor,
+    DelegationLedger,
+    DelegationPolicy,
+    decide_delegation,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,7 +86,9 @@ __all__ = [
     "AgentRole", "AgentSpec", "SubTask", "PlanResult", "AgentOutput", "TraceEvent",
     "RunResult", "RunStatus", "TeamConfig", "EvalCase", "EvalResult", "EvalReport",
     "AgentMessage", "ConsensusResult", "MessageKind",
+    "DelegationRecord", "DelegationDecision",
     "json_schema_hint",
+    "DelegationPolicy", "DelegationLedger", "DelegationExecutor", "decide_delegation",
     "BaseAgent", "SupervisorAgent", "WorkerAgent", "ReviewerAgent", "RunContext",
     "build_agent", "build_default_team",
     "AgentHarness", "build_harness", "CrewAIBackend",

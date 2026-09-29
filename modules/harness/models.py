@@ -192,7 +192,9 @@ class ToolPolicy:
         if cap.risk.rank <= RiskLevel.LOW.rank and self.default_risk.rank > risk.rank:
             risk = self.default_risk                      # 工具没声明 → 用默认等级
         for pattern, level in self.overrides.items():
+            # 【作用】按名字查配置有没有给这个工具单独定级（如 web_search:medium）；命中即覆盖工具声明并停止后续比对
             if self._match(cap.name, (pattern,)):
+                # 【作用】把配置写的等级字符串（"medium"）转成枚举，替换掉工具自己声明的等级
                 risk = RiskLevel.parse(level)             # 配置覆盖优先于工具声明
                 break
         if risk is cap.risk:

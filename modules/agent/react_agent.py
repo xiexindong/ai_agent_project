@@ -14,6 +14,7 @@ from modules.common.exceptions import LLMException, ToolException, handle_except
 from modules.common.validator import sanitize_input, check_prompt_injection, repair_json
 from modules.agent.llm import LLMClient
 from modules.agent.state import AgentState
+from modules.agent.planner import STATUS_DONE, STATUS_FAILED, ExecutionPlan
 from modules.prompt import PromptBuilder, get_registry
 
 _logger = get_logger("react")
@@ -50,6 +51,7 @@ class ReActAgent:
         skill_registry=None,                       # 技能注册表，为 None 则不走 SOP
         router=None,                               # L0 路由层，为 None 则每轮面对全部工具
         tool_harness=None,                         # 工具 Harness；为 None 则不做能力裁决/预算/沙箱治理
+        planner=None,                              # 任务规划器；为 None 时按配置自建（关闭则不规划）
     ):
         self.llm = llm_client or LLMClient()        # LLM 客户端
         self.tool_registry = tool_registry          # 工具注册表
@@ -86,6 +88,30 @@ class ReActAgent:
             max_context_tokens=s.max_prompt_context_tokens,            # 上下文 token 预算，超了由 builder 裁剪
         )
         self.system_prompt = self._builder.system_prompt()             # 每轮都一样，算一次存着复用
+
+        # ------------------------------------------------------------------
+        # 【任务规划器（Plan-and-Execute）】复杂流程先拆步骤再逐步执行
+        #   默认关闭：AGENT_PLANNING_ENABLED=False 时 planner=None，
+        #   should_plan() 恒为 False，整条链路与改造前逐字一致。
+        #   开了也只是"判定为复杂流程才规划"，简单问题不付这次 LLM 的钱。
+        # ------------------------------------------------------------------
+        self.planner = planner
+        if self.planner is None:
+            try:
+                if bool(getattr(s, "agent_planning_enabled", False)):
+                    from modules.agent.planner import TaskPlanner
+                    self.planner = TaskPlanner(
+                        llm=self.llm,
+                        enabled=True,
+                        min_score=int(getattr(s, "agent_planning_min_score", 2) or 2),
+                        max_steps=int(getattr(s, "agent_planning_max_steps", 6) or 6),
+                        replan_enabled=bool(getattr(s, "agent_planning_replan_enabled", True)),
+                        max_replans=int(getattr(s, "agent_planning_max_replans", 1) or 1),
+                    )
+                    _logger.info("任务规划器已启用（Plan-and-Execute）")
+            except Exception as e:
+                _logger.warning(f"任务规划器装配失败（按无规划运行）: {e}")
+                self.planner = None
 
     # 【什么】开跑前的准备工作：清洗、注入检测、技能、记忆、RAG
     # 【作用】把这些一次性召回塞进 state，ReAct 每轮只读不再重算
@@ -283,6 +309,112 @@ class ReActAgent:
         except Exception as e:
             _logger.warning(f"工具审计写入失败: {e}")
 
+    # ------------------------------------------------------------------
+    # 规划（Plan-and-Execute）：判定 → 拆步骤 → 逐步推进 → 走偏重排
+    # ------------------------------------------------------------------
+    # 【什么】这条 query 值不值得先规划
+    # 【作用】只有"复杂流程"才进 plan 节点；简单问题走原 ReAct，省一次 LLM 调用
+    def should_plan(self, state: AgentState) -> bool:
+        """是否需要规划：规划器未启用 / 已有计划 → 一律不规划。"""
+        if self.planner is None or state.sub_tasks:
+            return False                                   # 已有计划：重规划只在步骤失败时发生，不在这里
+        return self.planner.needs_planning(state.user_query, state.skill_context)
+
+    # 【什么】生成执行计划并写进 state
+    # 【作用】plan 节点的业务体；计划以结构化步骤存进 sub_tasks，可随 state 断点续跑
+    def plan_step(self, state: AgentState) -> AgentState:
+        """生成执行计划。规划不可用时 planner 会返回单步计划，行为等同不规划。"""
+        if self.planner is None:
+            return state
+        plan = self.planner.create_plan(
+            state.user_query,
+            tools_desc=self._tools_overview(),
+            skill_context=state.skill_context,
+        )
+        self._save_plan(state, plan)
+        _logger.info(f"计划已写入 state: {len(state.sub_tasks)} 步 | 思路={state.plan_rationale[:40]}")
+        return state
+
+    # 【什么】从 state 还原执行计划对象
+    # 【作用】state 里存的是 dict（LangGraph 只认 dict），业务操作前转回对象
+    def _plan_of(self, state: AgentState) -> "Optional[ExecutionPlan]":
+        if not state.sub_tasks:
+            return None
+        return ExecutionPlan.from_dict({
+            "query": state.user_query,
+            "rationale": state.plan_rationale,
+            "steps": state.sub_tasks,
+            "replan_count": state.plan_replan_count,
+        })
+
+    # 【什么】把计划写回 state
+    # 【作用】步骤列表 + 思路 + 重规划次数 + 指针（指向第一个待做步骤）
+    def _save_plan(self, state: AgentState, plan: "ExecutionPlan") -> None:
+        state.sub_tasks = [s.to_dict() for s in plan.steps]
+        state.plan_rationale = plan.rationale
+        state.plan_replan_count = plan.replan_count
+        state.current_task_index = next(
+            (i for i, s in enumerate(plan.steps) if s.is_open), len(plan.steps)
+        )
+
+    # 【什么】渲染注入 prompt 的计划进度
+    # 【作用】让模型每轮看见"总计划 + 已完成 + 当前步"；没有计划时返回空串（prompt 一字不改）
+    def _plan_context(self, state: AgentState) -> str:
+        plan = self._plan_of(state)
+        if plan is None:
+            return ""
+        return plan.progress_text()
+
+    # 【什么】把计划段落并进 messages
+    # 【作用】追加到最后一条 user 消息末尾；模板槽位固定 8 个，多传会被丢弃，
+    #         所以计划不走槽位而是直接拼在 user 内容里（无计划时完全不动 messages）
+    @staticmethod
+    def _with_plan(rec: dict, plan_text: str) -> dict:
+        messages = list(rec.get("messages") or [])
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                msg = dict(messages[i])
+                msg["content"] = f"{msg.get('content', '')}\n\n{plan_text}"
+                messages[i] = msg
+                break
+        out = dict(rec)
+        out["messages"] = messages
+        return out
+
+    # 【什么】工具清单概览（给规划器看）
+    # 【作用】规划要知道有哪些工具可用，步骤才能落到具体工具上（tool_hint）
+    def _tools_overview(self) -> str:
+        if not self.tool_registry:
+            return ""
+        return "\n".join(
+            f"- {t.name}: {getattr(t, 'description', '')}"
+            for t in self.tool_registry.list_tools()
+        )
+
+    # 【什么】一步做完之后推进计划
+    # 【作用】标记当前步结果、指针前移；失败且允许重规划时只重排剩余步骤
+    def _advance_plan(self, state: AgentState, tool_name: str, result) -> None:
+        """推进计划：成功→done，失败→failed（并按配置重排剩余步骤）。"""
+        plan = self._plan_of(state)
+        if plan is None:
+            return
+        step = plan.current()
+        if step is None:
+            return
+        ok = bool(getattr(result, "success", False))
+        brief = str(getattr(result, "result", ""))[:200] if ok else str(getattr(result, "error", ""))[:200]
+        plan.mark(step.id, STATUS_DONE if ok else STATUS_FAILED, brief)
+        state.task_results.append({
+            "id": step.id, "instruction": step.instruction, "tool": tool_name,
+            "status": STATUS_DONE if ok else STATUS_FAILED, "result": brief,
+        })
+        if not ok and self.planner is not None:
+            plan = self.planner.replan(plan, observation=state.observation or "",
+                                       tools_desc=self._tools_overview())
+        self._save_plan(state, plan)
+        _logger.info(f"计划推进: {step.id} → {'完成' if ok else '失败'} | "
+                     f"进度 {len(plan.done())}/{len(plan.steps)}")
+
     # 【什么】ReAct 的 Reason 步骤：让模型决定调工具还是直接答
     # 【作用】一次调用改写 need_tool_call / action / final_answer，决定图的下一跳
     def reason_step(self, state: AgentState) -> AgentState:
@@ -406,6 +538,13 @@ class ReActAgent:
         )
         if rec["trimmed"]:
             _logger.warning(f"提示词上下文超预算已裁剪: {rec['trimmed']}")
+
+        # 【计划上下文注入】有计划时把"总计划 + 已完成 + 当前步"并进 user 消息；
+        #   没有计划（未开启或不复杂）时 plan_text 为空，messages 一字不动
+        plan_text = self._plan_context(state)
+        if plan_text:
+            rec = self._with_plan(rec, plan_text)
+            _logger.info(f"计划上下文已注入 prompt（{len(plan_text)} 字）")
 
         result = self.llm.invoke_with_tools(
             messages=rec["messages"],
@@ -535,6 +674,9 @@ class ReActAgent:
         else:
             state.observation = f"工具执行失败: {result.error}"
             _logger.warning(f"工具执行失败: {tool_name} | {result.error}")
+
+        # 【推进计划】本步结果入账、指针前移；失败时按配置只重排剩余步骤
+        self._advance_plan(state, tool_name, result)
 
         state.action = {}
         return state

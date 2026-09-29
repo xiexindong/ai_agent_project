@@ -22,6 +22,7 @@ Harness 是「把 Agent 跑起来」的那层底座，Agent 本身只负责思�
 """
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from modules.common.logger import get_logger
@@ -38,10 +39,16 @@ from modules.multiagent.coordination import (
     MessageBus,
     ReplanController,
 )
+from modules.multiagent.delegation import (
+    DelegationExecutor,
+    DelegationLedger,
+    DelegationPolicy,
+)
 from modules.multiagent.models import (
     AgentOutput,
     AgentRole,
     AgentSpec,
+    DelegationRecord,
     EvalCase,
     EvalReport,
     EvalResult,
@@ -99,6 +106,14 @@ class AgentHarness:
         self.consensus = Consensus(threshold=self.config.consensus_threshold)   # 相似度低于阈值判冲突
         self.bus = MessageBus()                                                 # 成员横向消息总线（存储与检索）
         self.replan = ReplanController(supervisor=None, max_replans=self.config.max_replans)
+        # ------------------------------------------------------------------
+        # 【委派治理】策略从团队配置搬一次；台账与执行器按「每次运行」建，
+        #   原因是委派次数是"这一轮问题"的预算，不该被上一轮吃掉。
+        #   默认 delegation_enabled=False：不进委派分支，行为与改造前一致。
+        # ------------------------------------------------------------------
+        self.delegation_policy = DelegationPolicy.from_config(self.config)
+        self._delegation_ledger: Optional[DelegationLedger] = None      # 当前运行的台账
+        self._delegation_executor: Optional[DelegationExecutor] = None  # 当前运行的执行器
         # ------------------------------------------------------------------
         # 【编排治理四件套的装配】
         #   tracer  观测：每次运行一条 trace，每环节一个 span
@@ -211,6 +226,111 @@ class AgentHarness:
                 _logger.debug(f"事件回调异常（忽略）: {e}")
 
     # ----------------------------------------------------------------------
+    # 委派（Delegation）：执行者把活转给别人
+    # ----------------------------------------------------------------------
+    # 【什么】为一次运行新建委派台账与执行器
+    # 【作用】每次 run 都要新建：委派次数是"这一轮问题"的预算，不能跨轮累计
+    def _new_delegation(self, ctx: RunContext, result: Optional[RunResult] = None) -> DelegationExecutor:
+        """建本次运行的委派台账与执行器，并挂到 ctx 上供所有 Agent 使用。
+
+        【为什么执行器里跑子任务用的是 replace(ctx)】
+            受托方要知道"我现在在第几层委派、委派链上都有谁"，
+            这是递归防环的依据；用 replace 复制一份 ctx 改这三个字段，
+            既共享上游产出（同一个 upstream 引用），又不会污染委派方的上下文。
+        """
+        roster = {a.spec.name: a.spec for a in self.agents.values()}
+        ledger = DelegationLedger(self.delegation_policy, roster=roster)
+        self._delegation_ledger = ledger
+
+        # 【委派事件写进 trace】放行与拒绝都记：
+        #   "根本没转"和"想转但被治理拦了"在排查时是两件事
+        def _on_event(rec: Optional[DelegationRecord], note: str) -> None:
+            if result is None:
+                return
+            if rec is None:
+                self._emit(result, "delegate", f"委派未放行: {note}")
+                return
+            self._emit(result, "delegate", f"{rec.label} {note}", rec.from_agent,
+                       to=rec.to_agent, depth=rec.depth, success=rec.success,
+                       task_id=rec.parent_task_id)
+            # 【委派产出共享到总线】让队友看到"这块已经有人做了"，
+            #   否则同一件事可能被第二个人重复查一遍
+            if rec.success and self.config.share_findings and rec.content:
+                self.orchestrator.send(
+                    rec.from_agent, f"（委派 {rec.to_agent} 的产出）{rec.content[:300]}",
+                    kind=MessageKind.FINDING, sender_role="worker",
+                    ref_task_id=rec.parent_task_id,
+                    run_id=result.run_id if result is not None else "",
+                )
+
+        def _run_fn(agent_name: str, task: SubTask, extra: dict) -> AgentOutput:
+            agent = self.agents.get(agent_name)
+            if agent is None:
+                return AgentOutput.failed(agent_name, task.id, f"未注册的 Agent: {agent_name}")
+            info = extra.get("extra", {})
+            sub_ctx = replace(
+                ctx,
+                delegation_depth=int(info.get("delegation_depth", 0)),
+                delegation_chain=list(info.get("delegation_chain", []) or []),
+                delegated_by=str(info.get("delegated_by", "") or ""),
+            )
+            # ------------------------------------------------------------------
+            # 【委派也要进 span 树】挂在根 span 下：
+            #   直接跑 agent.run 的话，链路里只看得到"多了一个 agent 在跑"，
+            #   看不出它是主管派的还是中途被转来的、转了几层；
+            #   包一层 kind="delegate" 的 span 后，
+            #   前端按 trace_id 画出的时间线上能看到"这里发生了一次转派"。
+            # ------------------------------------------------------------------
+            trace = self.last_trace
+            if trace is None:                       # 没进 run（显式委派 API）时没有 trace 可挂
+                return agent.run(task, sub_ctx)
+            with self.tracer.span(
+                trace, f"delegate.{info.get('delegated_by', '')}→{agent_name}",
+                kind="delegate", parent_id=getattr(trace, "root_id", ""), task_id=task.id,
+            ) as dsp:
+                dsp.inputs.update({
+                    "instruction": task.instruction[:200],
+                    "from": str(info.get("delegated_by", "") or ""),
+                    "depth": int(info.get("delegation_depth", 0)),
+                    "chain": list(info.get("delegation_chain", []) or []),
+                })
+                out = agent.run(task, sub_ctx)
+                dsp.set_io(outputs={"success": out.success, "chars": len(out.content or "")})
+                return out
+
+        self._delegation_executor = DelegationExecutor(
+            run_fn=_run_fn, ledger=ledger, roster=roster, on_event=_on_event,
+        )
+        ctx.delegation = self._delegation_executor
+        if self.delegation_policy.enabled:
+            _logger.info("委派能力已启用: "
+                         f"depth<={self.delegation_policy.max_depth} "
+                         f"总次数<={self.delegation_policy.max_per_run} "
+                         f"单人<={self.delegation_policy.max_per_agent}")
+        return self._delegation_executor
+
+    # 【什么】显式委派一次（API / 主管 / 重规划后都能调）
+    # 【作用】给"代码决定转派"的场景一个正式入口，治理与 run 内委派完全一致
+    def delegate(self, from_agent: str, to_agent: str, instruction: str, *,
+                 query: str = "", session_id: str = "", parent_task_id: str = "",
+                 reason: str = "") -> Optional[DelegationRecord]:
+        """显式委派一次。被治理拒绝时返回 None（调用方照常自己处理）。
+
+        【输入输出对照】
+            h.delegate("analyst_1", "researcher_1", "查 Q3/Q4 营收", query="营收环比多少")
+            → DelegationRecord(from_agent="analyst_1", to_agent="researcher_1", success=True, ...)
+            → 受托方不存在 / 超深度 / 成环 → None
+        """
+        if self._delegation_executor is None:
+            ctx = RunContext(query=query, session_id=session_id, bus=self.obus, gate=self.gate)
+            self._new_delegation(ctx)
+        assert self._delegation_executor is not None
+        return self._delegation_executor.delegate(
+            from_agent=from_agent, to_agent=to_agent, instruction=instruction,
+            parent_task_id=parent_task_id, depth=0, reason=reason,
+        )
+
+    # ----------------------------------------------------------------------
     # 编排：DAG 分批
     # ----------------------------------------------------------------------
     # 【什么】把子任务按依赖分成若干批
@@ -290,6 +410,8 @@ class AgentHarness:
         #   Agent 读消息走总线，发消息必经编排器。
         ctx = RunContext(query=query, mm=mm, session_id=session_id,
                          bus=self.obus, gate=self.gate)
+        # 【委派装配】必须在派活之前：Agent.run 里要靠 ctx.delegation 转派
+        self._new_delegation(ctx, result)
         self.bus.clear()      # 上一轮的消息不跨运行，避免旧异议影响本轮
         deadline = started + self.config.timeout_seconds   # 整次运行的绝对截止时刻（秒级 epoch）
         steps_used = 0                                      # 累计已消耗的推理步数，用于卡 max_total_steps
@@ -561,6 +683,15 @@ class AgentHarness:
             if self.gate is not None:
                 self.gate.cancel_waiting()
             # ------------------------------------------------------------------
+            # 【委派台账收口】无论从哪条路径退出，本次转派过的活都要进结果。
+            #   放在 finally 里是因为 run 有多个 return（直接答、人工终止、超时、异常），
+            #   和 span 快照同理：失败的那次恰恰最需要看"活被转给了谁"。
+            # ------------------------------------------------------------------
+            if self._delegation_ledger is not None:
+                result.delegations = list(self._delegation_ledger.records)
+                if self._delegation_ledger.records or self._delegation_ledger.denials:
+                    _logger.info(f"委派汇总: {self._delegation_ledger.summary()}")
+            # ------------------------------------------------------------------
             # 【收口：关根 span、封 trace、把 span 快照写进结果】
             #   放在 finally 里是因为 run 有多处 return（直接答、人工终止、
             #   超时、异常），任何一条路径退出都要留下完整链路，
@@ -817,6 +948,13 @@ def build_harness(llm=None, tool_registry=None, gate=None, **cfg_kwargs) -> Agen
         share_findings=cfg_kwargs.pop("share_findings", s.multiagent_share_findings),
         replan_enabled=cfg_kwargs.pop("replan_enabled", s.multiagent_replan_enabled),
         max_replans=cfg_kwargs.pop("max_replans", s.multiagent_max_replans),
+        # ---- 委派：与上面同一套优先级（显式 > .env > 默认值），默认关闭 ----
+        delegation_enabled=cfg_kwargs.pop("delegation_enabled", s.multiagent_delegation_enabled),
+        delegation_max_depth=cfg_kwargs.pop("delegation_max_depth", s.multiagent_delegation_max_depth),
+        delegation_max_per_run=cfg_kwargs.pop(
+            "delegation_max_per_run", s.multiagent_delegation_max_per_run),
+        delegation_max_per_agent=cfg_kwargs.pop(
+            "delegation_max_per_agent", s.multiagent_delegation_max_per_agent),
         hitl_enabled=cfg_kwargs.pop("hitl_enabled", s.hitl_enabled),
         # ---- 编排治理：与上面的协调参数同一套优先级（显式 > .env > 默认值）----
         orchestration_enabled=cfg_kwargs.pop("orchestration_enabled", s.orchestration_enabled),

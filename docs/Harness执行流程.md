@@ -2,6 +2,10 @@
 
 > 目标：把「模型说要调工具」到「结果回灌 prompt」之间发生的一切，按顺序讲清楚。
 > 代码位置：`modules/harness/*`，串起来的地方是 `modules/tools/tool_registry.py` 的 `execute_tool`。
+>
+> **别混名**：本篇是**工具侧**流程。
+> 多 Agent 的团队运行时是另一个同名文件 `modules/multiagent/harness.py`，
+> 骨架见 [`多AgentHarness执行流程骨架.md`](./多AgentHarness执行流程骨架.md)。
 
 ---
 

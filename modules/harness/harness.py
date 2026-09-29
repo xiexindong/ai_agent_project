@@ -50,7 +50,7 @@ from modules.harness.models import (
     ACTION_APPROVE, ACTION_DENY, RiskLevel, ToolCallRequest, ToolCapability, ToolPolicy, ToolVerdict,
 )
 from modules.harness.result_filter import ResultFilter, ResultFilterConfig
-from modules.harness.sandbox import MODE_DOCKER, MODE_NONE, MODE_REMOTE, InProcessRunner, build_sandbox
+from modules.harness.sandbox import MODE_DOCKER, MODE_NONE, MODE_REMOTE, InProcessRunner, SandboxRunner, build_sandbox
 from modules.tools.base_tool import ToolResult
 
 _logger = get_logger("harness")
@@ -130,8 +130,46 @@ class ToolHarness:
     # 【作用】工具可以声明 capability（属性/方法/dict），没声明就按默认等级兜底
     def capability_of(self, tool: Any) -> ToolCapability:
         raw = getattr(tool, "capability", None)
+        # ------------------------------------------------------------------
+        # 【if callable(raw)】判断"这份声明是方法还是值"
+        #   工具可以把 capability 写成三种形态：属性（ToolCapability 实例）/ 方法 / dict。
+        #   属性与 dict 已经是值，直接往下走 isinstance 判断即可；
+        #   只有方法形态必须先调一次（见下面 raw = raw()），否则拿到的是方法对象本身。
+        #
+        # 【try 包的是谁的代码】包的是工具作者写的 capability 方法
+        #   它可能读配置、查库、取环境变量，抛出来的类型不可控
+        #   （KeyError / AttributeError / 连接错都可能有），
+        #   所以这里捕获 Exception 而不是具体某一类异常。
+        #
+        # 【输入输出对照】
+        #   raw = <bound method X.capability>   → callable=True  → 进 try，调用后拿到声明
+        #   raw = ToolCapability(risk=LOW)      → callable=False → 走 isinstance 的工具实例分支
+        #   raw = {"risk": "high"}              → callable=False → 走 dict 分支（按字段解析）
+        #   raw = None                          → callable=False → 走 policy.default_risk 兜底
+        #
+        # 【边界】判断顺序固定：先 callable，再 None / isinstance，最后兜底。
+        #   顺序调整（例如把 isinstance 提到 callable 前面）会让方法形态漏判，
+        #   声明静默失效——不报错，但风险等级回落到默认值。
+        # ------------------------------------------------------------------
+        
+        # 它是 Python 的一个内置函数，专门用来检查一个对象能不能被“调用”
         if callable(raw):
             try:
+                # ------------------------------------------------------------------
+                # 【raw 在这一行的作用】从"能取到声明的东西"变成"声明本身"
+                #   raw 是工具挂出来的 capability，可能是属性、方法、dict 三选一：
+                #   callable(raw) 为真说明工具把它写成了方法，
+                #   不调用就拿不到里面的内容，下面 142/144 行的 isinstance 判断会全部落空，
+                #   结果是按 155 行的默认风险等级兜底（工具声明白写了）。
+                #
+                # 【输入输出对照】
+                #   调用前：raw = <bound method CalculatorTool.capability>   # 只是个方法对象
+                #   调用后：raw = ToolCapability(name="calculator", risk=RiskLevel.LOW)
+                #   方法内部抛异常时：raw = None → 走 140 行按 policy.default_risk 兜底
+                #
+                # 【边界】这一步只降级不中断：
+                #   一个工具的声明写错，不该让整批工具都注册不进来
+                # ------------------------------------------------------------------
                 raw = raw()
             except Exception as e:
                 _logger.warning(f"工具能力声明读取失败: {getattr(tool, 'name', '?')} | {e}")
@@ -139,6 +177,7 @@ class ToolHarness:
         name = getattr(tool, "name", "") or ""
         if raw is None:
             cap = ToolCapability(name=name, risk=self.policy.default_risk)
+            # isinstance() 是 Python 里最常用的内置函数之一，用来判断一个对象是不是某个类型
         elif isinstance(raw, ToolCapability):
             cap = raw
         elif isinstance(raw, dict):
@@ -158,7 +197,10 @@ class ToolHarness:
     # 【什么】登记一个工具的能力
     # 【作用】注册时调一次，之后裁决不再重复解析；返回生效后的能力
     def register(self, tool: Any) -> ToolCapability:
+        # 【作用】像给工具办一张通行证：工具自己填的、配置里改的、没填就按默认的，
+        #         三份说法在这里一次性定下来（只算这一次，之后都查表）
         cap = self.capability_of(tool)
+        # 【作用】存进能力台账，之后裁决直接按工具名查表，不再重复解析
         self._capabilities[cap.name] = cap
         if cap.needs_approval or cap.risk.rank >= RiskLevel.HIGH.rank:
             _logger.info(f"工具能力登记: {cap.name} | 风险={cap.risk.value} | "
@@ -191,15 +233,40 @@ class ToolHarness:
         不过就是不过，真实服务不会收到请求 —— 副作用不会先发生再回滚。
         顺序固定：① 策略裁决（配置层面封死）→ ② 五道中间件 → ③ 人工审批。
         """
+        # ------------------------------------------------------------------
+        # 【这三关在干什么】"让不让调"的三道关卡，顺序固定不能换
+        #   比喻：工具出门干活前，先查黑名单（策略）→ 过安检（中间件）→
+        #         高风险的再找人签字（人工批准）；任一关不过就出不了门。
+        #
+        # 【顺序为什么不能换】按"拦住它的代价"从低到高排：
+        #   策略只查一张表（最便宜）→ 中间件要校验参数/权限/配额（中等）→
+        #   人工要等人（最贵）。反过来先把人叫来、再发现工具在黑名单里，就白等一场。
+        #
+        # 【输出】三选一：block（拦截 + 中文原因）/ 转人工 / ok（放行）
+        #
+        # 【输入 → 输出对照】同一个 before_call，三种工具三种结果（实测）
+        #   ① 输入：data_query（被配置提级成 high，且没开人工通道）
+        #      输出：allowed=False | action=approve | code=approval_required
+        #            reason="工具 data_query 风险等级为 high，需人工批准；
+        #                    当前未启用人工审批通道，已拒绝执行（模型无权直接调用）"
+        #   ② 输入：calculator（low，无覆盖）
+        #      输出：allowed=True  | action=allow | code=（空）→ 直接放行
+        #   ③ 输入：drop_table（名字命中禁止名单）
+        #      输出：allowed=False | action=deny   | code=policy_denied
+        #            reason="工具 drop_table 已配置为禁止执行"
+        # ------------------------------------------------------------------
+        # 【作用】总开关关着就直接放行：Harness 是加固项，不是依赖项
         if not self.enabled:
             return ToolVerdict.ok(req.arguments)
+        # 【作用】取这把工具的通行证：请求自带的优先，没有就查注册期台账，都没有就按默认等级临时造一张
         cap = req.capability or self._capabilities.get(req.tool_name) or ToolCapability(name=req.tool_name)
 
         decision = self.policy.decide(cap)
         if decision.denied:                                     # ① 配置层面禁止执行
             _logger.warning(f"工具被策略禁止: {req.tool_name} | {decision.reason}")
-            return ToolVerdict.block("policy_denied", decision.reason, action=ACTION_DENY)
+            return ToolVerdict.block(code="policy_denied", decision.reason, action=ACTION_DENY)
 
+        # 【作用】五道安检：参数 → 权限 → 数据范围 → 限流 → 预算，任一不过直接拦下
         verdict = self.chain.run(req)                           # ② 五道中间件
         if not verdict.allowed:
             return verdict
@@ -236,6 +303,10 @@ class ToolHarness:
     # ③ 沙箱执行
     # ------------------------------------------------------------------
     def _runner_for(self, mode: str):
+        # 【先查缓存】同一个 mode 只建一次执行器：
+        #   一是省掉重复构造的开销；
+        #   二是 runner 是有状态对象（远程执行器的连接配置、子进程执行器的环境白名单等），
+        #   每次新建会让"上一次的状态"凭空消失
         mode = str(mode or MODE_NONE)
         runner = self._runners.get(mode)
         if runner is None:
@@ -244,8 +315,14 @@ class ToolHarness:
                 kwargs.update(self.docker_options)
             elif mode == MODE_REMOTE:            # endpoint/token 只有远程沙箱认
                 kwargs.update(self.remote_options)
-            runner = build_sandbox(mode, **kwargs)
-            self._runners[mode] = runner
+            #  ↑ update = 把"该模式专属参数"并进 kwargs，最后一次性 **kwargs 下发给 build_sandbox
+            #    【为什么不合成一个全量大字典】三种 runner 的构造签名不同：
+            #    把 image 传给 SubprocessRunner 会直接 TypeError: unexpected keyword argument，
+            #    所以按 mode 分档下发（详见上方 97 行注释）
+            #    【副作用】update 同名 key 会覆盖：docker_options 里若带了 timeout_seconds，
+            #    会盖掉上面的 default_timeout —— 这是留给调用方单独调某个沙箱超时的口子
+            runner: SandboxRunner = build_sandbox(mode, **kwargs)
+            self._runners[mode] = runner          # 存缓存，下次同 mode 直接复用
         return runner
 
     def execute(self, tool: Any, params: dict, cap: Optional[ToolCapability] = None) -> ToolResult:

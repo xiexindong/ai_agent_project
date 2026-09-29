@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     checkpoint_enabled: bool = Field(default=True, alias="CHECKPOINT_ENABLED")                  # LangGraph 断点续跑开关
 
     max_react_iterations: int = Field(default=10, alias="MAX_REACT_ITERATIONS")                 # ReAct 最大循环轮数，超了强制出答案
+
+    # ---- 任务规划（Plan-and-Execute）：复杂流程先拆步骤再逐步执行 ----
+    #   默认关闭：单步问题走原 ReAct（多一次规划就是多一次 LLM 调用，是真金白银）。
+    #   开了也只有"判定为复杂流程"时才规划，简单问题照旧。
+    agent_planning_enabled: bool = Field(default=False, alias="AGENT_PLANNING_ENABLED")          # 总开关，关=改造前行为
+    agent_planning_min_score: int = Field(default=2, alias="AGENT_PLANNING_MIN_SCORE")           # 复杂度打分达到几分才规划
+    agent_planning_max_steps: int = Field(default=6, alias="AGENT_PLANNING_MAX_STEPS")           # 单次计划最多几步
+    agent_planning_replan_enabled: bool = Field(default=True, alias="AGENT_PLANNING_REPLAN_ENABLED")  # 步骤失败时是否重规划
+    agent_planning_max_replans: int = Field(default=1, alias="AGENT_PLANNING_MAX_REPLANS")       # 一次运行最多重规划几次
     max_history_tokens: int = Field(default=4000, alias="MAX_HISTORY_TOKENS")                   # 召回的历史对话最多占多少 token
     # ---- 提示词装配：上下文（RAG/记忆/技能/工具清单）合计能占多少 token ----
     #   超了由 PromptBuilder 按优先级裁剪（权限 > 工具 > 观察 > 技能 > RAG > 记忆）。
@@ -235,6 +244,13 @@ class Settings(BaseSettings):
     multiagent_share_findings: bool = Field(default=True, alias="MULTIAGENT_SHARE_FINDINGS")            # 是否把成员产出共享到消息总线
     multiagent_replan_enabled: bool = Field(default=False, alias="MULTIAGENT_REPLAN_ENABLED")           # 有人失败时是否让主管重规划（要多调一次 LLM）
     multiagent_max_replans: int = Field(default=1, alias="MULTIAGENT_MAX_REPLANS")                      # 最多重规划几次
+
+    # ---- 委派（Delegation）：执行者把活转给别人 ----
+    #   默认关闭：委派要多一次"要不要转派"的决策调用，不开就完全不进委派分支
+    multiagent_delegation_enabled: bool = Field(default=False, alias="MULTIAGENT_DELEGATION_ENABLED")       # 是否启用 Agent 间任务委派
+    multiagent_delegation_max_depth: int = Field(default=1, alias="MULTIAGENT_DELEGATION_MAX_DEPTH")        # 最多转派几层（防无限甩锅）
+    multiagent_delegation_max_per_run: int = Field(default=6, alias="MULTIAGENT_DELEGATION_MAX_PER_RUN")    # 单次运行最多委派几次
+    multiagent_delegation_max_per_agent: int = Field(default=2, alias="MULTIAGENT_DELEGATION_MAX_PER_AGENT")  # 单个 Agent 最多委派几次
 
     # ---- Human-in-the-Loop 人工介入 ----
     # 【为什么默认关】开启后链路会在敏感动作处停下来等人，

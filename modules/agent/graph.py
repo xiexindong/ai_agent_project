@@ -13,8 +13,11 @@ LangGraph 图构建模块
     相对 Express 手写 if 路由的升级。
 
 【图结构】
-    prepare → reason → should_continue? → act → reason (循环)
-                                    → answer → save → END
+    prepare → (复杂流程? plan) → reason → should_continue? → act → reason (循环)
+                                                       → answer → save → END
+
+    plan 是可选节点：AGENT_PLANNING_ENABLED 关闭时永不进入，
+    开了也只有"判定为复杂流程"才进（见 ReActAgent.should_plan）。
 
 【执行轨迹例子】用户问"3*7 等于多少"
     输入: query="3*7 等于多少", session_id="abc123", user_id="cli-user"
@@ -55,21 +58,23 @@ class AgentGraph:
         self._checkpointer = None                # 断点续跑用；未开启或不可用时保持 None
         self._graph = self._build_graph()        # 编译后的图，run() 直接 invoke 它
 
-    # 【什么】按「5 节点 + 6 条边」搭出整张图并编译
+    # 【什么】按「6 节点 + 8 条边」搭出整张图并编译
     # 【作用】流程全貌集中在这里，改跳转只改这一段
     def _build_graph(self):
         """
-        构建 LangGraph 状态图：5 个节点 + 6 条边（含 1 条条件边）。
+        构建 LangGraph 状态图：6 个节点 + 8 条边（含 2 条条件边）。
 
         【节点 = 工序】每个节点接收 state、返回 state 更新片段
             prepare : 安全检查 + 召回记忆/技能/RAG，初始化 state
+            plan    : 复杂流程拆成有序步骤（Plan-and-Execute，可选节点）
             reason  : LLM 决策——直接答 or 调工具（ReAct 的"思考"）
             act     : 执行工具（本地 Tool / 远程 MCP），结果回写 observation
             answer  : 生成完整答案 + 一句话摘要
             save    : 落库（原文+摘要+向量+工具日志），状态序列化供断点续跑
 
-        【边 = 跳转】固定边直连，条件边由 _should_continue 决定去向
-            prepare → reason                              （固定，准备工作做完必进推理）
+        【边 = 跳转】固定边直连，条件边由 _after_prepare / _should_continue 决定去向
+            prepare → plan | reason | answer               （条件边，看是否复杂 + 是否被拦截）
+            plan → reason                                  （固定，规划完必进推理）
             reason → should_continue? → act | answer      （条件边，看模型决策）
             act → reason                                  （固定，工具结果回到思考，形成 ReAct 循环）
             answer → save → END                           （固定，答完落库结束）
@@ -88,6 +93,7 @@ class AgentGraph:
         #   收窄成 StateNode（Runnable 体系），传绑定方法（MethodType）会被判不兼容；
         #   运行期 langgraph 会把它包成 RunnableCallable，行为完全正常。
         workflow.add_node("prepare", self._prepare_node)   # type: ignore
+        workflow.add_node("plan", self._plan_node)         # type: ignore   # 复杂流程先拆步骤（可选节点）
         workflow.add_node("reason", self._reason_node)     # type: ignore
         workflow.add_node("act", self._act_node)           # type: ignore
         workflow.add_node("answer", self._answer_node)     # type: ignore
@@ -98,10 +104,12 @@ class AgentGraph:
             "prepare",
             self._after_prepare,
             {
+                "plan": "plan",             # 判定为复杂流程 → 先规划再推理
                 "reason": "reason",
                 "answer": "answer",
             },
         )
+        workflow.add_edge("plan", "reason")     # 规划完必进推理；之后 reason↔act 循环不再回 plan
         workflow.add_conditional_edges(
             "reason",
             self._should_continue,
@@ -147,6 +155,22 @@ class AgentGraph:
             return updates
         return {}                           # 已准备过：返回空更新，原样往下走
 
+    # 【什么】plan 节点：给复杂流程拆一份执行计划
+    # 【作用】只跑一次（图结构上不会回到本节点）；规划不可用时不进这个节点
+    def _plan_node(self, state: dict[str, Any]) -> dict[str, Any]:
+        """规划节点：把 query 拆成有序步骤，写进 sub_tasks 供后续每轮参考。"""
+        from modules.agent.state import AgentState
+        agent_state = AgentState.from_dict(state)
+        _logger.info("节点[plan]: 生成执行计划")
+        updated = self.agent.plan_step(agent_state)
+        return {
+            "sub_tasks": updated.sub_tasks,
+            "current_task_index": updated.current_task_index,
+            "task_results": updated.task_results,
+            "plan_rationale": updated.plan_rationale,
+            "plan_replan_count": updated.plan_replan_count,
+        }
+
     # 【什么】reason 节点：调一次 ReAct 的 Reason 步骤
     # 【作用】把 LLM 的决策结果（要不要调工具、答案是什么）写回图状态
     def _reason_node(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -181,6 +205,12 @@ class AgentGraph:
             "action": updated.action,
             "tool_calls_history": updated.tool_calls_history,
             "tool_call_logs": updated.tool_call_logs,
+            # 【计划推进结果要写回图状态】本步标记完成/失败、指针前移、
+            #   以及可能的重规划都发生在 act_step 里，不回写的话下一轮看到的还是旧计划
+            "sub_tasks": updated.sub_tasks,
+            "current_task_index": updated.current_task_index,
+            "task_results": updated.task_results,
+            "plan_replan_count": updated.plan_replan_count,
         }
 
     # 【什么】answer 节点：出最终答案 + 一句话摘要
@@ -301,6 +331,10 @@ class AgentGraph:
         """
         if state.get("error") or (state.get("finished") and state.get("final_answer")):
             return "answer"
+        # 【规划判定】复杂流程先拆步骤；简单问题直接进 ReAct，行为与改造前一致
+        from modules.agent.state import AgentState
+        if self.agent.should_plan(AgentState.from_dict(state)):
+            return "plan"
         return "reason"
 
     # 【什么】整张图的「红绿灯」：返回 act 或 answer

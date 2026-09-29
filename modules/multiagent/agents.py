@@ -34,6 +34,7 @@ from modules.multiagent.models import (
 )
 from modules.multimodal.media import MultiModalInput
 from modules.multiagent.coordination import MessageBus
+from modules.multiagent.delegation import decide_delegation
 
 _logger = get_logger("multiagent")
 
@@ -106,6 +107,17 @@ class RunContext:
     # ------------------------------------------------------------------
     bus: Optional[MessageBus] = None     # 实际挂的是 OrchestratedBus 门面：读消息直转真 bus，仅发消息走编排治理
     gate: Optional[Any] = None           # 人工闸门：敏感动作前拍板用
+    # ------------------------------------------------------------------
+    # 【委派三件套】Agent 把手里的活转给别人时用（详见 delegation.py）
+    #   delegation       委派执行器；为 None = 本次运行不支持委派（默认）
+    #   delegation_depth 当前处于第几层委派（主管派的活是 0，转一次 +1）
+    #   delegation_chain 委派链（含所有上游委派方），防 A→B→A 死循环
+    #   delegated_by     本次任务是受谁委派而来；空 = 主管直接派的
+    # ------------------------------------------------------------------
+    delegation: Optional[Any] = None
+    delegation_depth: int = 0
+    delegation_chain: list = field(default_factory=list)
+    delegated_by: str = ""
 
 
 # 【什么】审核者的评审结论（结构化）
@@ -278,7 +290,39 @@ class BaseAgent:
         #   排除自己发出的，按时间正序取最近 20 条，每条正文截断 400 字符，
         #   拼成 "- [kind] sender: content"；无人发消息时返回 ""，可直接拼进 prompt
         peer_text = ctx.bus.inbox_text(self.name) if ctx.bus is not None else ""
-        prompt = self._build_prompt(instruction, upstream_text, vision_text, peer_text)
+
+        # ------------------------------------------------------------------
+        # 【委派：先把"更适合别人的那部分"转出去，再带着结果做自己的部分】
+        #   三个前置条件缺一不可：运行装配了委派器 / 本 Agent 有委派资格 / 有具体任务
+        #   （没有 task 说明是主管直接问答，谈不上转派）
+        #   开关在第一位：未启用时连"要不要转派"这次决策调用都不发生，
+        #   保证关闭委派 = 零额外开销、行为与改造前完全一致。
+        #   【转不出去会怎样】decide 解析失败、或治理不放行 → 返回 None，
+        #   本 Agent 照常自己干，绝不因为"想转没转成"就让任务失败。
+        # ------------------------------------------------------------------
+        delegated: list = []
+        dex = getattr(ctx, "delegation", None)
+        if dex is not None and getattr(dex, "enabled", False) \
+                and self.spec.can_delegate and task is not None:
+            decision = decide_delegation(
+                self.llm, instruction, dex.candidates(self.name), self.system_prompt
+            )
+            if decision is not None and decision.should_delegate:
+                rec = dex.delegate(
+                    from_agent=self.name,
+                    to_agent=decision.to_agent,
+                    instruction=decision.instruction,
+                    parent_task_id=task.id,
+                    depth=getattr(ctx, "delegation_depth", 0),
+                    reason=decision.reason,
+                    chain=list(getattr(ctx, "delegation_chain", []) or []),
+                )
+                if rec is not None:
+                    delegated.append(rec)
+                    _logger.info(f"[{self.name}] 已把部分工作委派给 {rec.to_agent}: {rec.instruction[:60]}")
+
+        delegation_text = self._delegation_text(delegated)
+        prompt = self._build_prompt(instruction, upstream_text, vision_text, peer_text, delegation_text)
 
         try:
             schemas = self._tool_schemas()
@@ -298,6 +342,8 @@ class BaseAgent:
                 tool_calls=logs,
                 duration_ms=int((time.time() - started) * 1000),
                 multimodal=bool(vision_text),
+                delegations=delegated,                                   # 我转出去的活（账）
+                delegated_by=getattr(ctx, "delegated_by", "") or "",     # 我是受谁委派来的
             )
         except Exception as e:
             _logger.error(f"[{self.name}] 执行失败: {type(e).__name__}: {e}")
@@ -305,7 +351,22 @@ class BaseAgent:
                 self.name, task.id if task else "", f"{type(e).__name__}: {e}",
                 role=self.spec.role,
                 duration_ms=int((time.time() - started) * 1000),
+                delegations=delegated,
+                delegated_by=getattr(ctx, "delegated_by", "") or "",
             )
+
+    # 【什么】把委派产出拼成可读文本
+    # 【作用】给委派方当"上游输入"：成功的拿结论，失败的如实告知（模型据此改路子）
+    @staticmethod
+    def _delegation_text(records: list) -> str:
+        """把委派回传的产出拼成 prompt 段落；没有委派时返回空串。"""
+        if not records:
+            return ""
+        blocks = []
+        for r in records:
+            body = r.content if getattr(r, "success", False) else f"（委派失败）{getattr(r, 'error', '')}"
+            blocks.append(f"【委派产出 · {r.to_agent}】{body}")
+        return "\n\n".join(blocks)
 
     # 【什么】把上游产出拼成可读文本
     # 【作用】给下游提供依赖产出；每条截断到 1200 字防止上下文被单个产出占满
@@ -322,12 +383,16 @@ class BaseAgent:
     # 【什么】组装本 Agent 收到的最终提示词
     # 【作用】把任务、图片解析、上游产出、同伴消息按顺序拼成可执行的一段话
     def _build_prompt(self, instruction: str, upstream_text: str, vision_text: str,
-                      peer_text: str = "") -> str:
+                      peer_text: str = "", delegation_text: str = "") -> str:
         parts = [f"## 你的任务\n{instruction}"]
         if vision_text:
             parts.append(f"## 图片解析结果\n{vision_text}")
         if upstream_text:
             parts.append(f"## 上游产出\n{upstream_text}")
+        # 【委派产出紧跟上游产出】它本质上就是"你转出去的那部分活回来了什么"，
+        #   和上游产出同级，放在同伴消息之前，避免被闲聊冲淡
+        if delegation_text:
+            parts.append(f"## 你委派出去的工作产出\n{delegation_text}")
         # 【同伴消息放在要求之前】
         #   顺序上它是"执行时的参考信息"，和上游产出同级，
         #   放在最末尾的要求之前，避免把"直接给结论"这条指令冲淡。
@@ -494,13 +559,19 @@ def build_default_team() -> list[AgentSpec]:
             name="supervisor", role=AgentRole.SUPERVISOR,
             description="拆解任务、派活、汇总最终答案", temperature=0.2,
         ),
+        # 【为什么给这两个角色开委派资格】
+        #   他们是最容易"缺一块"的人：analyst 常常没有原始数据、
+        #   researcher 常常需要别人验算。开关（delegation_enabled）默认关闭，
+        #   所以这里只是"具备能力"，不打开就完全不会发生委派、也不会多花一次调用。
         AgentSpec(
             name="researcher_1", role=AgentRole.RESEARCHER,
             description="查资料、找事实依据", tools=["data_query"], multimodal=True,
+            can_delegate=True,
         ),
         AgentSpec(
             name="analyst_1", role=AgentRole.ANALYST,
             description="做计算、对比、归因", tools=["calculator"],
+            can_delegate=True,
         ),
         AgentSpec(
             name="reviewer_1", role=AgentRole.REVIEWER,

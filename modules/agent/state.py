@@ -46,9 +46,15 @@ class AgentStateDict(TypedDict, total=False):
     tool_call_logs: list            # 工具流水，save 节点写 tool_call_log 表
     tool_calls_history: list        # 工具历史，供重复调用检测与 prompt 展示
 
+    # 【计划三件套】Plan-and-Execute：复杂流程先拆步骤，再逐步执行
+    #   sub_tasks          计划步骤列表（每步是 dict：id/instruction/tool_hint/depends_on/status/result）
+    #   current_task_index 当前执行到第几步（下标，与 sub_tasks 对齐）
+    #   task_results       已完成步骤的结果流水（审计与 prompt 展示用）
     sub_tasks: list                 # 任务拆解后的子任务列表
     current_task_index: int         # 当前执行到第几个子任务
     task_results: list              # 各子任务的结果
+    plan_rationale: str             # 计划总体思路（为什么要这么拆）；空 = 本轮没规划
+    plan_replan_count: int          # 本轮已经重规划过几次（上限由配置控制）
 
     final_answer: str               # 最终答案，answer 节点填写
     llm_summary: str                # 一句话摘要，用于向量入库
@@ -92,9 +98,11 @@ class AgentState:
     tool_call_logs: list = field(default_factory=list)         # 工具流水，save 节点落表
     tool_calls_history: list = field(default_factory=list)     # 工具历史，用于重复调用检测
 
-    sub_tasks: list = field(default_factory=list)              # 拆解出的子任务
+    sub_tasks: list = field(default_factory=list)              # 拆解出的子任务（计划步骤）
     current_task_index: int = 0                                # 当前子任务下标
     task_results: list = field(default_factory=list)           # 各子任务的结果
+    plan_rationale: str = ""                                   # 计划总体思路；空 = 本轮没规划
+    plan_replan_count: int = 0                                 # 本轮已重规划次数
 
     final_answer: str = ""                                     # 最终答案
     llm_summary: str = ""                                      # 一句话摘要，用于向量入库
@@ -147,6 +155,8 @@ class AgentState:
             "sub_tasks": self.sub_tasks,
             "current_task_index": self.current_task_index,
             "task_results": self.task_results,
+            "plan_rationale": self.plan_rationale,
+            "plan_replan_count": self.plan_replan_count,
             "final_answer": self.final_answer,
             "llm_summary": self.llm_summary,
             "summary_embedding": self.summary_embedding,
@@ -198,6 +208,8 @@ class AgentState:
             sub_tasks=d.get("sub_tasks", []),
             current_task_index=d.get("current_task_index", 0),
             task_results=d.get("task_results", []),
+            plan_rationale=d.get("plan_rationale", ""),
+            plan_replan_count=int(d.get("plan_replan_count", 0) or 0),
             final_answer=d.get("final_answer", ""),
             llm_summary=d.get("llm_summary", ""),
             summary_embedding=d.get("summary_embedding", []),

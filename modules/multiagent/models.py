@@ -64,6 +64,14 @@ class AgentSpec(BaseModel):
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)   # 采样温度，0~2；越低越稳定
     max_steps: int = Field(default=3, ge=1, le=20, description="单个 Agent 最多推理步数")
     enabled: bool = Field(default=True)                       # False 的 Agent 不注册、不参与派活
+    # ------------------------------------------------------------------
+    # 【委派能力（Delegation）】：这个 Agent 能不能把手里的活转给别人
+    #   can_delegate   True 才会在执行前做一次"要不要委派"的决策（多一次 LLM 调用）
+    #   delegate_to    允许委派给谁；空列表 = 不限（由治理按花名册校验存在性）
+    #   两个都默认关闭：委派是增强能力，不开就与改造前完全一致。
+    # ------------------------------------------------------------------
+    can_delegate: bool = Field(default=False, description="是否允许把任务转派给其他 Agent")
+    delegate_to: list[str] = Field(default_factory=list, description="允许委派给哪些 Agent；空=不限")
 
     # 【什么】校验 name 非空
     # 【作用】空名字会让 automatic 注册进字典却无法派活，在入口就拦住
@@ -147,6 +155,11 @@ class AgentOutput(BaseModel):
     tool_calls: list[dict] = Field(default_factory=list)
     duration_ms: int = Field(default=0)
     multimodal: bool = Field(default=False, description="本次是否处理了多模态输入")
+    # 【委派痕迹】本次执行中"我转出去的活"与"我是被谁转来的"
+    #   单独存而不混进 content：content 是给模型看的正文，
+    #   委派链是给人看的账——谁把什么转给了谁、成没成，排查协作链路时靠它
+    delegations: list["DelegationRecord"] = Field(default_factory=list, description="本次转派出去的任务")
+    delegated_by: str = Field(default="", description="本次任务是受谁委派而来；空=主管直接派的")
 
     # 【什么】统一构造失败产出
     # 【作用】收敛各处手写 success=False 的写法，保证 error 一定被填上
@@ -154,6 +167,71 @@ class AgentOutput(BaseModel):
     def failed(cls, agent: str, task_id: str, error: str, **kw) -> "AgentOutput":
         """统一构造失败产出（避免各处手写 success=False 忘了填 error）。"""
         return cls(agent=agent, task_id=task_id, success=False, error=error, **kw)
+
+
+# ---------------------------------------------------------------------------
+# 【什么】委派（Delegation）的数据契约
+# 【作用】让"把活转给别人"这件事可校验、可记账、可回溯
+#
+#   【委派和派活（dispatch）有什么区别】
+#       派活：主管在规划阶段一次性把任务分下去（事前、中心化、一层）
+#       委派：执行者接到活之后，发现"这块更适合别人"，当场转出去
+#             （事中、横向、可递归），产出回传给委派方并入它的结论
+#
+#   【为什么要单独定契约而不是复用 AgentMessage(DELEGATE)】
+#       消息只是"说了一句这块你来做"，没有执行、没有结果、没有治理；
+#       委派是有输入（instruction）、有产出（content/error）、
+#       有约束（深度、次数、防环）的一次真实调用，必须能进台账与 trace。
+# ---------------------------------------------------------------------------
+# 【什么】一条委派记录
+# 【作用】台账与 RunResult 的最小单位：谁把什么活转给了谁、成了没有
+class DelegationRecord(BaseModel):
+    """一条委派记录（进台账、进 RunResult.delegations、进 trace）。"""
+
+    id: str = Field(default_factory=lambda: new_id("dlg"))
+    from_agent: str = Field(description="委派方 Agent 名")
+    to_agent: str = Field(description="受托方 Agent 名")
+    instruction: str = Field(default="", description="转出去的具体指令")
+    reason: str = Field(default="", description="为什么转出去（给排查看）")
+    parent_task_id: str = Field(default="", description="委派方当时在做的 SubTask.id")
+    depth: int = Field(default=0, ge=0, description="委派层级：主管派的活是 0，转一次 +1")
+    chain: list[str] = Field(default_factory=list, description="委派链（含委派方），用于防环")
+    success: bool = Field(default=False)
+    content: str = Field(default="", description="受托方产出")
+    error: str = Field(default="", description="失败原因")
+    duration_ms: int = Field(default=0)
+    ts: int = Field(default_factory=now_ms)
+
+    # 【什么】人类可读的一条委派
+    # 【作用】日志与 trace 里一眼看到"A 把活转给了 B，成没成"
+    @property
+    def label(self) -> str:
+        return f"{self.from_agent}→{self.to_agent}"
+
+
+# 【什么】Agent 的委派决策（结构化输出）
+# 【作用】让"这块是不是该转给别人"变成可校验字段，而不是模型随口一句
+class DelegationDecision(BaseModel):
+    """委派决策：要不要转派、转给谁、转什么。
+
+    【为什么填一半要降级而不是报错】
+        模型最常见的失误是 should_delegate=true 却漏了 to_agent / instruction。
+        这种半成品拿去执行只会派出一个空任务，
+        所以校验器把它降级成"不委派"——稳住主流程，不为一个可选能力冒险。
+    """
+
+    should_delegate: bool = Field(default=False, description="是否要把这块工作转派出去")
+    to_agent: str = Field(default="", description="转派给谁（Agent 名）")
+    instruction: str = Field(default="", description="转出去的具体指令")
+    reason: str = Field(default="", description="为什么要转派")
+
+    # 【什么】信息不全就降级成"不委派"
+    # 【作用】模型漏字段时不抛异常、不派空任务，主流程照常往下走
+    @model_validator(mode="after")
+    def _downgrade_incomplete(self) -> "DelegationDecision":
+        if self.should_delegate and (not self.to_agent.strip() or not self.instruction.strip()):
+            self.should_delegate = False
+        return self
 
 
 # 【什么】trace 事件类型字面量集合
@@ -165,6 +243,9 @@ TraceKind = Literal[
     # 下面四个是协调与人工介入环节的事件，和上面同一套取值空间，
     # 写错字符串同样在类型检查阶段暴露
     "consensus", "arbitration", "hitl", "replan",
+    # delegate：委派（把活转给别人）与派活分开记——排查"这个产出为什么不是原定的人做的"时，
+    # 这两种来源必须能区分开
+    "delegate",
 ]
 
 
@@ -207,6 +288,10 @@ class RunResult(BaseModel):
     consensus: Optional["ConsensusResult"] = None          # 产出一致性判定
     arbitration: Optional[AgentOutput] = None              # 冲突仲裁结论
     replan_count: int = Field(default=0, description="实际发生的重规划次数")
+    # 【委派台账】本次运行发生过的所有转派（含被拒绝的尝试也记在 ledger 里）
+    #   与 outputs 分开存：outputs 回答"谁产出了什么"，
+    #   delegations 回答"活在中途被转了几次、转给谁"
+    delegations: list["DelegationRecord"] = Field(default_factory=list, description="本次运行的委派记录")
     interrupt_count: int = Field(default=0, description="本次运行触发的人工介入次数")
     # ------------------------------------------------------------------
     # 【观测链路的两个索引】
@@ -259,6 +344,21 @@ class TeamConfig(BaseModel):
     share_findings: bool = Field(default=True, description="每批结束后是否把产出共享到消息总线")
     replan_enabled: bool = Field(default=False, description="有 Agent 失败时是否让主管重规划")
     max_replans: int = Field(default=1, ge=0, le=3, description="最多重规划几次")
+
+    # ------------------------------------------------------------------
+    # 【委派配置】执行者把活转给别人时的四条边界
+    #   默认关闭：委派要多一次"要不要转派"的 LLM 决策，
+    #   不开就完全不进入委派分支（与改造前逐字一致）。
+    #   四条边界的意义：
+    #     max_depth      转派层数上限，防 A→B→C→… 无限甩锅
+    #     max_per_run    整次运行委派总次数，防小问题被拆成几十次转派
+    #     max_per_agent  单个 Agent 最多转几次，防"专职二传手"
+    #     allow_*        由 DelegationPolicy 按花名册与链做存在性/防环校验
+    # ------------------------------------------------------------------
+    delegation_enabled: bool = Field(default=False, description="是否启用 Agent 之间的任务委派")
+    delegation_max_depth: int = Field(default=1, ge=0, le=5, description="最多转派几层（0=只能主管派）")
+    delegation_max_per_run: int = Field(default=6, ge=0, le=100, description="单次运行最多委派几次")
+    delegation_max_per_agent: int = Field(default=2, ge=0, le=20, description="单个 Agent 最多委派几次")
 
     # ------------------------------------------------------------------
     # 【编排治理配置】限流 / 配额 / 防环 / 校验 / 观测
@@ -485,3 +585,7 @@ def _simplify(node: dict, root: dict) -> Any:
 #   否则第一次实例化 RunResult 就会抛"名字未定义"。
 # ---------------------------------------------------------------------------
 RunResult.model_rebuild()
+# 【AgentOutput 也要重建】它用字符串前向引用了 DelegationRecord
+#   （delegations 字段），而 DelegationRecord 定义在它后面。
+#   不重建的话第一次构造 AgentOutput 就会抛"名字未定义"。
+AgentOutput.model_rebuild()

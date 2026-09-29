@@ -174,32 +174,33 @@ class ScopeMiddleware(ToolMiddleware):
     name = "scope"
 
     def check(self, req: ToolCallRequest) -> Optional[tuple[str, str]]:
-        principal = req.principal
-        cap = req.capability
+        # 【作用】越界就返回 (拦截码, 中文原因)；没越界返回 None（= 放行，交给下一道中间件）
+        principal = req.principal                                       # 当前请求的身份快照；None = 未启用权限体系
+        cap = req.capability                                            # 这把工具登记的能力，里面带着它涉及哪些数据域
         if principal is None or cap is None:
-            return None
-        scope_for = getattr(principal, "scope_for", None)
+            return None                                                 # 【目的】没有身份或没有能力台账就不校验，行为与未接入权限时一致
+        scope_for = getattr(principal, "scope_for", None)               # 取"问身份：某类数据你能看多宽"的那个方法
         if scope_for is None:
-            return None
-        args = req.arguments or {}
-        for dt in getattr(cap, "data_scopes", ()) or ():
+            return None                                                 # 【目的】身份对象没带这个方法就跳过，不强迫所有调用方都实现它
+        args = req.arguments or {}                                      # 模型实际传进来的参数，越界就藏在这里
+        for dt in getattr(cap, "data_scopes", ()) or ():                # 逐个数据域查：工具声明了 users/orders 就每一个都要过
             try:
-                scope = scope_for(dt)
+                scope = scope_for(dt)                                   # 问一句：这个人对这类数据的可见范围是 all / dept / self
             except Exception:
-                continue
+                continue                                                # 【目的】身份算范围时出错只跳过这一个域，不让一次异常拖垮整次调用
             if scope == "all":
-                continue
+                continue                                                # 全域可见，不用比参数
             if scope == "dept":
-                want = str(args.get("dept_code") or "")
-                mine = str(getattr(principal, "dept_code", "") or "")
-                if want and mine and want != mine:
+                want = str(args.get("dept_code") or "")                 # 参数里想查哪个部门
+                mine = str(getattr(principal, "dept_code", "") or "")   # 这个人属于哪个部门
+                if want and mine and want != mine:                      # 两边都有值且不相等才判越界：有一边为空就放行，避免误伤
                     return "scope_denied", f"dept_code={want} 超出本部门范围({mine})"
             elif scope == "self":
-                want = str(args.get("user_code") or "")
-                mine = str(getattr(principal, "user_code", "") or "")
-                if want and mine and want != mine:
+                want = str(args.get("user_code") or "")                 # 参数里想查哪个人的数据
+                mine = str(getattr(principal, "user_code", "") or "")   # 这个人自己的工号
+                if want and mine and want != mine:                      # 同上：只拦"明确指向别人"的情况
                     return "scope_denied", f"user_code={want} 超出本人数据范围"
-        return None
+        return None                                                     # 所有数据域都过完、没有越界 → 放行
 
 
 # 【什么】调用限流
@@ -216,19 +217,37 @@ class RateLimitMiddleware(ToolMiddleware):
 
     def __init__(self, capacity: int = 20, refill_per_sec: float = 5.0, per_user_capacity: int = 8,
                  per_user_refill: float = 2.0):
-        from modules.orchestration.control import RateLimiter
+        from modules.orchestration.control import RateLimiter   # 放函数里：按需加载，避免顶层循环导入
+        # ------------------------------------------------------------------
+        # 【这里自己不算限流】真正的算法在 RateLimiter 里，本方法只负责"把它建好"。
+        #   两组桶：capacity/refill 是全局桶（所有人共用），per_user_* 是每人一个桶。
+        #   max() 不是随手写的，是下限保护：
+        #     容量保底 1   —— 传 0 会让桶永远是空的 → 所有调用全被拦 = 整站不可用
+        #     速率保底 0.1 —— 传 0 令牌永不回生     → 打完 8 次就永久封死，只能重启进程
+        # ------------------------------------------------------------------
         self._limiter = RateLimiter(
-            capacity=max(1, int(capacity)),
-            refill_per_sec=max(0.1, float(refill_per_sec)),
-            per_sender_capacity=max(1, int(per_user_capacity)),
-            per_sender_refill=max(0.1, float(per_user_refill)),
+            capacity=max(1, int(capacity)),                      # 全系统瞬时最多连打几次
+            refill_per_sec=max(0.1, float(refill_per_sec)),      # 之后每秒回血几个 = 长期平均速率
+            per_sender_capacity=max(1, int(per_user_capacity)),  # 同一个人最多连打几次
+            per_sender_refill=max(0.1, float(per_user_refill)),  # 之后每秒回血几个
         )
 
     def check(self, req: ToolCallRequest) -> Optional[tuple[str, str]]:
+        # ------------------------------------------------------------------
+        # 【三步】认出是谁 → 问桶要 1 枚令牌 → 把结果翻译成中间件契约
+        #   契约（基类 ToolMiddleware.check 定死）：None = 放行，(code, reason) = 拦截
+        #   "限流的记忆"在 self._limiter 这个实例属性里——桶内记着剩余令牌数与上次补充时间，
+        #   所以本中间件必须长期持有、全局单例，每次 check 都扣在同一个桶上。
+        # ------------------------------------------------------------------
         sender = str(getattr(req.principal, "user_code", "") or req.user_id or req.session_id or "")
+        #  ↑ 用 getattr 而不是 req.principal.user_code：principal 可能是 None（CLI / 单测无登录态），
+        #    直接取属性会崩。后半段是三级兜底：工号 → user_id → session_id，都没有就退回 anonymous
         ok, by = self._limiter.acquire(sender or "anonymous", 1)
+        #  ↑ 一次调用 = 扣 1 枚令牌；判两次：全局桶先扣，再扣这个人自己的桶，任一扣不动就拦
+        #    by = "global"（整体太猛）或 "sender:U007"（某个人太猛），写进原因里便于日志定位
+        #    "anonymous"：没身份时所有人共用一个桶——宁可共用，也不跳过限流
         if ok:
-            return None
+            return None                                          # 放行（令牌已在 acquire 里扣掉，这里只是翻译结果）
         return "rate_limited", f"工具调用过于频繁（被 {by} 限流），请稍后再试"
 
 
@@ -240,15 +259,26 @@ class BudgetMiddleware(ToolMiddleware):
     name = "budget"
 
     def __init__(self, budgets: BudgetManager):
+        # 【这里不记账】账本按会话存在 BudgetManager 里，本中间件只是"拿账本查一下"的那道闸
         self._budgets = budgets
 
     def check(self, req: ToolCallRequest) -> Optional[tuple[str, str]]:
+        # ------------------------------------------------------------------
+        # 契约与 rate_limit 那道一致：None = 放行，(code, reason) = 拦截
+        #   【和限流的区别】限流看"速率"（令牌会按秒回血，等一会儿就恢复）；
+        #   预算看"总量"（次数 / token / 墙钟），打满不会自己恢复，只能 begin() 重开一轮。
+        # ------------------------------------------------------------------
         budget = self._budgets.get(req.session_id or "default")
+        #  ↑ 按会话取账本：BudgetManager.get 内部兜底，没 begin 过也会用默认 spec 现开一本
+        #    "default" 是无会话时的兜底 key（CLI / 单测），避免用 None 当 key 让所有无会话调用挤在一起
         ok, reason = budget.check(req.tool_name)
+        #  ↑ 四道闸门任一打满就返回 False + 中文原因：
+        #    超时 / 总次数上限 / 单工具次数上限（防死循环）/ 上下文 token 预算
+        #    注意 check 只"问"，不扣配额——真正记账在调用成功后的 consume()
         if ok:
-            return None
-        budget.record_block()
-        return "budget_exceeded", reason
+            return None                                  # 放行
+        budget.record_block()                            # 被拦才记一次：blocked 高 = 配额偏紧或模型在打转
+        return "budget_exceeded", reason                 # 原因直接复用账本给的，不在这里二次拼装
 
 
 # 【什么】中间件链
@@ -275,7 +305,9 @@ class MiddlewareChain:
                 hit = mw.check(req)
             except Exception as e:                       # 中间件自身出错不能中断整条链路
                 _logger.warning(f"中间件 {mw.name} 异常，按放行处理: {e}")
-                continue
+                
+                # 工具出错 还会继续执行其他的
+                continue 
             if hit:
                 code, reason = hit
                 _logger.warning(f"工具调用被拦截 [{code}]: {req.tool_name} | {reason}")

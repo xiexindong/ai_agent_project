@@ -6,6 +6,10 @@
 **端到端流程见 [`Harness执行流程.md`](./Harness执行流程.md)**（从提问到回灌，六阶段 + 拦截码 + 配置映射）。
 本篇讲「每层是什么、为什么这么设计」。
 
+> **别混名**：本篇讲**工具侧** Harness（单个工具让不让调、在哪调）。
+> 多 Agent 的团队运行时是另一个同名文件 `modules/multiagent/harness.py`，
+> 骨架见 [`多AgentHarness执行流程骨架.md`](./多AgentHarness执行流程骨架.md)。
+
 ---
 
 ## 一、为什么需要这一层

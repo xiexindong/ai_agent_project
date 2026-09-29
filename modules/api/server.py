@@ -309,7 +309,17 @@ class APIServer:
                 self.ctx.harness = build_harness(
                     llm=self.ctx.llm, tool_registry=self.ctx.tool_registry
                 )
-                _logger.info("多 Agent 团队已装配: 4 人（主管/检索/分析/审核）")
+                # 【委派状态要打在启动日志里】它默认关闭，
+                #   不看这行就无法判断接口返回的 RunResult.delegations 为什么一直是空
+                s2 = get_settings()
+                _logger.info(
+                    "多 Agent 团队已装配: 4 人（主管/检索/分析/审核） | 委派="
+                    + ("开" if s2.multiagent_delegation_enabled else "关")
+                    + (f"（深度<={s2.multiagent_delegation_max_depth} "
+                       f"总次数<={s2.multiagent_delegation_max_per_run} "
+                       f"单人<={s2.multiagent_delegation_max_per_agent}）"
+                       if s2.multiagent_delegation_enabled else "")
+                )
         except Exception as e:
             _logger.warning(f"多 Agent 模块降级（/agent/* 接口不可用）: {e}")
             self.ctx.harness = None
