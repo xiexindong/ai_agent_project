@@ -44,10 +44,18 @@ class RAGChain:
                      为空时由 chunk 的 metadata 决定，再没有则落到默认库。
         """
         doc = self.loader.load(file_path)
+        # 【切片】TextSplitter.split_document() → modules/rag/text_splitter.py:95
+        #   按 chunk_size=500 / chunk_overlap=80 切分（29 行构造时传入），
+        #   每个分片带上 chunk_id/chunk_index/total_chunks 元数据，供检索后溯源与拼接；
+        #   返回 List[TextChunk]，空列表 = 文档无可切内容（见下面 52 行的判断）
         chunks: List[TextChunk] = self.splitter.split_document(doc)
         if not chunks:
             _logger.warning(f"文档无有效内容: {file_path}")
             return 0
+        # 【向量化 + 写库】MilvusVectorStore.insert_chunks() → modules/rag/vector_store.py:207
+        #   内部三步：embed_batch 批量向量化 → 按 kb_code 分组到不同物理集合 → insert + flush
+        #   kb_code 为空时取 chunk.metadata["kb_code"]，再没有就落默认库（215 行注释）
+        #   返回实际写入条数；本行没接返回值，下面日志用的是 len(chunks)（切出多少就报多少）
         self.vector_store.insert_chunks(chunks, kb_code=kb_code)
         _logger.info(f"文档入库完成: {file_path} | 分片={len(chunks)} | 知识库={kb_code or '默认'}")
         return len(chunks)

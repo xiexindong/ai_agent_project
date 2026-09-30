@@ -264,7 +264,7 @@ class ToolHarness:
         decision = self.policy.decide(cap)
         if decision.denied:                                     # ① 配置层面禁止执行
             _logger.warning(f"工具被策略禁止: {req.tool_name} | {decision.reason}")
-            return ToolVerdict.block(code="policy_denied", decision.reason, action=ACTION_DENY)
+            return ToolVerdict.block(code="policy_denied", reason=decision.reason, action=ACTION_DENY)
 
         # 【作用】五道安检：参数 → 权限 → 数据范围 → 限流 → 预算，任一不过直接拦下
         verdict = self.chain.run(req)                           # ② 五道中间件

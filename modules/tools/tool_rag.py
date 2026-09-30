@@ -87,18 +87,26 @@ class ToolRAGIndex:
     # 【什么】给工具建索引，返回新编码的工具数
     # 【作用】文本没变且已编码的工具跳过，避免重复调 embedding
     def index_tools(self, tools: list) -> int:
+        # pending = 本轮真正需要编码的工具 [(名字, 画像文本), ...]；攒完再批量编码，
+        #           一次 embed_batch 搞定，避免每个工具各调一次 embedding（省调用、省钱）
         pending: List[tuple] = []
         for tool in tools or []:
+            # 【归一化】BaseTool 实例与网关目录 dict 两种来源统一成 (name, desc, schema, meta)
+            #   → _normalize() 见本文件 263 行
             name, desc, schema, meta = self._normalize(tool)
-            if not name:
+            if not name:                                    # 没有名字的工具无法召回（召回结果靠名字取实例），直接跳过
                 continue
+            # 【用途画像】"名字。描述 可填参数: a、b" —— 只描述"干什么"，不含 JSON Schema 细节，
+            #   否则参数噪声会干扰相似度 → _routing_text() 见本文件 255 行
             text = self._routing_text(name, desc, schema)
+            # 【是否已编码过】向量不可用时恒为 True（没有向量可比对，只靠文本判断）；
+            #   向量可用时要求 _vectors 里已有它，否则补一次编码
             already_indexed = not self._vector_available or name in self._vectors
             if self._texts.get(name) == text and already_indexed:
-                continue
-            self._texts[name] = text
-            self._metas[name] = meta
-            pending.append((name, text))
+                continue                                    # 文本没变且已编码 → 跳过，网关 refresh 重喂同一批工具时不重复花钱
+            self._texts[name] = text                        # 文本表：向量与关键词召回共用
+            self._metas[name] = meta                        # 元信息表：记录来源 server，排查"这工具哪来的"用
+            pending.append((name, text))                    # 文本变了或还没编码 → 加入待编码队列
 
         if not pending:
             return 0

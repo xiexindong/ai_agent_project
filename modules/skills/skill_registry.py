@@ -333,7 +333,8 @@ class SkillRegistry:
         if not name or name.lower() in ("none", "null", "无"):
             _logger.info(f"[L3 LLM路由] 模型判定无合适技能: reason={reason}")
             return None
-        skill = self._skills.get(name)
+            # 这一步是容错处理 要和本地的 skills的名字进行匹配
+        skill = self._skills.get(name)  
         if skill is None:
             _logger.warning(
                 f"[L3 LLM路由] 模型返回了未注册的技能名 '{name}'（幻觉），按未命中处理"

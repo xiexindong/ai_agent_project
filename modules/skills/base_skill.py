@@ -93,7 +93,7 @@ class BaseSkill(ABC):
           即命中 1 个双字意图词，或 3 个以上单字弱词）。
         """
         text = (query or "").lower()
-        hits = [kw for kw in self.trigger_keywords if kw.lower() in text]
+        hits: list[str] = [kw for kw in self.trigger_keywords if kw.lower() in text]
         if not hits:
             return SkillMatch(skill=self, score=0.0, hit_keywords=[])
         hit_weight = sum(self._keyword_weight(kw) for kw in hits)

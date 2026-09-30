@@ -7,8 +7,9 @@ ReAct Agent 模块
 """
 # 【什么】标准库 + 校验器 + LLM 客户端 + 提示词注册表
 # 【作用】清洗输入、检测注入、修 JSON、取提示词模板，都是 ReAct 每轮要用的东西
+import json
 import time
-from typing import Optional
+from typing import Optional, Tuple
 from modules.common.logger import get_logger
 from modules.common.exceptions import LLMException, ToolException, handle_exception
 from modules.common.validator import sanitize_input, check_prompt_injection, repair_json
@@ -58,13 +59,24 @@ class ReActAgent:
         self.rag = rag_chain                        # RAG 链
         self.memory = memory_manager                # 记忆管理器
         self.skill_registry = skill_registry        # 技能注册表
-        # L0 路由层（可选）：没有它时退化为「全部工具」，行为与改造前一致
+        # L0 路由层（可选）：没有它时退化为「全部工具」，行为与改造前一致   这个要重点读一下
         self.router = router
         # 工具 Harness（可选）：为 None 时不做能力裁决、预算控制与沙箱隔离（改造前行为）
         self.tool_harness = tool_harness
         from config import get_settings
         s = get_settings()
         self._max_iter = s.max_react_iterations     # ReAct 轮次上限，写进提示词与 state.max_iterations
+
+        # ------------------------------------------------------------------
+        # 【循环防护的两道补充闸】配合"同名同参去重"(581) 与 max_iterations(599) 用
+        #   getattr 而不是直接取属性：未在 Settings 里配置时用默认值，
+        #   避免"加了个字段就必须改配置类"的强耦合（项目既有写法，见 harness.py 的 tool_sandbox_image）
+        # ------------------------------------------------------------------
+        self._loop_guard_enabled = bool(getattr(s, "agent_loop_guard_enabled", True))          # 总开关
+        self._cycle_min_period = max(2, int(getattr(s, "agent_cycle_min_period", 2) or 2))     # 最短环长：2 = A→B→A→B
+        self._cycle_max_period = max(self._cycle_min_period,
+                                     int(getattr(s, "agent_cycle_max_period", 3) or 3))        # 最长环长：3 = A→B→C→A→B→C
+        self._stall_rounds = max(2, int(getattr(s, "agent_stall_rounds", 3) or 3))             # 连续几次结果一模一样 = 无进展
 
         # ------------------------------------------------------------------
         # 【提示词装配在这里定型，之后每轮只重拼 user】
@@ -87,7 +99,7 @@ class ReActAgent:
             max_iter=self._max_iter,                                   # 写进模板变量 max_iter
             max_context_tokens=s.max_prompt_context_tokens,            # 上下文 token 预算，超了由 builder 裁剪
         )
-        self.system_prompt = self._builder.system_prompt()             # 每轮都一样，算一次存着复用
+        self.system_prompt = self._builder.system_prompt()             # PromptBuilder.system_prompt() → modules/prompt/builder.py:190；每轮都一样，算一次存着复用
 
         # ------------------------------------------------------------------
         # 【任务规划器（Plan-and-Execute）】复杂流程先拆步骤再逐步执行
@@ -135,10 +147,11 @@ class ReActAgent:
         # 【开一本预算账】新一轮提问 = 新预算：调用次数 / token / 墙钟时间都从这里开始算
         #   Harness 为 None 时整段跳过（改造前行为）
         if self.tool_harness is not None:
-            self.tool_harness.begin_run(session_id)
+            self.tool_harness.begin_run(session_id)      # ToolHarness.begin_run() → modules/harness/harness.py:218；新一轮开一本预算账
 
+        # 恶意指令检测
         if check_prompt_injection(query):
-            return AgentState(
+            return AgentState(   #初始化state
                 session_id=session_id,
                 user_id=user_id,
                 user_query=query,
@@ -147,8 +160,8 @@ class ReActAgent:
                 final_answer="检测到潜在的指令注入，已拦截。请使用正常方式提问。",
                 error="prompt_injection_blocked",
             )
-
-        clean_query = sanitize_input(query)
+        # 去控制字符 + 截断 + 去首尾空白
+        clean_query = sanitize_input(text=query)
         state = AgentState(
             session_id=session_id,
             user_id=user_id,
@@ -159,7 +172,7 @@ class ReActAgent:
 
         if self.skill_registry:
             try:
-                matched_skill, skill_ctx = self.skill_registry.build_skill_context(clean_query)
+                matched_skill, skill_ctx = self.skill_registry.build_skill_context(clean_query)   # SkillRegistry.build_skill_context() → modules/skills/skill_registry.py:388
                 if matched_skill:
                     state.active_skill = matched_skill.name
                     state.skill_context = skill_ctx
@@ -169,13 +182,13 @@ class ReActAgent:
                 state.skill_context = ""
 
         if self.memory:
-            try:
+            try:   
                 query_emb = None
                 from modules.memory.embedding_service import get_embedding_service
                 query_emb = get_embedding_service().embed(clean_query)
-                mem_ctx = self.memory.build_context(
+                mem_ctx = self.memory.build_context(      # MemoryManager.build_context() → modules/memory/memory_manager.py:65
                     session_id, user_id, clean_query, query_emb
-                )
+                )                                          # 返回 dict：context_text + 长期/短期记忆 + 两个观测标记
                 state.memory_context = mem_ctx["context_text"]
                 state.long_term_memory = mem_ctx["long_term_memory"]
                 state.short_term_memory = mem_ctx["short_term_memory"]
@@ -185,22 +198,23 @@ class ReActAgent:
             except Exception as e:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
                 state.memory_context = ""
-
+        # 根据权限载体生成知识库过滤表达式
         if self.rag:
             try:
                 expr = self._kb_expr(principal)
-                rag_ctx = self.rag.build_context(clean_query, expr=expr)
+                rag_ctx = self.rag.build_context(clean_query, expr=expr)      # RAGChain.build_context() → modules/rag/rag_chain.py:124；拼成"## 知识库参考"文本
                 state.rag_context = rag_ctx
-                state.rag_sources = self.rag.retrieve(clean_query, expr=expr) if rag_ctx else []
+                state.rag_sources = self.rag.retrieve(clean_query, expr=expr) if rag_ctx else []   # RAGChain.retrieve() → modules/rag/rag_chain.py:75；单独取来源清单供前端展示引用
                 if expr:
                     _logger.info(f"知识库权限过滤已生效: {expr}")
             except Exception as e:
                 _logger.warning(f"RAG召回异常降级: {e}")
                 state.rag_context = ""
 
+        # 【什么】标准答案库匹配
         if self.memory and self.memory.pg:
             try:
-                stds = self.memory.pg.match_standard_answers(clean_query, limit=2)   # 最多取 2 条标准答案
+                stds = self.memory.pg.match_standard_answers(clean_query, limit=2)   # PGManager.match_standard_answers() → modules/memory/pg_manager.py:959；最多取 2 条标准答案
                 if stds:
                     std_text = "\n".join(
                         f"【标准答案{i + 1}】问：{s['question']}\n答：{s['answer']}"
@@ -318,7 +332,7 @@ class ReActAgent:
         """是否需要规划：规划器未启用 / 已有计划 → 一律不规划。"""
         if self.planner is None or state.sub_tasks:
             return False                                   # 已有计划：重规划只在步骤失败时发生，不在这里
-        return self.planner.needs_planning(state.user_query, state.skill_context)
+        return self.planner.needs_planning(state.user_query, state.skill_context)   # TaskPlanner.needs_planning() → modules/agent/planner.py:262
 
     # 【什么】生成执行计划并写进 state
     # 【作用】plan 节点的业务体；计划以结构化步骤存进 sub_tasks，可随 state 断点续跑
@@ -326,7 +340,7 @@ class ReActAgent:
         """生成执行计划。规划不可用时 planner 会返回单步计划，行为等同不规划。"""
         if self.planner is None:
             return state
-        plan = self.planner.create_plan(
+        plan = self.planner.create_plan(          # TaskPlanner.create_plan() → modules/agent/planner.py:304
             state.user_query,
             tools_desc=self._tools_overview(),
             skill_context=state.skill_context,
@@ -350,12 +364,12 @@ class ReActAgent:
     # 【什么】把计划写回 state
     # 【作用】步骤列表 + 思路 + 重规划次数 + 指针（指向第一个待做步骤）
     def _save_plan(self, state: AgentState, plan: "ExecutionPlan") -> None:
-        state.sub_tasks = [s.to_dict() for s in plan.steps]
-        state.plan_rationale = plan.rationale
-        state.plan_replan_count = plan.replan_count
+        state.sub_tasks = [s.to_dict() for s in plan.steps]      # 步骤列表（dict，因为 LangGraph 只认 dict）
+        state.plan_rationale = plan.rationale                    # 总体思路
+        state.plan_replan_count = plan.replan_count              # 已重排几次
         state.current_task_index = next(
             (i for i, s in enumerate(plan.steps) if s.is_open), len(plan.steps)
-        )
+        )                                                        # 指针 = 第一个未闭合步骤的下标
 
     # 【什么】渲染注入 prompt 的计划进度
     # 【作用】让模型每轮看见"总计划 + 已完成 + 当前步"；没有计划时返回空串（prompt 一字不改）
@@ -388,7 +402,7 @@ class ReActAgent:
             return ""
         return "\n".join(
             f"- {t.name}: {getattr(t, 'description', '')}"
-            for t in self.tool_registry.list_tools()
+            for t in self.tool_registry.list_tools()   # ToolRegistry.list_tools() → modules/tools/tool_registry.py:130
         )
 
     # 【什么】一步做完之后推进计划
@@ -409,7 +423,7 @@ class ReActAgent:
             "status": STATUS_DONE if ok else STATUS_FAILED, "result": brief,
         })
         if not ok and self.planner is not None:
-            plan = self.planner.replan(plan, observation=state.observation or "",
+            plan = self.planner.replan(plan, observation=state.observation or "",    # TaskPlanner.replan() → modules/agent/planner.py:368
                                        tools_desc=self._tools_overview())
         self._save_plan(state, plan)
         _logger.info(f"计划推进: {step.id} → {'完成' if ok else '失败'} | "
@@ -458,23 +472,23 @@ class ReActAgent:
         #   墙钟超时或 token 预算打满时不再问模型（问了也只会再要一次工具），
         #   直接收尾出答案——这对应"上下文膨胀"的最后一道防线。
         # ------------------------------------------------------------------
-        if self.tool_harness is not None:
-            budget = self.tool_harness.budget(state.session_id)
-            if budget.expired or budget.tokens >= budget.spec.token_budget:
-                _logger.warning(f"运行预算已用尽，强制收尾: {budget.snapshot()}")
-                state.need_tool_call = False
-                state.action = {}
-                state.finished = True
+        if self.tool_harness is not None:                                           # 没装 Harness 就没有账本，纯 LLM 模式不做预算管控
+            budget = self.tool_harness.budget(state.session_id)                     # ToolHarness.budget() → modules/harness/harness.py:224；取这个会话的预算账本
+            if budget.expired or budget.tokens >= budget.spec.token_budget:         # 超时（120s）或上下文 token 用尽（6000）
+                _logger.warning(f"运行预算已用尽，强制收尾: {budget.snapshot()}")     # 快照含次数/token/剩余秒/blocked，便于分辨是哪一项打满
+                state.need_tool_call = False                                        # 不再走 act 节点（图路由据此跳过工具）
+                state.action = {}                                                   # 清空本轮动作，避免残留上一次的调用
+                state.finished = True                                               # 直接进 answer 节点收尾
                 state.final_answer = (
-                    state.final_answer
+                    state.final_answer                                              # 已有答案就保留，不覆盖模型此前产出的内容
                     or "已达到本次运行的工具调用预算（时间或上下文额度用尽），以下基于已有信息作答。"
-                )
-                return state
+                )                                                                   # 确实没有才填兜底句，告诉用户是"基于已有信息"
+                return state                                                        # 提前返回：跳过工具路由/拼 prompt/调 LLM，省掉这次调用
 
         tools_schema = []
         tools_desc = "（无可用工具）"
         if self.tool_registry:
-            selected = self.tool_registry.list_tools()
+            selected = self.tool_registry.list_tools()      # ToolRegistry.list_tools() → modules/tools/tool_registry.py:130
             if self.router:
                 # ------------------------------------------------------------------
                 # 【L0 路由：只在本轮第 1 次算名单，之后沿用】
@@ -486,36 +500,41 @@ class ReActAgent:
                 #   网关目录里的工具此刻才连 server、注册进 registry；
                 #   没被召回的远程工具不会起进程，也不会进 prompt。
                 # ------------------------------------------------------------------
-                if not state.routed_tools:
-                    decision = self.router.route(
-                        state.user_query,
-                        registry=self.tool_registry,
-                        skill_name=state.active_skill,
+                if not state.routed_tools:                          # 只在本轮第 1 次算名单，之后沿用（中途换名单会让模型困惑）
+                    decision = self.router.route(                    # AgentRouter.route() → modules/agent/router.py:148
+                        state.user_query,                           # 语义召回用：按这句话找相关工具
+                        registry=self.tool_registry,                # 候选池来源：本地已注册的工具
+                        skill_name=state.active_skill,              # 已匹配的技能：有则优先走它的推荐工具
                     )
-                    state.routed_tools = list(decision.tool_names)
+                    state.routed_tools = list(decision.tool_names)   # 存进 state：后续轮次与断点续跑都沿用同一份名单
                 selected = [
-                    t for t in self.tool_registry.list_tools()
+                    t for t in self.tool_registry.list_tools()      # 同上 modules/tools/tool_registry.py:130；routed_tools 只有名字，这里按名字取回工具对象
                     if t.name in state.routed_tools
-                ]
+                ]                                                   # 本轮真正进 prompt 的工具集
                 _logger.info(
                     f"本轮工具名单 {len(selected)}/{len(state.routed_tools or [])} 个"
-                    f"（候选池 {len(self.tool_registry.list_tools())}）: "
+                    f"（候选池 {len(self.tool_registry.list_tools())}）: "   # 同上：候选池 = 全部已注册工具
                     + "、".join(t.name for t in selected)
                 )
-            allowed = self._allowed_tools(state.principal, selected)
-            user_level = state.principal.user_level if state.principal else "normal"
-            tools_schema = self.tool_registry.get_openai_tools_schema(
-                user_level=user_level, allowed=allowed
-            )
+            allowed = self._allowed_tools(state.principal, selected)     # RBAC 过滤：RBAC = Role-Based Access Control，基于角色的访问控制。本轮名单 ∩ 该用户有权用的工具
+            user_level = state.principal.user_level if state.principal else "normal"   # 权限等级；无登录态按普通用户
+            tools_schema = self.tool_registry.get_openai_tools_schema(      # ToolRegistry.get_openai_tools_schema() → modules/tools/tool_registry.py:141
+                user_level=user_level,          # 用户等级（normal/advanced/admin）：allowed 为空时才按它过滤
+                allowed=allowed,                # 本轮白名单（工具对象或名字都收）；[] = 全屏蔽，不是"不过滤"
+            )                                   # 返回 OpenAI Function Calling 的 tools 数组
+            #  ↑ 一份 schema 两用：① 下面 invoke_with_tools 的 tools 参数（模型据此发起调用）
+            #    ② 512 行拼成 tools_desc 文本（prompt 的"## 可用工具"一节），两者永远同源一致
             tools_desc = "\n".join(
                 f"- {t['function']['name']}: {t['function']['description']}"
                 for t in tools_schema
             ) or "（无可用工具）"
 
-        tool_history = "\n".join(
-            f"  - {log.get('name', '')}({log.get('arguments', {})}) → {log.get('result', '')[:100]}"
-            for log in state.tool_calls_history
-        ) or "（无）"
+        tool_history = "\n".join(                                    # 【为什么还要有它】observation 只留最近一次结果且每轮被覆盖，
+            f"  - {log.get('name', '')}({log.get('arguments', {})}) → {log.get('result', '')[:100]}"   # 模型不记得自己做过什么就会重复调用
+            for log in state.tool_calls_history                      #  ↑ 结果截 100 字：这里只做"索引"，完整结果在 observation 里
+        ) or "（无）"                                                #  ↑ 首轮给占位而不是留空：空槽会让模型自己脑补历史
+        #  ↑ 软硬两条防线：本行是软的（给模型看账本），
+        #    _last_same_success_call（576 行）是硬的（拿 tool_calls_history 精确比对工具名+参数，重复就收敛）
 
         # ------------------------------------------------------------------
         # 【这一行替代了原来的 REASON_PROMPT.format(...)】
@@ -526,7 +545,7 @@ class ReActAgent:
         #     3. 返回值里带 prompt_tokens 与 trimmed，裁剪动作可查（见 debug 日志）
         #   messages 已经是 [system, user] 两条，system 用 __init__ 里算好的那份。
         # ------------------------------------------------------------------
-        rec = self._builder.build_record(
+        rec = self._builder.build_record(                            # PromptBuilder.build_record() → modules/prompt/builder.py:105；把 8 段上下文填进 react.reason 模板，产出 [system, user] 两条消息
             state.user_query,
             permission_context=self._permission_context(state.principal),
             skill_context=state.skill_context or "（未匹配到专门技能，按通用企业助手流程处理）",
@@ -541,20 +560,20 @@ class ReActAgent:
 
         # 【计划上下文注入】有计划时把"总计划 + 已完成 + 当前步"并进 user 消息；
         #   没有计划（未开启或不复杂）时 plan_text 为空，messages 一字不动
-        plan_text = self._plan_context(state)
+        plan_text = self._plan_context(state)                        # 渲染计划进度；没有计划时返回空串，messages 一字不动
         if plan_text:
-            rec = self._with_plan(rec, plan_text)
-            _logger.info(f"计划上下文已注入 prompt（{len(plan_text)} 字）")
+            rec = self._with_plan(rec, plan_text)                    # 追加到最后一条 user 消息末尾（模板只有 8 个槽位，计划不走槽位）
+            _logger.info(f"计划上下文已注入 prompt（{len(plan_text)} 字）")   # 注入字数：规划是否真生效，靠这条日志确认
 
-        result = self.llm.invoke_with_tools(
-            messages=rec["messages"],
-            tools=tools_schema,
+        result = self.llm.invoke_with_tools(                         # LLMClient.invoke_with_tools() → modules/agent/llm.py:336；本轮唯一一次 LLM 调用
+            messages=rec["messages"],                                # [system, user] 两条，system 每轮不变
+            tools=tools_schema,                                      # Function Calling 工具说明书（已过路由 + RBAC）
         )
 
-        state.reasoning = result["content"] or ""
-        tool_calls = result.get("tool_calls")
+        state.reasoning = result["content"] or ""                    # 模型的文字输出：可能是思考过程，也可能就是最终答案
+        tool_calls = result.get("tool_calls")                        # 模型要求调用的工具列表；为空 = 它要直接作答
 
-        if tool_calls and state.iteration < state.max_iterations:
+        if tool_calls and state.iteration < state.max_iterations:     # 还要看轮次上限：到顶则强制作答，不再调工具
             # ------------------------------------------------------------------
             # 【重复动作强制收敛】模型拿到工具结果后仍反复调同一个工具时的刹车
             #   判定：本次动作与「最近一次成功调用」的工具名与参数完全一致
@@ -571,26 +590,62 @@ class ReActAgent:
             #         history 里已有同名同参且成功的一条（result='21'）
             #   输出：need_tool_call=False，observation='...结果如下...21'
             # ------------------------------------------------------------------
-            repeated = self._last_same_success_call(state, tool_calls[0])
-            if repeated is not None:
+            repeated = self._last_same_success_call(state, tool_calls[0])   # 与最近一次"同名同参且成功"的调用比对
+            if repeated is not None:                                        # 命中 = 模型在同一件事上打转
                 _logger.warning(
                     f"检测到重复工具调用，强制收敛: {tool_calls[0].get('name')}"
-                )
-                state.need_tool_call = False
+                )                                                           # 实测：同一句"3*7"曾连调 9 次计算器，拖到 14 秒
+                state.need_tool_call = False                                # 不再进 act，这一轮就收尾
                 state.observation = (
                     f"工具 {repeated.get('name', '')} 已用相同参数执行过，"
                     f"结果如下（不要重复调用，直接据此作答）：\n{repeated.get('result', '')}"
+                )                                                           # 把上次结果回灌，模型有东西可答，不会空转
+                state.final_answer = ""                                     # 清空上一轮残留答案，让 answer 节点重新生成
+                return state                                                # 提前返回：跳过 act，省掉一次工具调用
+            # 【两道补充闸：交替环 + 无进展】"同名同参"那条抓的是"原地打转"，
+            #   下面两条抓的是"换着花样打转"——A→B→A→B 这种环、以及每次都拿到一模一样的结果
+            if self._loop_guard_enabled:
+                cycle = self._detect_cycle(
+                    getattr(state, "tool_calls_history", []), tool_calls[0],
+                    self._cycle_min_period, self._cycle_max_period,
                 )
-                state.final_answer = ""
-                return state
-            state.need_tool_call = True
-            state.action = tool_calls[0]
+                if cycle is not None:
+                    period, names = cycle
+                    _logger.warning(f"检测到交替循环调用（周期 {period}）: {' → '.join(names)} → …，强制收敛")
+                    state.need_tool_call = False
+                    state.observation = (
+                        f"检测到调用循环：{' → '.join(names)} 已重复 {2} 轮（周期 {period}），"
+                        "继续调用不会得到新信息。请基于已有结果直接作答，不要换工具重试同一件事。"
+                    )
+                    state.final_answer = ""
+                    return state
+                if self._no_progress(getattr(state, "tool_calls_history", []), self._stall_rounds):
+                    last = (getattr(state, "tool_calls_history", []) or [])[-1]
+                    _logger.warning(f"检测到连续 {self._stall_rounds} 次调用结果无变化，强制收敛")
+                    state.need_tool_call = False
+                    state.observation = (
+                        f"最近 {self._stall_rounds} 次工具调用返回的结果完全一致，判定为无进展。\n"
+                        f"最新结果：{str(last.get('result', ''))[:300]}\n"
+                        "请基于这个结果直接作答，不要再尝试其他工具。"
+                    )
+                    state.final_answer = ""
+                    return state
+            state.need_tool_call = True                                     # 正常路径：这一轮要调工具
+            state.action = tool_calls[0]                                    # 只取第一个调用，多工具并行暂不支持
         else:
-            state.need_tool_call = False
-            state.final_answer = result["content"] or "抱歉，我暂时无法回答这个问题。"
+            state.need_tool_call = False                                    # 模型没要工具 = 它认为可以直接作答
+            state.final_answer = result["content"] or "抱歉，我暂时无法回答这个问题。"   # content 为空时兜底，避免返回空答案
 
-        if state.iteration >= state.max_iterations and state.need_tool_call:
-            _logger.warning(f"达到最大循环次数{state.max_iterations}，强制终止ReAct循环")
+        # 【两个参数分别是什么】
+        #   state.iteration      = 当前是第几轮 ReAct：reason_step 开头（467 行）state.iteration += 1，从 1 起算
+        #   state.max_iterations = 轮次上限：默认 10，来自 settings.max_react_iterations(68 行)，
+        #                          在 prepare_state 建 AgentState 时写入（169 行），
+        #                          同时也写进提示词"最多循环10次"，让模型自己知道有这个上限
+        # 【为什么用 >= 而不是 >】iteration 从 1 起算，等于上限时这一轮已经是第 10 轮，不能再开第 11 轮
+        # 【为什么还要 and need_tool_call】只有"还想调工具"才需要强制收尾；
+        #                                 模型本来就要直接作答时不去动它，否则会覆盖它已生成的 final_answer
+        if state.iteration >= state.max_iterations and state.need_tool_call:   # 到顶了还想调工具：强制作答，不再循环
+            _logger.warning(f"达到最大循环次数{state.max_iterations}，强制终止ReAct循环")   # 撞上限 = 模型在"调工具-看结果-再调"里绕圈
             state.need_tool_call = False
             state.final_answer = result["content"] or "已达到最大推理次数，基于当前信息给出最佳答案。"
 
@@ -615,6 +670,60 @@ class ReActAgent:
             if log.get("success") and log.get("name") == name and log.get("arguments") == args:
                 return log
         return None
+
+    # 【什么】把一个动作（工具名 + 参数）压成可比对的键
+    # 【作用】周期检测与去重都靠它；参数用 sort_keys 序列化，避免键顺序不同被当成两个动作
+    @staticmethod
+    def _action_key(call: dict) -> str:
+        """动作指纹：工具名 + 规范化后的参数，形如 'data_query|{"quarter":"Q4"}'。"""
+        name = str(call.get("name", "") or "")
+        args = call.get("arguments", {}) or {}
+        try:
+            args_text = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            args_text = str(args)                      # 参数里有不可序列化对象时退化为字符串，宁可粗也不崩
+        return f"{name}|{args_text}"
+
+    # 【什么】检测「交替环」：A→B→A→B / A→B→C→A→B→C
+    # 【作用】补"同名同参去重"抓不到的那类循环——每一步都和上一次不同，但整段在重复
+    @classmethod
+    def _detect_cycle(cls, history: list, pending_call: dict,
+                      min_period: int = 2, max_period: int = 3) -> Optional[Tuple[int, list]]:
+        """判断"历史 + 本次动作"的尾部是否由某个周期重复构成。
+
+        【判定方法】对每个候选周期 p，取尾部 2p 个动作键，检查 key[i] == key[i-p]，
+                   全等则说明最后 2p 步是同一个长度为 p 的片段重复了两遍。
+        【为什么要 2p】只看 p 个无法区分"重复"与"恰好相同的一步"；要看到同一片段出现两次才算环。
+        【输入输出对照】
+            in   history=[A,B,A], pending=B, p=2  → 键序列 A,B,A,B → key[2]==key[0]、key[3]==key[1]
+            out  (2, ['data_query', 'report_write'])   ← 周期 2，环里的工具名
+        """
+        keys = [cls._action_key(h) for h in (history or [])]
+        keys.append(cls._action_key(pending_call or {}))     # 把"即将执行的这次"也算进去，否则要等它执行完才能发现
+        for p in range(max(2, int(min_period)), max(2, int(max_period)) + 1):
+            if len(keys) < 2 * p:
+                continue
+            tail = keys[-(2 * p):]
+            if all(tail[i] == tail[i - p] for i in range(p, len(tail))):
+                return p, [k.split("|", 1)[0] for k in tail[:p]]
+        return None
+
+    # 【什么】进展检测：最近 N 次成功调用返回的结果是否一模一样
+    # 【作用】抓"每次都调不同工具、但拿到的东西没变"这类隐形卡死
+    @staticmethod
+    def _no_progress(history: list, rounds: int = 3) -> bool:
+        """最近 rounds 次成功调用的结果完全一致 → 判定无进展。
+
+        【为什么只看成功的】失败的调用结果都是错误串，本来就相同，会把"一直失败"误判成"无进展"；
+                           一直失败另有 max_calls_per_tool 与重规划去处理。
+        【为什么结果为空不算】空结果可能只是"工具没返回内容"，不足以判定停摆。
+        """
+        logs = [h for h in (history or []) if h.get("success")]
+        if len(logs) < max(2, int(rounds)):
+            return False
+        tail = logs[-max(2, int(rounds)):]
+        results = [str(t.get("result", "") or "").strip() for t in tail]
+        return bool(results[0]) and len(set(results)) == 1
 
     # 【什么】ReAct 的 Action 步骤：真正执行工具
     # 【作用】把执行结果写回 observation 与两条日志，供下一轮 Reason 参考
@@ -647,7 +756,7 @@ class ReActAgent:
             state.observation = "工具注册器未初始化，无法调用工具"
             return state
 
-        result = self.tool_registry.execute_tool(
+        result = self.tool_registry.execute_tool(      # ToolRegistry.execute_tool() → modules/tools/tool_registry.py:205
             name=tool_name,
             params=arguments,
             session_id=state.session_id,
@@ -695,7 +804,7 @@ class ReActAgent:
                 f"## 推理过程\n{state.reasoning}\n\n"
                 "请基于以上信息，给出完整详细的最终答案。"
             )
-            state.final_answer = self.llm.invoke(
+            state.final_answer = self.llm.invoke(      # LLMClient.invoke() → modules/agent/llm.py:297；汇总成文用的纯文本调用
                 prompt,
                 system_prompt=self.system_prompt,
             )
@@ -716,7 +825,7 @@ class ReActAgent:
                 return m.group(1).strip()[:100]     # 标签里的摘要最多留 100 字
         if self.memory:
             try:
-                summary = self.memory.summary_generator.generate_summary(
+                summary = self.memory.summary_generator.generate_summary(      # MemorySummaryGenerator.generate_summary() → modules/memory/summary_generator.py:90
                     state.user_query, state.final_answer
                 )
                 return summary

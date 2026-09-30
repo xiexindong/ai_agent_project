@@ -156,29 +156,38 @@ class AgentRouter:
         pool: Dict[str, object] = {}        # 工具名 → 工具对象（本地）或目录条目（远程）
         pool_names: List[str] = []          # 候选池名字列表，保序去重
 
+        # ------------------------------------------------------------------
+        # 【第 1 步：本地工具进池】已注册的本地工具一定是候选，先全部收进来。
+        #   registry 为 None 时这一段整个跳过（如纯远程场景）。
+        # ------------------------------------------------------------------
         for tool in (registry.list_tools() if registry else []):
             name = getattr(tool, "name", "")
-            if name and name not in pool:
+            if name and name not in pool:                  # 去重：本地与远程同名时以本地为准
                 pool[name] = tool
                 pool_names.append(name)
 
+        # ------------------------------------------------------------------
+        # 【第 2 步：远程目录进池】网关目录里的工具此刻只有描述、没有实例，
+        #   但照样参与"该不该用"的召回；能不能真调由第 6 步 ensure_registered 补上。
+        #   目录读失败只 warn 不抛：退化成"只按本地工具路由"，本轮照样能跑。
+        # ------------------------------------------------------------------
         remote_catalog = []
         if self.gateway:
             try:
-                remote_catalog = self.gateway.catalog()
+                remote_catalog = self.gateway.catalog()    # MCPGateway.catalog() → modules/mcp/gateway.py:222；只读元数据描述，不连 server
             except Exception as e:
                 _logger.warning(f"网关目录读取失败，本轮只按本地工具路由: {e}")
         for entry in remote_catalog:
             name = entry.get("name", "")
-            if name and name not in pool:
-                pool[name] = entry
+            if name and name not in pool:                  # 本地已存在的同名工具不覆盖
+                pool[name] = entry                         # 值是目录条目 dict，不是工具对象
                 pool_names.append(name)
 
         # ------------------------------------------------------------------
         # 【索引增量更新】只对新出现的工具编码；已索引的不会重复调 embedding。
         # ------------------------------------------------------------------
         if self.tool_index:
-            self.tool_index.index_tools([pool[n] for n in pool_names])
+            self.tool_index.index_tools([pool[n] for n in pool_names])   # ToolRAGIndex.index_tools() → modules/tools/tool_rag.py:89
 
         # ------------------------------------------------------------------
         # 【技能是怎么来的】三种来源，按代价从小到大：
@@ -190,33 +199,49 @@ class AgentRouter:
         if skill_match is not None:
             skill, route, score = skill_match.skill, "prepared", getattr(skill_match, "score", 0.0)
         elif skill_name and self.skill_registry:
-            skill = self.skill_registry.get_skill(skill_name)
+            skill = self.skill_registry.get_skill(skill_name)           # SkillRegistry.get_skill() → modules/skills/skill_registry.py:143
             route = "prepared" if skill else ""
         elif self.skill_registry:
-            m = self.skill_registry.match(query, query_emb=query_emb)
+            m = self.skill_registry.match(query, query_emb=query_emb)   # SkillRegistry.match() → modules/skills/skill_registry.py:360
             if m:
                 skill, route, score = m.skill, m.route, m.score
 
+        # ------------------------------------------------------------------
+        # 【第 3 步：种子 = 技能绑定工具】SOP 点名要用的工具，属于硬需求。
+        #   分数记 1.0 表示"强约束"，不参与后续排序，也不被截断挤掉。
+        #   name in pool：技能里写了但候选池没有的工具（未注册/被卸载）直接跳过，
+        #   否则名单里会出现模型看得见、调不到的幽灵工具。
+        # ------------------------------------------------------------------
         chosen: List[str] = []
         scores: Dict[str, float] = {}
         if skill is not None:
-            for name in getattr(skill, "bound_tools", []) or []:
+            for name in getattr(skill, "bound_tools", []) or []:   # 技能可能没配 bound_tools，None 也当空
                 if name in pool and name not in chosen:
                     chosen.append(name)
                     scores[name] = 1.0          # 1.0 = 技能强绑定，不参与分数排序
 
+        # ------------------------------------------------------------------
+        # 【第 4 步：语义召回补位】补上技能没点名、但语义相关的工具。
+        #   hit.name in pool  ：召回结果可能指向池外的工具（索引残留），过滤掉
+        #   not in scores     ：已在种子里的不再加一遍，分数也保持 1.0
+        #   tool_index 为 None 时整段跳过，名单只剩技能绑定 + 兜底。
+        # ------------------------------------------------------------------
         rag_hits: List[str] = []
         if self.tool_index:
-            for hit in self.tool_index.recall(query, top_k=self.top_k):
+            for hit in self.tool_index.recall(query, top_k=self.top_k):   # ToolRAGIndex.recall() → modules/tools/tool_rag.py:164；top_k 默认 5（配置 tool_rag_top_k）
                 if hit.name in pool and hit.name not in scores:
                     rag_hits.append(hit.name)
                     scores[hit.name] = hit.score
 
         merged = chosen + rag_hits                  # 种子在前、召回在后，技能绑定工具不会被挤掉
-        truncated = merged[: self.max_tools]        # 硬截断：名单再合理也不超过 max_tools
+        truncated = merged[: self.max_tools]        # 【第 5 步】硬截断：名单再合理也不超过 max_tools（默认 8）
 
+        # ------------------------------------------------------------------
+        # 【兜底与理由】四条分支互斥，reason 是给人看的一句话，source 是给机器看的标记。
+        #   两者一一对应：default 兜底 / skill_bound / tool_rag / skill_bound+tool_rag。
+        # ------------------------------------------------------------------
         if not truncated:
-            truncated = [n for n in self.default_tools if n in pool]
+            truncated = [n for n in self.default_tools if n in pool]     # 池里没有兜底工具时可能仍是空名单
             scores = {n: 0.0 for n in truncated}
             reason = "技能未命中且语义召回为空，回退默认工具兜底"
         elif chosen and rag_hits:
@@ -226,10 +251,10 @@ class AgentRouter:
         else:
             reason = f"无技能命中，按语义召回 {len(rag_hits)} 个"
 
-        if len(merged) > self.max_tools:
+        if len(merged) > self.max_tools:                                 # 被截断就补一句，日志里能看出"少了几个"
             reason += f"；候选 {len(merged)} 个超过单轮上限 {self.max_tools}，已截断"
 
-        source = "default"
+        source = "default"                                               # 默认兜底：chosen 与 rag_hits 都为空
         if chosen and rag_hits:
             source = "skill_bound+tool_rag"
         elif chosen:
@@ -244,15 +269,19 @@ class AgentRouter:
         if self.gateway and registry is not None:
             self.gateway.ensure_registered(registry, truncated)
 
+        # ------------------------------------------------------------------
+        # 【打包返回】只把名单里用到的分数带出去（scores.get 兜 0.0，防缺键）。
+        #   pool_size 是截断前的候选池规模，日志里"选 3/32"的分母就是它。
+        # ------------------------------------------------------------------
         decision = RoutingDecision(
-            tool_names=truncated,
-            tool_scores={n: scores.get(n, 0.0) for n in truncated},
-            source=source,
-            skill=skill,
-            skill_route=route,
-            skill_score=float(score or 0.0),
-            pool_size=len(pool_names),
-            reason=reason,
+            tool_names=truncated,                                       # 最终名单：本次路由唯一被外部使用的字段
+            tool_scores={n: scores.get(n, 0.0) for n in truncated},     # 只保留入选工具的分数
+            source=source,                                              # 名单来源，用于可解释性
+            skill=skill,                                                # 命中的技能实例（未命中为 None）
+            skill_route=route,                                          # keyword/vector/llm/prepared
+            skill_score=float(score or 0.0),                            # 转 float：上游可能给 None 或 numpy 标量
+            pool_size=len(pool_names),                                  # 候选池规模 N
+            reason=reason,                                              # 一句话理由
         )
-        _logger.info(f"[L0路由] {decision.describe()} | {reason} | query='{query[:30]}'")
+        _logger.info(f"[L0路由] {decision.describe()} | {reason} | query='{query[:30]}'")   # query 截 30 字：够定位又不会刷屏
         return decision

@@ -54,10 +54,10 @@ class RunBudget:
     """
 
     def __init__(self, session_id: str, spec: Optional[BudgetSpec] = None):
-        self.session_id = session_id
-        self.spec = spec or BudgetSpec()
-        self.started = time.time()
-        self.deadline = self.started + max(0.0, float(self.spec.timeout_seconds))
+        self.session_id = session_id                   # 账本归属的会话；日志与快照用它定位是哪次对话
+        self.spec = spec or BudgetSpec()               # 配额表；不传就用默认（8 次/5 次/6000 token/120 秒）
+        self.started = time.time()                     # 建账时刻；deadline 与 remaining_seconds 都以它为起点
+        self.deadline = self.started + max(0.0, float(self.spec.timeout_seconds))   # 墙钟到期时刻；max 防负数配置导致"一建账就超时"
         self.total_calls = 0                       # 已调用次数（含被拦截的不计）
         self.per_tool: Dict[str, int] = {}         # 工具名 → 已调用次数
         self.tokens = 0                            # 已回灌上下文的 token 累计

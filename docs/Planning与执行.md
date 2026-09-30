@@ -2,6 +2,9 @@
 
 > 代码：`modules/agent/planner.py`（规划器）+ `graph.py` 的 `plan` 节点 + `react_agent.py` 的注入与推进。
 > 开关：`AGENT_PLANNING_ENABLED`（**默认关闭**，关掉时整条链路与改造前逐字一致）。
+>
+> **想跟着一句话走完整条链路**（入口 → prepare → 判定 → 拆步骤 → 执行 → 推进 → 重规划 → 收敛 → 落库，
+> 每步带实测输出）：[`Planning全流程-阅读文档.md`](./Planning全流程-阅读文档.md)。本文是设计速查版。
 
 ---
 

@@ -313,15 +313,15 @@ class RBACService:
         if principal is None:
             return []
         allowed = []
-        for t in tools:
-            codes = [f"tool:{t.name}"]
+        for t in tools:                                              # 逐个判断，保留有权的，其余丢弃
+            codes = [f"tool:{t.name}"]                               # 权限码：本地工具只认 tool:{名字}
             if getattr(t, "tool_type", "local") == "mcp":
-                codes.append(f"tool:mcp:{t.name}")
-            if principal.can_any(codes):
+                codes.append(f"tool:mcp:{t.name}")                   # MCP 工具多一个码，便于按"整类 MCP"授权
+            if principal.can_any(codes):                             # 任一权限码命中即放行（或关系，不是都要有）
                 allowed.append(t)
             else:
-                _logger.info(f"工具被权限过滤: {t.name} | user={principal.user_code}")
-        return allowed
+                _logger.info(f"工具被权限过滤: {t.name} | user={principal.user_code}")   # 记 info：过滤是常态，不是错误
+        return allowed                                               # 返回的是子集（可能为空），绝不返回"全部"兜底
 
     def kb_expr(self, principal: Principal) -> Optional[str]:
         """

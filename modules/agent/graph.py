@@ -404,12 +404,13 @@ class AgentGraph:
             try:
                 snapshot = self._graph.get_state(config)
                 if snapshot and getattr(snapshot, "next", None):
+                    # ← 续跑：从 next 指向的节点继续
                     _logger.warning(f"检测到未完成任务，断点续跑: session={session_id} next={snapshot.next}")
                     return self._graph.invoke(None, config)
             except Exception as e:
                 _logger.warning(f"断点恢复失败，按新任务执行: {e}")
 
-        result: dict[str, Any] | Any = self._graph.invoke(initial_state, config)
+        result: dict[str, Any] | Any = self._graph.invoke(initial_state, config) #新任务：从入口节点开始
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "
             f"tool_calls={len(result.get('tool_call_logs', []))} | "

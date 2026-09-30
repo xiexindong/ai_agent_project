@@ -221,34 +221,53 @@ class MCPGateway:
     # ------------------------------------------------------------------
     def catalog(self, refresh: bool = False) -> List[dict]:
         """返回全部远程工具的元数据（不含任何连接状态假设）。"""
+        # ------------------------------------------------------------------
+        # 【为什么整段加锁】_tool_index（目录表）与 _clients（连接表）会被并发读写
+        #   （API 多线程请求 + 后台刷新），不加锁可能读到"建了一半的目录"。
+        # ------------------------------------------------------------------
         with self._lock:
+            # ------------------------------------------------------------------
+            # 【分支 1：目录已建好】最快路径：直接按内存里的表返回，不起任何连接。
+            #   返回的是拷贝（dict(...) 新建）：调用方改动不会污染网关内部表。
+            #   server 字段是后加的，用来在日志/路由里回溯"这个工具来自哪个 server"。
+            # ------------------------------------------------------------------
             if self._catalog_loaded and not refresh:
                 return [dict(e["info"], server=e["server"]) for e in self._tool_index.values()]
+
+            # ------------------------------------------------------------------
+            # 【分支 2：读落盘缓存】冷启动只会走到这里一次，之后都是分支 1。
+            #   refresh=True 时强制跳过缓存（server 侧增删工具后用它重拉）。
+            # ------------------------------------------------------------------
             cached = [] if refresh else self._read_cache()
             if cached:
                 for entry in cached:
                     self._tool_index[entry["name"]] = {
-                        "server": entry.get("server", ""),
-                        "info": {k: v for k, v in entry.items() if k != "server"},
+                        "server": entry.get("server", ""),                          # 老缓存可能没有 server 字段，兜空串
+                        "info": {k: v for k, v in entry.items() if k != "server"},  # 其余字段原样当工具元数据
                     }
                 self._catalog_loaded = True
                 self._stats.catalog_tools = len(self._tool_index)
                 _logger.info(f"MCP 工具目录来自缓存: {self._cache_path} | 工具数={len(self._tool_index)}")
-                return [dict[str, Any](e["info"], server=e["server"]) for e in self._tool_index.values()]
+                return [dict(e["info"], server=e["server"]) for e in self._tool_index.values()]
 
+            # ------------------------------------------------------------------
+            # 【分支 3：现连现拉】没缓存或要求刷新 —— 这一步才真正拉起子进程。
+            #   单个 server 出问题（连不上 / 发现失败）只跳过它，不影响其他 server，
+            #   也不抛异常：目录少几个工具远好过整个网关不可用。
+            # ------------------------------------------------------------------
             for name, cfg in self._servers.items():
-                if not cfg.enabled:
+                if not cfg.enabled:                             # 停用状态：登记着但不参与，用于临时摘故障 server
                     continue
-                client = self._connect(name)
+                client = self._connect(name)                    # 懒连接下，首次建目录才会真正起进程
                 if client is None:
                     continue
                 try:
-                    tools = client.discover_tools()
+                    tools = client.discover_tools()             # 只要元数据：name/description/inputSchema
                 except Exception as e:
                     _logger.warning(f"MCP 工具发现失败，跳过该 server: {name} | {e}")
                     continue
                 for t in tools:
-                    self._tool_index[t["name"]] = {"server": name, "info": t}
+                    self._tool_index[t["name"]] = {"server": name, "info": t}   # 同名工具：后连的 server 覆盖先连的
                 # ------------------------------------------------------------------
                 # 【拉完目录就断开】目录是元数据，不需要子进程常驻；
                 #   真正调用时 _connect 会重新拉起（同一份配置，行为一致）。
@@ -257,11 +276,11 @@ class MCPGateway:
                 # ------------------------------------------------------------------
                 if self._lazy and cfg.transport != TRANSPORT_HTTP:
                     client.disconnect()
-                    self._clients.pop(name, None)
+                    self._clients.pop(name, None)                # 连 _clients 里的记录一起清，下次 _connect 重新拉起
 
             self._catalog_loaded = True
             self._stats.catalog_tools = len(self._tool_index)
-            self._write_cache()
+            self._write_cache()                                  # 落盘：下次启动走分支 2，一个 server 都不用起
             _logger.info(f"MCP 工具目录已建立: 工具数={len(self._tool_index)} | servers={self.server_names}")
             return [dict(e["info"], server=e["server"]) for e in self._tool_index.values()]
 
@@ -343,34 +362,51 @@ class MCPGateway:
     # 【作用】带缓存复用、熔断拦截与重试；连不上返回 None 而不是抛异常
     # ------------------------------------------------------------------
     def _connect(self, server: str):
+        # ------------------------------------------------------------------
+        # 【复用已有连接】_clients 里还活着就直接返回，不再起一次子进程。
+        #   is_connected 用 getattr 取：http 客户端也有同名字段，两种传输共用这条路径。
+        # ------------------------------------------------------------------
         existing = self._clients.get(server)
         if existing is not None and getattr(existing, "is_connected", False):
             return existing
+
+        # 【查配置】没登记或已停用 → 返回 None（调用方据此跳过，不抛异常）
         cfg = self._servers.get(server)
         if cfg is None or not cfg.enabled:
             return None
+
+        # 【熔断前置检查】这个 server 刚连续失败过就直接不连，避免每次请求都去撞一次超时；
+        #   熔断按 "mcp:{server}" 计数（_cb_key），不同 server 互不连累。
         if self._breaker and not self._breaker.allow(self._cb_key(server)):
             _logger.warning(f"MCP Server 熔断中，跳过连接: {server}")
             return None
 
+        # ------------------------------------------------------------------
+        # 【带重试的连接】最多 self._retry 次（构造时已 max(1,...) 兜底，至少 1 次）。
+        #   每次都新建 client：上一次失败的连接对象可能处于半连状态，复用不安全。
+        #   成功后记录 connects + 熔断成功；全部失败才记一次熔断失败（不是每次尝试都记，
+        #   否则重试反而会加速熔断）。
+        # ------------------------------------------------------------------
         last_err = None
         for attempt in range(1, self._retry + 1):
-            client = self._new_client(server, cfg)
+            client = self._new_client(server, cfg)          # http → MCPHttpClient；stdio → MCPClient（起子进程）
             try:
                 client.connect()
-                self._clients[server] = client
-                self._stats.connects += 1
+                self._clients[server] = client              # 放进连接表：后续调用与 catalog 断开逻辑都认这张表
+                self._stats.connects += 1                   # 观测用：懒加载省下的就是它
                 if self._breaker:
-                    self._breaker.record_success(self._cb_key(server))
+                    self._breaker.record_success(self._cb_key(server))   # 连上了就复位该 server 的失败计数
                 _logger.info(f"MCP Server 已连接: {server} | 第 {attempt} 次尝试")
                 return client
             except Exception as e:
-                last_err = e
+                last_err = e                                # 只留最后一次错误，最终日志用它
                 try:
-                    client.disconnect()
+                    client.disconnect()                     # 清理半连状态的子进程/套接字
                 except Exception:
-                    pass
+                    pass                                    # 断开本身失败无所谓，不能盖掉真正的连接错误
                 _logger.warning(f"MCP Server 连接失败({attempt}/{self._retry}): {server} | {e}")
+
+        # 【全部重试失败】记熔断 + error 日志，返回 None 让调用方降级（跳过该 server）
         if self._breaker:
             self._breaker.record_failure(self._cb_key(server))
         _logger.error(f"MCP Server 连接最终失败: {server} | {last_err}")

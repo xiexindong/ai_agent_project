@@ -268,18 +268,23 @@ class TaskPlanner:
 
         score = 0
         reasons: List[str] = []
-        if any(w in q for w in _SEQ_WORDS):
+        # 然后", "接着", "之后", "随后", "最后", "接下来", "其次"
+        if any(w in q for w in _SEQ_WORDS):   
             score += 2
             reasons.append("含序列词")
+        # 分别", "汇总", "对比", "比较", "统计", "整理", "总结"
         if any(w in q for w in _SUMMARY_WORDS):
             score += 1
             reasons.append("含汇总/对比词")
+        # 第一步", "第二步", "第三步", "1.", "2.", "3."
         if any(m in q for m in _STEP_MARKS):
             score += 2
             reasons.append("自带步骤标记")
+        # ("；", ";", "、", "，然后", "以及", "并且")
         if sum(q.count(m) for m in _MULTI_MARKS) >= 2:
             score += 1
             reasons.append("并列项多")
+        # 大于40个字 就确定是长问句 
         if len(q) >= 40:
             score += 1
             reasons.append("长问句")
