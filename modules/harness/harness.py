@@ -52,6 +52,8 @@ from modules.harness.models import (
 from modules.harness.result_filter import ResultFilter, ResultFilterConfig
 from modules.harness.sandbox import MODE_DOCKER, MODE_NONE, MODE_REMOTE, InProcessRunner, SandboxRunner, build_sandbox
 from modules.tools.base_tool import ToolResult
+from modules.tools.concurrency import ToolConcurrencyGuard
+from modules.tools.retry import ToolRetryPolicy
 
 _logger = get_logger("harness")
 
@@ -75,6 +77,8 @@ class ToolHarness:
         chain: Optional[MiddlewareChain] = None,
         result_filter: Optional[ResultFilter] = None,
         gate: Any = None,                       # HumanGate；None = 不启用人工审批
+        guard: Any = None,                      # ToolConcurrencyGuard；None = 不限制并发（build_tool_harness 会注入）
+        retry: Any = None,                      # ToolRetryPolicy；None = 失败不自动重试（build_tool_harness 会注入）
         enabled: bool = True,
         audit_enabled: bool = True,
         default_sandbox: str = MODE_NONE,
@@ -87,6 +91,9 @@ class ToolHarness:
         self.chain = chain or MiddlewareChain()
         self.result_filter = result_filter or ResultFilter()
         self.gate = gate
+        # 执行期两件套：guard 管"同名工具同时进几个"，retry 管"瞬时故障再试一次"
+        self.guard = guard
+        self.retry = retry
         self.enabled = bool(enabled)
         self.audit_enabled = bool(audit_enabled)
         self.default_sandbox = str(default_sandbox or MODE_NONE)
@@ -334,11 +341,35 @@ class ToolHarness:
             subprocess  本机子进程，超时可杀、环境白名单（有副作用）
             docker      容器，网络隔离 + 内存限制（不可信逻辑）
             remote      远程沙箱服务，工具不在本机跑（跨机隔离）
+
+        【执行期三层包裹】Guard（排队拿名额）→ Retry（名额内瞬时故障重试）→ runner（真正执行）。
+            重试包在闸门内：一趟在途的所有重试只占一个名额，不会因重试挤占排队者。
         """
         cap = cap or self.capability_of(tool)
         mode = cap.sandbox or self.default_sandbox                  # 工具没声明就用全局默认
         timeout = cap.timeout_seconds or self.default_timeout
-        return self._runner_for(mode).run(tool, dict(params or {}), timeout)
+        runner = self._runner_for(mode)
+        call_params = dict(params or {})
+        tool_name = getattr(tool, "name", "")
+
+        # 最内层：在选定工位上真正执行一次（runner 契约：返回 ToolResult）
+        def _run_once() -> ToolResult:
+            return runner.run(tool, call_params, timeout)
+
+        # 中间层：失败且属于瞬时故障（超时/连接断开）时指数退避重试
+        def _run_with_retry() -> ToolResult:
+            if self.retry is None:
+                return _run_once()
+            return self.retry.run(tool_name, _run_once)
+
+        # 最外层：同名工具信号量限流；guard=None 时直接执行
+        if self.guard is None:
+            return _run_with_retry()
+        try:
+            return self.guard.execute(tool_name, _run_with_retry)
+        except TimeoutError as e:
+            # 排队 30s 仍拿不到名额：转成失败 ToolResult，不向上抛异常（registry 约定不抛）
+            return ToolResult(success=False, error=str(e), meta={"code": "concurrency_timeout"})
 
     # ------------------------------------------------------------------
     # ⑤ 结果过滤 + 审计
@@ -524,8 +555,16 @@ def build_tool_harness(settings: Any = None, gate: Any = None) -> Optional[ToolH
         BudgetMiddleware(budgets),
     ])
     result_filter = ResultFilter(ResultFilterConfig(max_result_chars=spec.max_result_chars))
+    # 执行期两件套：显式从 settings 取值构造（读不到配置时用各自的默认值 4 / 2 次 / 0.5s）
+    guard = ToolConcurrencyGuard(
+        max_concurrent=int(getattr(settings, "tool_max_concurrent", 4) or 4))
+    retry = ToolRetryPolicy(
+        max_retries=int(getattr(settings, "tool_retry_attempts", 2)),
+        backoff=float(getattr(settings, "tool_retry_backoff", 0.5)),
+    )
     return ToolHarness(
         policy=policy, budgets=budgets, chain=chain, result_filter=result_filter, gate=gate,
+        guard=guard, retry=retry,
         enabled=True, audit_enabled=True,
         default_sandbox=str(getattr(settings, "tool_sandbox_mode", MODE_NONE) or MODE_NONE),
         default_timeout=float(getattr(settings, "tool_sandbox_timeout_seconds", 15.0) or 15.0),

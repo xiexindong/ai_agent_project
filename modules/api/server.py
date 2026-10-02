@@ -4,6 +4,7 @@ FastAPI 后端服务模块
 企业级 API 服务：对话接口、知识库管理、会话管理、工具日志审计。
 所有接口统一鉴权、限流、多用户隔离。
 """
+# ---- 标准库：文件/系统/序列化/唯一号/时间/异步/线程 ----
 import os
 import sys
 import json
@@ -14,13 +15,17 @@ import threading
 from pathlib import Path
 from typing import Any, Optional, Union, TYPE_CHECKING
 from contextlib import asynccontextmanager
+# ---- FastAPI 全家桶：应用/依赖注入/异常/上传表单/跨域/静态文件/响应类型 ----
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
+# ---- Pydantic：请求/响应体基类，以及上传图片校验失败时拿到的异常类型 ----
 from pydantic import BaseModel, ValidationError
+# ---- 项目内公共件：日志器、业务流水号与请求上下文 ----
 from modules.common.logger import get_logger
 from modules.common.context import new_task_id, set_request_context
+# ---- 统一鉴权：依赖注入函数、权限/等级要求、会话归属校验 ----
 from modules.api.auth import (
     get_current_user,
     RequirePermission,
@@ -28,15 +33,19 @@ from modules.api.auth import (
     UserLevel,
     AuthManager,
 )
+# ---- Agent：LangGraph 编排外壳、ReAct 业务引擎、大模型客户端 ----
 from modules.agent.graph import AgentGraph
 from modules.agent.react_agent import ReActAgent
 from modules.agent.llm import LLMClient
+# ---- 工具注册、双层记忆与 PG ----
 from modules.tools.tool_registry import ToolRegistry
 from modules.memory.memory_manager import MemoryManager
 from modules.memory.pg_manager import PGManager
+# ---- 多模态（团队接口的图片输入）、多 Agent 编排与数据模型 ----
 from modules.multimodal.media import MultiModalInput, ImagePart
 from modules.multiagent.harness import build_harness
 from modules.multiagent.models import EvalCase, RunResult
+# ---- 全局配置单例 ----
 from config import get_settings
 
 # 【什么】只在类型检查阶段执行的导入（TYPE_CHECKING 恒为 False，运行时不导入）
@@ -51,6 +60,7 @@ if TYPE_CHECKING:
     from modules.mcp.gateway import MCPGateway
     from modules.mcp.mcp_client import MCPClient
 
+# 本模块统一日志器：名 "api"，日志前缀据此显示，也可按模块名做日志过滤
 _logger = get_logger("api")
 
 
@@ -168,15 +178,18 @@ def create_app() -> FastAPI:
     """创建 FastAPI 应用实例。"""
     app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0", lifespan=lifespan)
 
+    # 配置里按逗号写允许的前端来源，这里逐个去空白；空串项丢掉，避免匹配到非法来源
     origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins or ["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=origins or ["*"],   # 一个都没配时放开全部来源（开发友好；生产应显式配置）
+        allow_methods=["*"],              # 放行全部 HTTP 方法（GET/POST/PUT/DELETE…）
+        allow_headers=["*"],              # 放行全部请求头（含 Authorization 鉴权头）
     )
+    # 静态目录固定在项目根/static：__file__ 是 modules/api/server.py，上溯三级到项目根
     static_dir = Path(__file__).resolve().parent.parent.parent / "static"
     if static_dir.is_dir():
+        # 挂成子应用：/static/xxx 的请求直接由 StaticFiles 发文件，不进路由函数
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
         _logger.info(f"静态文件已挂载: {static_dir}")
     return app
@@ -190,10 +203,10 @@ class APIServer:
     # 【什么】构造：建 FastAPI app 并装配全部组件与路由
     # 【作用】构造完成即处于可服务状态；任何组件失败都走降级而不是中断启动
     def __init__(self): # self.app: FastAPI
-        self.app = create_app()
-        self.ctx: AppContext = AppContext()
-        self._init_components() # 初始化全局组件
-        self._register_routes() # 注册路由
+        self.app = create_app()              # 裸 FastAPI 实例（CORS/静态/lifespan 已就绪，还没有业务路由）
+        self.ctx: AppContext = AppContext()  # 进程级组件容器，路由闭包都从它取共享单例
+        self._init_components() # 初始化全局组件（LLM/记忆/工具/技能/网关/图）
+        self._register_routes() # 注册路由（必须在组件就绪后，路由要捕获 ctx）
 
     # 【什么】初始化全局组件（LLM、记忆、工具、技能、网关、Agent 图）
     # 【作用】每个可选能力都用 try 包住，失败只记 warning 并降级，不让服务起不来
@@ -202,9 +215,10 @@ class APIServer:
         s = get_settings()
         _logger.info("初始化后端服务组件...")
 
-        self.ctx.llm = LLMClient()
-        self.ctx.pg = PGManager()
-        self.ctx.memory = MemoryManager(llm_client=self.ctx.llm)
+        # 三个基础组件先就位，后面所有装配都围绕它们接线
+        self.ctx.llm = LLMClient()                       # 大模型客户端（对话/工具决策/摘要全走它）
+        self.ctx.pg = PGManager()                        # PG 连接管理（会话/历史/向量读写）
+        self.ctx.memory = MemoryManager(llm_client=self.ctx.llm)  # 双层记忆：摘要生成需要复用同一个 LLM 客户端
 
         # ------------------------------------------------------------------
         # 【工具 Harness】能力声明 / 调用前校验 / 人工审批 / 沙箱 / 预算 / 结果过滤
@@ -212,31 +226,41 @@ class APIServer:
         #   gate 只在开启 HITL 时注入：高风险工具（high/critical）需要真人拍板，
         #   没开 HITL 时按 tool_on_no_gate 处理（默认 deny，安全优先）。
         # ------------------------------------------------------------------
-        harness = None
+        harness = None   # 先按 None（无治理）兜底：下面任何一步装配失败，服务仍能正常启动
         try:
+            # 总开关关闭时整段跳过：Harness 是增强项不是依赖项，关掉行为回到改造前
             if s.tool_harness_enabled:
-                from modules.harness import build_tool_harness
-                gate = None
+                from modules.harness import build_tool_harness   # 函数内延迟 import：启动失败也不影响本模块加载
+                gate = None                                      # 人工审批闸门；None = 不启用 HITL
                 if s.hitl_enabled:
+                    # 开启 Human-in-the-loop：取全局唯一的人工闸门（审批通知/等待/落库都由它负责）
                     from modules.hitl import get_global_gate
                     gate = get_global_gate()
+                # 按配置装配完整 Harness（策略/中间件/预算/沙箱/结果过滤 + Guard/Retry），并注入人工闸门
                 harness = build_tool_harness(s, gate=gate)
         except Exception as e:
+            # 装配失败（配置错误/依赖缺失等）只告警不抛出：保证 API 服务始终可启动，按无治理降级
             _logger.warning(f"工具 Harness 装配失败（按无治理运行）: {e}")
             harness = None
-        self.ctx.tool_harness = harness
+        self.ctx.tool_harness = harness   # 挂到全局上下文：Agent/路由等其他组件从这里取用
 
+        # 工具注册与 Harness 同一行接线：harness=None 时注册器退化为"注册+去重+限次"
         self.ctx.tool_registry = ToolRegistry(harness=harness)
+        # 注册内置工具（calculator/data_query）：先注册、后绑定，顺序不能反
         self.ctx.tool_registry.register_batch(self.ctx.tool_registry.get_default_tools())
         if harness is not None:
             # 绑定后 SchemaMiddleware 才能按工具名取到 JSON Schema（延迟注入避免循环依赖）
             harness.bind_registry(self.ctx.tool_registry)
+            # 打印装配结果：中间件清单确认治理链生效，闸门状态确认人工审批是否就位
             _logger.info(f"工具 Harness 已装配: 中间件={harness.chain.names()} | 闸门={'开' if harness.gate else '关'}")
 
+        # 技能系统独立装配（与工具并行，互不依赖）：函数内延迟 import 与上面保持同一写法
         from modules.skills import SkillRegistry, get_default_skills
         self.ctx.skill_registry = SkillRegistry()
+        # 注册内置技能包（含触发词/SOP/推荐工具），供 Agent 每轮开始前按意图匹配
         self.ctx.skill_registry.register_batch(get_default_skills())
-        _logger.info(f"技能已加载: {len(self.ctx.skill_registry.list_skills())} 个")
+        # 打印技能数量：启动日志里据此确认技能包加载成功（数量异常偏少说明装配有问题）
+        _logger.info(f"技能已加载: {len(self.ctx.skill_registry.list_tools())} 个")
 
         # ------------------------------------------------------------------
         # 【MCP 技能网关 + Tool-RAG + 分层路由】与 main.py 同一套装配
@@ -246,8 +270,8 @@ class APIServer:
         #   【启动命令为什么用 sys.executable】写死 "python" 在虚拟环境里可能指向
         #   别的解释器，MCP 子进程起来后 import 不到本项目模块，握手直接失败。
         # ------------------------------------------------------------------
-        self.ctx.gateway = None
-        router = None
+        self.ctx.gateway = None   # 网关先置空：mcp_enabled=False 时保持 None，路由据此跳过远程工具
+        router = None             # 分层路由器先置空：装配失败时 Agent 退回"全量工具"模式
         try:
             from modules.mcp.gateway import MCPGateway
             from modules.tools.tool_rag import ToolRAGIndex
@@ -255,23 +279,26 @@ class APIServer:
             from modules.common.circuit_breaker import CircuitBreaker
 
             if s.mcp_enabled:
+                # from_settings 按配置里的 server 清单纳管；熔断器在连续失败时自动开路，防止拖垮主链路
                 self.ctx.gateway = MCPGateway.from_settings(
                     s,
                     breaker=CircuitBreaker(s.cb_failure_threshold, s.cb_recovery_seconds),
                     default_command=[sys.executable, "-m", "modules.mcp.mcp_server"],
                 )
+                # servers=纳管的服务名；transports=每个服务用 stdio 还是 http，启动时核对配置是否生效
                 _logger.info(f"MCP 网关已就绪: servers={self.ctx.gateway.server_names} | "
                              f"传输={self.ctx.gateway.transports}")
 
-            tool_index = None
+            tool_index = None   # 语义索引先置空：tool_rag_enabled=False 时路由只走关键词
             if s.tool_rag_enabled:
                 # 召回 top_k 个候选，相似度低于 min_score 的直接丢掉（配置：TOOL_RAG_TOP_K / TOOL_RAG_MIN_SCORE）
                 tool_index = ToolRAGIndex(top_k=s.tool_rag_top_k, min_score=s.tool_rag_min_score)
-                tool_index.index_tools(self.ctx.tool_registry.list_tools())
+                tool_index.index_tools(self.ctx.tool_registry.list_tools())  # 本地工具先入索引
                 if self.ctx.gateway:
-                    tool_index.index_tools(self.ctx.gateway.catalog())
+                    tool_index.index_tools(self.ctx.gateway.catalog())  # 远程工具目录也入索引（只存语义，不连进程）
                 _logger.info(f"Tool-RAG 索引已建立: {tool_index.stats()}")
 
+            # 路由器把"技能匹配 + 工具语义召回 + 网关目录"收敛成每轮一个工具名单
             router = AgentRouter(
                 skill_registry=self.ctx.skill_registry,
                 tool_index=tool_index,
@@ -280,6 +307,7 @@ class APIServer:
                 max_tools=s.max_tools_per_turn,    # 单轮最多带进 prompt 的工具数（配置：MAX_TOOLS_PER_TURN）
             )
         except Exception as e:
+            # 网关/索引/路由任一失败：记 warning 并让 router=None，Agent 按"全量工具可用"继续跑
             _logger.warning(f"技能网关/路由降级（按全部工具运行）: {e}")
             router = None
 
