@@ -372,29 +372,33 @@ class APIServer:
 
             硬编码返回 ok 的探针是假健康——依赖全挂容器也不会重启，等于没有探针。
             """
-            checks = {}
+            checks = {}   # 每项依赖一条结果："ok" 正常，"down: 原因" 故障，"disabled" 未启用
             try:
-                ctx.pg._reconnect_if_needed()
-                ctx.pg._cur.execute("SELECT 1")
+                ctx.pg._reconnect_if_needed()     # 断线先重连：保证探的是"现在能不能连上"
+                ctx.pg._cur.execute("SELECT 1")   # 最轻量的探活 SQL，不依赖任何业务表
                 checks["postgres"] = "ok"
             except Exception as e:
                 checks["postgres"] = f"down: {e}"
 
+            # MySQL 只有开启 RBAC 才是必需依赖；没开就标 disabled，不参与降级判定
             if get_settings().rbac_enabled:
                 try:
                     from modules.enterprise.mysql_client import get_mysql_ro_client
-                    get_mysql_ro_client().query_one("SELECT 1")
+                    get_mysql_ro_client().query_one("SELECT 1")   # 只读连接探活，不产生写入
                     checks["mysql"] = "ok"
                 except Exception as e:
                     checks["mysql"] = f"down: {e}"
             else:
                 checks["mysql"] = "disabled"
 
+            # Milvus 没有独立探活：RAG 组件装配成功（启动时连过一次）即视为可用
             checks["milvus"] = "ok" if ctx.rag else "down: RAG模块未启用"
 
+            # 除 ok/disabled 之外都算降级：disabled 是主动关闭不算故障
             degraded = any(v != "ok" and v != "disabled" for v in checks.values())
             payload = {"status": "degraded" if degraded else "ok", "service": "ai-agent", "checks": checks}
             if checks["postgres"] != "ok":
+                # PG 是会话/记忆的核心依赖：直接 503，K8s 探针看到非 2xx 才会重启容器
                 raise HTTPException(status_code=503, detail=payload)
             return payload
 
@@ -403,10 +407,10 @@ class APIServer:
         @app.get("/me")
         async def me(user: dict = Depends(get_current_user)):
             """当前登录者的权限快照：排障时先问"我是谁、我有什么权限"。"""
-            p = user.get("principal")
+            p = user.get("principal")   # Principal 对象单独取出：它带 to_dict，其他字段是普通字符串
             return {
-                "user": {k: v for k, v in user.items() if k != "principal"},
-                "permissions": p.to_dict() if p else None,
+                "user": {k: v for k, v in user.items() if k != "principal"},  # 身份基础字段（user_id/dept_code…）
+                "permissions": p.to_dict() if p else None,   # 权限码/数据域/脱敏强度/可见知识库全展开
             }
 
         # 【什么】GET /admin/audit —— 查审计日志（需 api:audit:* 权限）
@@ -426,23 +430,28 @@ class APIServer:
             """
             from modules.enterprise.mysql_client import get_mysql_ro_client
             try:
-                db = get_mysql_ro_client()
+                db = get_mysql_ro_client()   # 只读客户端：查询审计不该走写连接
+                # 公共列与基表；WHERE 条件按入参动态追加
                 sql = (
                     "SELECT user_code, dept_code, session_id, task_id, action, resource, result, created_at "
                     "FROM sys_audit_log"
                 )
                 if task_id:
+                    # 精确到一轮对话：参数化查询 %s，杜绝审计查询本身被注入
                     rows = db.query_all(
                         sql + " WHERE task_id=%s ORDER BY id DESC LIMIT %s", (task_id, limit)
                     )
                 elif session_id:
+                    # 精确到一次会话：同一 session_id 下可能跨很多轮
                     rows = db.query_all(
                         sql + " WHERE session_id=%s ORDER BY id DESC LIMIT %s", (session_id, limit)
                     )
                 else:
+                    # 两个过滤条件都没传：返回全局最近的审计
                     rows = db.query_all(sql + " ORDER BY id DESC LIMIT %s", (limit,))
                 return {"total": len(rows), "items": rows}
             except Exception as e:
+                # 审计库挂了明确报 503：不能返回空列表让管理员误以为"没有日志"
                 raise HTTPException(status_code=503, detail=f"审计库不可用: {e}")
 
         # 【什么】GET /admin/bill —— 按部门汇总 LLM token 消耗（需 api:admin:* 权限）
@@ -452,6 +461,7 @@ class APIServer:
             """按部门汇总 LLM token 消耗：成本治理与预算控制的数据源。"""
             from modules.enterprise.mysql_client import get_mysql_ro_client
             try:
+                # 按部门分组：调用次数 + token 总数；ORDER BY tokens DESC 让花费最高的部门排最前
                 rows = get_mysql_ro_client().query_all(
                     "SELECT dept_code, COUNT(*) AS calls, SUM(total_tokens) AS tokens "
                     "FROM sys_llm_usage GROUP BY dept_code ORDER BY tokens DESC"
@@ -466,8 +476,9 @@ class APIServer:
         async def offboard_preview(user: dict = Depends(RequirePerm("api:admin:*"))):
             """离职数据对账：只看不改，报告哪些离职员工的会话仍未归档。"""
             from modules.enterprise import lifecycle
-            result = lifecycle.preview()
+            result = lifecycle.preview()   # 只读扫描：对比在职名单与未归档会话，不做任何删除
             if not result.get("ok"):
+                # 扫描本身失败（如 MySQL 不可用）转 503，detail 带上具体原因
                 raise HTTPException(status_code=503, detail=result.get("error"))
             return result
 
@@ -480,8 +491,10 @@ class APIServer:
         ):
             """执行离职数据处置：离职员工会话归档 + 超保留期数据清理。"""
             from modules.enterprise import lifecycle
+            # None 时由 lifecycle 内部取配置默认保留期；传了天数则以请求参数为准
             result = lifecycle.run_once(retention_days or None)
             if not result.get("ok"):
+                # 部分失败也回 503：detail 优先展示 errors 明细，让管理员知道哪几步没做完
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
 
@@ -499,7 +512,7 @@ class APIServer:
             """
             from modules.enterprise.reconcile import reconcile
 
-            result = reconcile(hours)
+            result = reconcile(hours)   # 按 task_id 集合比对两库，算出 pg_only / mysql_only
             if not result.get("ok"):
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
             return result
@@ -514,6 +527,7 @@ class APIServer:
             """冷热分离：超过保留期的会话先导出归档文件，再从 PG 删除。"""
             from modules.memory.archiver import archive_expired
 
+            # 0 表示取配置默认保留期；归档动作内部顺序是"先导出文件成功、再删 PG 行"
             result = archive_expired(retention_days or 0)
             if not result.get("ok"):
                 raise HTTPException(status_code=503, detail=result.get("errors") or result)
@@ -541,6 +555,7 @@ class APIServer:
             static_dir = Path(__file__).resolve().parent.parent.parent / "static"
             index_file = static_dir / "index.html"
             if index_file.is_file():
+                # FileResponse 直接读文件发回，Content-Type 按 .html 自动判定
                 return FileResponse(str(index_file))
             raise HTTPException(status_code=404, detail="前端界面未找到")
 
@@ -564,10 +579,10 @@ class APIServer:
                 event: done         全部完成 {session_id, task_id}（task_id 是本轮的业务流水号，
                                     凭它能在 MySQL 审计/用量与 PG 会话之间来回查）
             """
-            user_id = user["user_id"]
-            principal = user.get("principal")
-            is_new_session = not req.session_id
-            session_id = req.session_id or str(uuid.uuid4())
+            user_id = user["user_id"]                 # 工号：会话归属与落库的用户标识
+            principal = user.get("principal")         # 权限快照：透传给 Agent 做工具过滤和数据隔离
+            is_new_session = not req.session_id       # 没带会话号 = 新会话（后面要先建会话再开跑）
+            session_id = req.session_id or str(uuid.uuid4())   # 续聊用原号；新会话现造一个 UUID
 
             # ------------------------------------------------------------------
             # 【task_id 只在入口生成一次】它是本轮对话的业务流水号：
@@ -586,9 +601,12 @@ class APIServer:
                 # 会话标题取用户输入的前 50 个字，够列表展示又不把整段提问塞进标题
                 ctx.pg.create_session(session_id, user_id, title=req.query[:50])
             elif not AuthManager.check_session_owner(user_id, session_id, ctx.pg):
+                # 续聊必须校验归属：防止拿别人的 session_id 直接读历史（越权）
                 raise HTTPException(status_code=403, detail="无权访问该会话")
 
+            # 清空该会话上的去重账本/结果缓存：新一轮对话允许重新调用相同工具
             ctx.tool_registry.reset_session(session_id)
+            # 把计费上下文挂到 LLM：每次模型调用落用量表时自动带上这四个号，不需要业务侧再传
             ctx.llm.set_usage_context(
                 user_code=user_id,
                 dept_code=user.get("dept_code", ""),
@@ -605,12 +623,15 @@ class APIServer:
             # 【什么】SSE 事件生成器：按推理进度 yield 一串事件帧
             # 【作用】跑在线程池里执行 Agent（不阻塞事件循环），异常时也保证把 done 帧发出去
             async def event_generator():
+                # 第一帧先发状态：前端立刻展示"思考中"，不用等首轮推理结束
                 yield sse_event("status", {"message": "Agent 正在思考...", "phase": "thinking"})
                 try:
+                    # Agent 是同步重逻辑：丢到线程池执行，不卡住 FastAPI 的事件循环
                     result = await asyncio.to_thread(
                         ctx.agent_graph.run, req.query, session_id, user_id, principal
                     )
                 except Exception as e:
+                    # 推理异常也要把协议走完：发错误答案 + done 帧，前端不会永远转圈
                     _logger.error(f"Agent推理异常: {e}")
                     yield sse_event("answer_start", {"iterations": 0})
                     yield sse_event("answer_chunk", {"content": f"服务内部错误：{e}"})
@@ -618,6 +639,7 @@ class APIServer:
                     yield sse_event("done", {"session_id": session_id, "task_id": task_id})
                     return
 
+                # Agent 跑完后一次性回放工具流水：每笔先发 start 再发 end，前端按序渲染
                 for tc in result.get("tool_call_logs", []):
                     yield sse_event("tool_start", {
                         "name": tc.get("name", ""),
@@ -629,6 +651,7 @@ class APIServer:
                         "success": tc.get("success", True),
                     })
 
+                # 没有答案时给占位文案：前端不用处理空字符串边界
                 answer = result.get("final_answer", "") or "（无回答）"
                 yield sse_event("answer_start", {"iterations": result.get("iteration", 0)})
                 # 每片 24 个字，片间停 20 毫秒：既有打字机效果，又不至于把连接刷爆
@@ -636,6 +659,7 @@ class APIServer:
                     yield sse_event("answer_chunk", {"content": answer[i:i + 24]})
                     await asyncio.sleep(0.02)
 
+                # 收尾两帧：summary 供前端展示，done 标志流结束（前端据此关闭 loading）
                 yield sse_event("answer_end", {"summary": result.get("llm_summary", "")})
                 yield sse_event("done", {"session_id": session_id, "task_id": task_id})
 
@@ -660,27 +684,33 @@ class APIServer:
                 data URL（客户端自己编码的）和 http(s) 链接（模型侧去取）。
             """
             if not ctx.harness:
+                # 模块降级时给明确 503：和"服务挂了"区分开
                 raise HTTPException(status_code=503, detail="多Agent模块未启用")
             # 后端选择：请求级 > 全局配置 > native。请求级能覆盖是为了 A/B 对比，
             # 但默认仍是 native —— 换编排引擎是行为变更，不该由客户端静默触发。
             backend = (req.backend or get_settings().multiagent_backend or "native").lower()
             runner = ctx.harness
             if backend == "crewai":
+                # 懒加载 CrewAI 后端：没装可选依赖的用户不会在启动时被拖累
                 if ctx.crew_backend is None:
                     from modules.multiagent.crewai_backend import CrewAIBackend
                     ctx.crew_backend = CrewAIBackend(llm=ctx.llm, tool_registry=ctx.tool_registry)
                 runner = ctx.crew_backend
             parts = []
             for src in req.images or []:
+                # 白名单前缀校验：只放行 data URL 和 http(s)，本地路径一律拒绝
                 if not src.startswith(("data:", "http://", "https://")):
                     raise HTTPException(
                         status_code=400,
                         detail="图片只接受 data URL 或 http(s) 链接，不接受服务器本地路径",
                     )
                 try:
+                    # ImagePart 内部再做一次格式合法性校验（如 data URL 的前缀/base64）
                     parts.append(ImagePart(source=src))
                 except ValidationError as e:
+                    # 取第一条校验错误回给客户端，避免整段冗长错误结构
                     raise HTTPException(status_code=400, detail=f"图片非法: {e.errors()[0]['msg']}")
+            # 有图片才构造多模态输入；纯文本任务保持 None，走普通链路
             mm = MultiModalInput(instruction=req.query, parts=parts) if parts else None
             # 没传会话号时生成 team-＋8 位十六进制，避免多轮团队会话互相覆盖
             session_id = req.session_id or f"team-{uuid.uuid4().hex[:8]}"
@@ -700,9 +730,11 @@ class APIServer:
             """
             if not ctx.harness:
                 raise HTTPException(status_code=503, detail="多Agent模块未启用")
+            # 传了用例就逐个转成 EvalCase（Pydantic 会校验字段）；没传走内置连通性用例
             cases = [EvalCase(**c) for c in req.cases] if req.cases else [
                 EvalCase(name="默认连通性", query="用一句话说明你能做什么", expected_keywords=["可以"]),
             ]
+            # evaluate 返回 RunResult；model_dump 转成普通 dict 才能直接做 JSON 响应
             return ctx.harness.evaluate(cases).model_dump()
 
         # 【什么】GET /agent/backends —— 可选框架后端探活
@@ -714,14 +746,15 @@ class APIServer:
             排障时第一件事就是分清"配了但没装"和"装了但没配"——
             前者表现为静默降级（不报错、结果不一样），最容易误判。
             """
+            # is_available 只检查库装没装（importlib），不真正连接服务，接口开销极小
             from modules.multiagent.crewai_backend import is_available as crewai_ok
             from modules.rag.llamaindex_adapter import is_available as li_ok
 
             s = get_settings()
             return {
-                "rag_backend": s.rag_backend,
-                "multiagent_backend": s.multiagent_backend,
-                "available": {"llamaindex": li_ok(), "crewai": crewai_ok()},
+                "rag_backend": s.rag_backend,                 # 配置里想用的 RAG 后端
+                "multiagent_backend": s.multiagent_backend,   # 配置里想用的编排后端
+                "available": {"llamaindex": li_ok(), "crewai": crewai_ok()},  # 实际装没装
             }
 
         # 【什么】GET /history/{session_id} —— 取会话历史（带归属校验）
@@ -733,8 +766,10 @@ class APIServer:
             user: dict = Depends(get_current_user),
         ):
             """获取会话历史（会话隔离）。"""
+            # 归属校验先行：不是本人会话，连历史条数都不返回
             if not AuthManager.check_session_owner(user["user_id"], session_id, ctx.pg):
                 raise HTTPException(status_code=403, detail="无权访问该会话")
+            # 取短期历史（默认最近 20 条），user_id 在 SQL 层再做一次过滤，双保险
             rows = ctx.pg.get_short_term_history(session_id, user["user_id"], limit)
             return {"session_id": session_id, "history": rows}
 
@@ -752,15 +787,17 @@ class APIServer:
                      单集合模式下只作为 kb_code 标量字段写入，不影响落哪个集合。
             """
             if not ctx.rag:
+                # RAG 降级时不允许入库：否则文件处理了却没处存，还可能误报成功
                 raise HTTPException(status_code=503, detail="RAG模块未启用")
             import tempfile, os
             # file.filename 可能是 None（客户端没带文件名），兜底一个名字，避免拼路径时类型不兼容
             tmp_path = os.path.join(tempfile.gettempdir(), file.filename or "upload.tmp")
+            # 上传内容先完整落到临时文件：RAG 入库按"文件路径"读取，不直接吃字节流
             with open(tmp_path, "wb") as f:
                 content = await file.read()
                 f.write(content)
-            count = ctx.rag.ingest_document(tmp_path, kb_code=kb_code)
-            os.remove(tmp_path)
+            count = ctx.rag.ingest_document(tmp_path, kb_code=kb_code)  # 切片+向量化+写入，返回切片数
+            os.remove(tmp_path)   # 临时文件用完即删，避免临时目录堆积
             return {"status": "success", "chunks": count, "file": file.filename, "kb_code": kb_code}
 
         # 【什么】GET /knowledge/stats —— 知识库统计
@@ -774,8 +811,10 @@ class APIServer:
             """
             if ctx.rag:
                 principal = user.get("principal")
+                # None = 未开启 RBAC，不做范围过滤；否则只统计本人可见知识库
                 kb_codes = getattr(principal, "kb_codes", None) or None
                 return ctx.rag.get_knowledge_stats(kb_codes=kb_codes)
+            # RAG 降级时回状态字段而不是 503：统计是只读展示，不该阻塞页面
             return {"status": "RAG模块未启用"}
 
         # 【什么】GET /skills —— 已注册技能清单
@@ -785,6 +824,7 @@ class APIServer:
             """获取已注册技能清单及其绑定的函数工具。"""
             return {
                 "total": len(ctx.skill_registry.list_skills()),
+                # 每个技能转 dict：含触发词/SOP/绑定工具，前端直接渲染，无需二次解析
                 "skills": [s.to_dict() for s in ctx.skill_registry.list_skills()],
             }
 
@@ -806,6 +846,7 @@ class APIServer:
             user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
         ):
             """待人工审核列表（管理员权限）。"""
+            # 直接从 PG 取 status=pending 的记录；鉴权已由 RequirePermission(ADMIN) 完成
             return {"reviews": ctx.pg.get_pending_reviews()}
 
         # ------------------------------------------------------------------
@@ -828,17 +869,20 @@ class APIServer:
             user: dict = Depends(RequirePermission(UserLevel.ADMIN)),
         ):
             """人工审核处置：approved / rejected，审核通过的标准答案反哺标准答案库（Few-shot 来源）。"""
+            # 动作白名单校验：只允许两种合法值，其他写法在入口就挡掉
             if req.action not in ("approved", "rejected"):
                 raise HTTPException(status_code=400, detail="action 只能是 approved 或 rejected")
+            # 更新审核状态；返回 False = 记录不存在或已被处理（防止重复审核）
             if not ctx.pg.update_review_status(review_id, req.action, user["user_id"], req.note):
                 raise HTTPException(status_code=404, detail="待审核项不存在或已处理")
 
             answer_id = None
+            # 仅"通过 + 填了标准答案"才反哺：驳回或留空都不进标准答案库
             if req.action == "approved" and req.standard_answer.strip():
                 answer_id = ctx.pg.add_standard_answer(
                     question=req.question.strip(),
                     answer=req.standard_answer.strip(),
-                    source_review_id=review_id,
+                    source_review_id=review_id,   # 保留来源：将来能追溯这条答案出自哪次审核
                 )
             return {"review_id": review_id, "action": req.action, "standard_answer_id": answer_id}
 
@@ -846,8 +890,9 @@ class APIServer:
     # 【作用】按配置的 APP_HOST / APP_PORT 监听，阻塞当前进程
     def run(self):
         """启动 API 服务。"""
-        import uvicorn
+        import uvicorn   # 延迟 import：不用 serve 功能时不需要安装/加载 uvicorn
 
         s = get_settings()
         _logger.info(f"API服务启动: {s.app_host}:{s.app_port}")
+        # 直接传 app 对象（非 import 字符串）：uvicorn 不做 reloader，配置全由本进程控制
         uvicorn.run(self.app, host=s.app_host, port=s.app_port)
