@@ -450,6 +450,23 @@ class PGManager:
         self._conn.commit()
         _logger.info(f"会话创建: session={session_id}, user={user_id}")
 
+    # 【什么】判断会话是否存在且属于该用户
+    # 【作用】server.py 的归属校验专用：只查记录存在性，与 agent_state 内容无关
+    @handle_exception(default=False, log_msg="校验会话归属异常")
+    def session_belongs_to(self, session_id: str, user_id: str) -> bool:
+        """会话存在且归属该用户 → True；不存在/不属于/异常 → False。
+
+        【为什么不复用 get_session_state？】它返回的是 agent_state 内容，
+            新会话 agent_state 为 NULL 时会被判成"不存在"，续聊被误拦（403）。
+            归属校验只关心"有没有这条记录"，不看状态字段。
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            "SELECT 1 FROM chat_session WHERE session_id = %s AND user_id = %s",
+            (session_id, user_id),
+        )
+        return self._cur.fetchone() is not None
+
     # 【什么】把 Agent 当前进展快照写进会话封面
     # 【作用】断点续跑的落盘端；异常向外抛，让上层知道状态没存成功
     @handle_exception(default=None, log_msg="更新会话状态异常", reraise=True)

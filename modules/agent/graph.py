@@ -141,6 +141,7 @@ class AgentGraph:
     # 【作用】只跑一次（靠 prepared 标记），避免循环回来重复召回
     def _prepare_node(self, state: dict[str, Any]) -> "AgentStateDict":
         """准备节点：初始化状态、召回记忆与RAG上下文。"""
+        breakpoint()                # TODO: 调试用，提交前删除
         _logger.info(f"节点[prepare]: session={state.get('session_id', '')}")
 
         if not state.get("prepared"):
@@ -265,9 +266,11 @@ class AgentGraph:
 
                 from modules.agent.state import AgentState
                 agent_state = AgentState.from_dict(state)
-                self.agent.memory.pg.update_session_state(
-                    session_id, agent_state.to_dict()
-                )
+                snapshot = agent_state.to_dict()
+                # principal 是 Principal 活体对象，json.dumps 无法序列化，会让整段落库抛异常
+                # 且快照里也不需要它（续跑时由请求方重新解析传入），落库前剔除
+                snapshot.pop("principal", None)
+                self.agent.memory.pg.update_session_state(session_id, snapshot)
                 self._save_tool_logs(state)
                 self._auto_review(state, history_id)
                 _logger.info("对话记忆 + Agent状态 已持久化")
@@ -410,6 +413,14 @@ class AgentGraph:
             except Exception as e:
                 _logger.warning(f"断点恢复失败，按新任务执行: {e}")
 
+        # 【workflow 怎么跑起来】LangGraph 的 invoke 收到 initial_state 后：
+        #   1. 把初始状态 dict 装进 state；
+        #   2. 从入口节点 prepare 开始，按边定义的拓扑顺序逐个跑节点；
+        #   3. 每个节点 return 的更新片段合并回 state（不是替换，是增量更新）；
+        #   4. 遇到条件边（_should_continue）返回值当 key 查 path_map，决定下步去哪；
+        #   5. 大模型在 reason_node 和 answer_node 里被调用——不是 invoke 直接调 LLM，
+        #      而是 invoke 驱动节点、节点内部再调 self.agent.reason_step() / generate_answer()，
+        #      后者通过 LLMClient 发起 HTTP。一直跑到 save → END，终态 dict 返回。
         result: dict[str, Any] | Any = self._graph.invoke(initial_state, config) #新任务：从入口节点开始
         _logger.info(
             f"Agent完成: iterations={result.get('iteration', 0)} | "

@@ -146,6 +146,23 @@ class LLMClient:
 
         task_id 是跨库对账的主键：PG 的 chat_history 与 MySQL 的 sys_llm_usage
         靠它指向同一轮对话，缺省时从请求上下文（modules.common.context）取。
+
+        【为什么需要跨库对账】一次对话的数据被拆存在两个数据库，两边各写各的，
+            没有外键、没有分布式事务把它们绑在一起：
+              · PG 的 chat_history    —— 对话内容（说了什么、调了什么工具），应用内部记忆库
+              · MySQL 的 sys_llm_usage —— 用量账单（谁、哪个部门、烧了多少 token），企业成本侧
+            两条写入路径独立，都可能单独失败：
+              · 对话成功但记账失败（_log_usage 异常只留 debug 日志）→ 月底账单漏一笔；
+              · 有账单却找不到对应会话 → 可能有人绕开正常链路刷 API（Key 泄露/脚本滥用）。
+            没有对账键只能看到"总数对不上"，永远定位不到具体哪一条；
+            有了 task_id，一条 LEFT JOIN 就能列出所有不一致记录。
+
+        【为什么用 task_id 而不是 session_id】session_id 是会话级，一个会话几十轮对话，
+            账单无法精确到"这笔 token 对应哪一轮"；task_id 是任务级流水号，
+            一轮对话（含其中多次模型调用）共享同一个，颗粒度正好对账。
+
+        【缺省为什么回落请求上下文】调用方忘传 task_id 时会落空值落库，
+            这条账永远对不上。宁可从 req_ctx.get_task_id() 自动补，也不允许留空。
         """
         self.usage_context = {
             "user_code": user_code,     # 谁调的

@@ -627,6 +627,10 @@ class APIServer:
                 yield sse_event("status", {"message": "Agent 正在思考...", "phase": "thinking"})
                 try:
                     # Agent 是同步重逻辑：丢到线程池执行，不卡住 FastAPI 的事件循环
+                    # 【to_thread 的参数结构】第 1 个是函数引用（只传不调用），
+                    # 后面 req.query / session_id / user_id / principal 全是它的实参，
+                    # 线程池里的工作线程拿到后会真正执行 run(query, session_id, user_id, principal)。
+                    # await 期间协程挂起、事件循环继续服务其他请求；线程跑完结果回填，从这里继续。
                     result = await asyncio.to_thread(
                         ctx.agent_graph.run, req.query, session_id, user_id, principal
                     )

@@ -77,9 +77,14 @@ class AuthManager:
         【为什么要这一步？】用户 A 拿着合法 API Key，但用 session_id=B 的会话查询。
             不校验就会让 A 看到 B 的对话历史——会话劫持漏洞。
             边界9.5 的会话权限管控。
+
+        【为什么不再用 get_session_state 的结果判真假？】
+            get_session_state 查的是 agent_state 字段，新会话时该字段为 null，
+            导致"会话存在但内容为空"被误判成"会话不存在"。
+            改用独立的 SQL 只查记录是否存在，与状态内容解耦。
         """
         try:
-            return bool(pg_manager.get_session_state(session_id, user_id))
+            return pg_manager.session_belongs_to(session_id, user_id)
         except Exception:
             return False
 
