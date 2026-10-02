@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     cb_failure_threshold: int = Field(default=5, alias="CB_FAILURE_THRESHOLD")     # 连续失败几次后打开
     cb_recovery_seconds: float = Field(default=30.0, alias="CB_RECOVERY_SECONDS")  # 打开后多久放探针
     tool_timeout_seconds: float = Field(default=30.0, alias="TOOL_TIMEOUT_SECONDS")            # 单个工具执行的超时秒数
+    # ---- 工具并发与重试（modules/tools/concurrency.py、retry.py）----
+    tool_max_concurrent: int = Field(default=4, alias="TOOL_MAX_CONCURRENT")                   # 同名工具同时最多几个线程在执行，超出的排队
+    tool_retry_attempts: int = Field(default=2, alias="TOOL_RETRY_ATTEMPTS")                   # 瞬时故障(超时/连接断开)额外重试几次，0=不重试
+    tool_retry_backoff: float = Field(default=0.5, alias="TOOL_RETRY_BACKOFF")                 # 重试退避基数(秒)：0.5 → 1.0 → 2.0 指数递增
 
     # ---- 检索与记忆开关 ----
     rag_keyword_fallback: bool = Field(default=True, alias="RAG_KEYWORD_FALLBACK")              # 向量召回为空时，退回关键词匹配
@@ -115,6 +119,10 @@ class Settings(BaseSettings):
     rag_top_k: int = Field(default=5, alias="RAG_TOP_K")                                        # 向量检索召回多少条
     rerank_top_k: int = Field(default=3, alias="RERANK_TOP_K")                                  # 重排后保留几条进 prompt
     similarity_threshold: float = Field(default=0.65, alias="SIMILARITY_THRESHOLD")             # 相似度下限，低于此值的片段直接丢弃
+    # ---- 记忆治理：入库筛选 / 冲突处理 / 时效衰减（memory_manager.py）----
+    memory_filter_enabled: bool = Field(default=True, alias="MEMORY_FILTER_ENABLED")           # 寒暄/过短问句不进长期记忆库
+    memory_conflict_threshold: float = Field(default=0.90, alias="MEMORY_CONFLICT_THRESHOLD")  # 新旧记忆相似度 ≥ 此值判为冲突，旧的置 superseded
+    memory_recency_half_life_days: int = Field(default=180, alias="MEMORY_RECENCY_HALF_LIFE_DAYS")  # 记忆时效半衰期(天)：180 天后权重减半
     session_expire_hours: int = Field(default=72, alias="SESSION_EXPIRE_HOURS")                 # 会话创建多久后算过期
 
     # ---- 技能匹配：关键词 → 向量 → LLM 三级 ----
@@ -251,6 +259,16 @@ class Settings(BaseSettings):
     multiagent_delegation_max_depth: int = Field(default=1, alias="MULTIAGENT_DELEGATION_MAX_DEPTH")        # 最多转派几层（防无限甩锅）
     multiagent_delegation_max_per_run: int = Field(default=6, alias="MULTIAGENT_DELEGATION_MAX_PER_RUN")    # 单次运行最多委派几次
     multiagent_delegation_max_per_agent: int = Field(default=2, alias="MULTIAGENT_DELEGATION_MAX_PER_AGENT")  # 单个 Agent 最多委派几次
+
+    # ---- 子图委派（Subgraph）与本地模拟分布式（学习/演示用）----
+    #   两条新增链路的边界参数：深度上限管"子图最多嵌套几层/委派链最长几跳"，
+    #   超时管"单个子任务最长允许跑多久"；默认值取"演示够用、失控可兜底"的量级
+    subgraph_max_depth: int = Field(default=2, alias="SUBGRAPH_MAX_DEPTH")                  # 子图最多嵌套几层（管理图为第 0 层）
+    subgraph_task_timeout: float = Field(default=15.0, alias="SUBGRAPH_TASK_TIMEOUT")       # 单个子任务（一次子图执行）超时秒数
+    subgraph_max_subtasks: int = Field(default=5, alias="SUBGRAPH_MAX_SUBTASKS")            # 单次运行最多拆几个子任务
+    simbroker_visibility_timeout: float = Field(default=4.0, alias="SIMBROKER_VISIBILITY_TIMEOUT")  # 模拟消息代理：消息投出多久没 ack 视为要重投
+    simbroker_max_retries: int = Field(default=3, alias="SIMBROKER_MAX_RETRIES")            # 模拟消息代理：同一条消息最多重投几次，超了进死信
+    simtask_timeout: float = Field(default=12.0, alias="SIMTASK_TIMEOUT")                   # 模拟分布式：单个子任务等结果的超时秒数
 
     # ---- Human-in-the-Loop 人工介入 ----
     # 【为什么默认关】开启后链路会在敏感动作处停下来等人，

@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS chat_history (
     query_embedding    vector(1024),                      -- 问句向量（用户原话的向量，长期记忆主检索列）
     tool_call_log      JSONB DEFAULT '[]'::jsonb,         -- 工具调用日志
     rag_sources        JSONB DEFAULT '[]'::jsonb,          -- RAG召回来源
+    memory_status      VARCHAR(16) DEFAULT 'active',       -- 记忆状态：active 正常召回 / superseded 已被新记忆取代
+    superseded_by      BIGINT,                             -- 被哪一条新记忆取代（chat_history.id），冲突追溯用
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -72,6 +74,13 @@ WITH (lists = 100);
 -- 需对已有库手工补一列（幂等，可重复执行）：
 ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS query_embedding vector(1024);
 ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
+
+-- 【记忆治理】记忆状态列（冲突处理：新旧记忆相似度 ≥ 0.90 时旧的置 superseded，
+-- 召回 SQL 只取 active；superseded_by 记录取代它的新记忆 id，可追溯）
+ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS memory_status VARCHAR(16) DEFAULT 'active';
+ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS superseded_by BIGINT;
+CREATE INDEX IF NOT EXISTS idx_history_user_status
+ON chat_history (user_id, memory_status, created_at DESC);
 
 -- 按 task_id 反查"这一轮对话"：跨库对账与排障的入口索引
 CREATE INDEX IF NOT EXISTS idx_history_task ON chat_history (task_id);

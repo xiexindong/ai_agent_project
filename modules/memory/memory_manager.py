@@ -9,6 +9,7 @@
 # 【什么】标准库与项目内依赖
 # 【作用】re 做关键词切分、check_token_overflow 判压缩、PGManager 取数、get_settings 读阈值
 import re
+from datetime import datetime
 from typing import List, Optional
 from modules.common.logger import get_logger
 from modules.common.exceptions import handle_exception
@@ -37,8 +38,17 @@ class MemoryManager:
         self._short_rounds = s.short_memory_rounds              # 短期记忆轮数，默认 3 轮
         self._similarity_threshold = s.similarity_threshold     # 召回相似度下限，默认 0.65，低于它丢弃
         self._low_confidence = False                            # 本次召回是否低置信，供上层提示人工审核
+        # ------------------------------------------------------------------
+        # 【记忆治理三阈值】入库筛选 / 冲突处理 / 时效衰减的开关与参数
+        #   _filter_enabled     : False 时 save_turn 不过滤（行为回到改造前）
+        #   _conflict_threshold : 新旧记忆相似度 ≥ 它判为同一主题（默认 0.90）
+        #   _half_life_days     : 时效半衰期，默认 180 天——旧记忆排序权重每 180 天减半
+        # ------------------------------------------------------------------
+        self._filter_enabled = s.memory_filter_enabled          # 寒暄/过短问句不入库，True 默认开
+        self._conflict_threshold = s.memory_conflict_threshold  # 冲突判定阈值，默认 0.90
+        self._half_life_days = s.memory_recency_half_life_days  # 时效半衰期天数，默认 180
 
-    # 【什么】保存一轮对话的全量数据
+    # 【什么】保存一轮对话的全量数据（带入库筛选与冲突处理）
     # 【作用】原文、摘要、摘要向量、问句向量、工具日志一次落库，缺任一项后续记忆能力会残废
     def save_turn(
         self,
@@ -52,13 +62,97 @@ class MemoryManager:
         rag_sources: list | None = None,        # 本轮引用的知识库来源，None 落库为 []
         query_embedding: list | None = None,    # 问句向量，当前不参与检索，预留给重复提问检测
     ) -> int | None:
-        """保存一轮对话全量数据（原文+摘要+摘要向量+问句向量+工具日志）。"""
-        return self.pg.save_history(
+        """
+        保存一轮对话全量数据（入库筛选 → 落库 → 冲突取代）。
+
+        【治理流水线，三步】
+            第1步 - 入库筛选（_should_memorize）：
+                寒暄 / 过短 / 纯标点的问句直接跳过，返回 None 不落库
+            第2步 - 落库（pg.save_history）：
+                原文 + 摘要 + 双向量 + 工具日志一次写入，拿回新行主键
+            第3步 - 冲突处理（find_conflict_memory → supersede_memory）：
+                新记忆入库后，把同用户相似度 ≥ 0.90 的旧记忆置 superseded
+
+        【输入输出对照】
+            筛选拦截：save_turn(..., user_query="你好", ...)  → None（不落库）
+            正常入库：save_turn(..., user_query="差旅报销标准是多少", ...)
+                      → 42（新行 id）
+            冲突取代：库里已有 id=40 "用户住址:上海"(active, 相似度0.93)，
+                      本次存 "用户住址:北京" → 新行 id=42 入库，
+                      旧 id=40 置 memory_status='superseded', superseded_by=42
+        """
+        # ------------------------------------------------------------------
+        # 【第1步·入库筛选】不值得进长期记忆的内容在这里挡下。
+        #   【不滤会怎样】"你好""好的""哈哈哈"这类寒暄全部进库，
+        #   长期记忆库被噪声灌满后，召回 top-5 里寒暄挤掉真正有用的历史。
+        # ------------------------------------------------------------------
+        if self._filter_enabled and not self._should_memorize(user_query, llm_summary):
+            _logger.info(f"问句未通过入库筛选，不写入长期记忆: '{user_query[:20]}'")
+            return None
+
+        # 【第2步·落库】先拿到新行主键，第 3 步取代旧记忆要用它回填 superseded_by
+        history_id = self.pg.save_history(
             session_id, user_id,
             user_query, llm_full_answer, llm_summary,
             summary_embedding, tool_call_log, rag_sources,
             query_embedding,
         )
+
+        # ------------------------------------------------------------------
+        # 【第3步·冲突处理】新记忆已入库（id 已知）再取代旧的。
+        #   【顺序为什么是"先插新、再废旧"】反过来（先废旧再插新）时万一
+        #   save_history 抛异常，旧记忆已被置 superseded 而新的没进去——
+        #   这个主题的记忆凭空消失；先插新最坏情况也只是两条并存一轮。
+        # ------------------------------------------------------------------
+        if history_id and summary_embedding:
+            conflict = self.pg.find_conflict_memory(
+                summary_embedding, user_id, self._conflict_threshold,
+            )
+            if conflict:
+                self.pg.supersede_memory(conflict["id"], history_id)
+                _logger.info(
+                    f"记忆冲突处理: 新记忆 id={history_id} 取代旧记忆 "
+                    f"id={conflict['id']} (相似度 {conflict['similarity']})"
+                )
+        return history_id
+
+    # 【什么】入库筛选：判断一轮对话值不值得进长期记忆
+    # 【作用】挡住寒暄、过短、纯标点三类噪声；规则不依赖 LLM，零成本零延迟
+    @staticmethod
+    def _should_memorize(user_query: str, llm_summary: str = "") -> bool:
+        """
+        入库筛选（规则版）：三关全过才返回 True。
+
+        【三关规则】
+            ① 长度关：问句去空白后 < 4 字符 → 拦（"好的""嗯""ok" 都过不了）
+            ② 寒暄关：整句命中寒暄/告别/致谢词表 → 拦（"你好""谢谢""再见"）
+            ③ 内容关：问句去标点后是空的 → 拦（"？？？""！！"）
+
+        【判定例子】
+            "你好"                        → False（命中寒暄词表）
+            "好的"                        → False（长度 2 < 4）
+            "差旅报销标准是多少"            → True
+            "帮我算一下12*8"              → True
+            "？？？"                      → False（去标点后为空）
+            "你好，请问报销流程"           → True（不是整句寒暄，是带正事的问句）
+
+        【为什么整句匹配而不是包含匹配】"你好，请问报销流程"里也有"你好"，
+            按包含匹配会被误杀；寒暄当"开场白"整句才算噪声，混在句中是正常表达。
+        """
+        q = (user_query or "").strip()
+        if len(q) < 4:
+            return False                                       # ① 长度关
+        if re.sub(r"[，。！？!?.,~～\s]", "", q) == "":
+            return False                                       # ③ 内容关（纯标点/空白）
+        # ② 寒暄关：整句（去标点空白后）等值命中才算寒暄
+        normalized = re.sub(r"[，。！？!?.,~～\s]", "", q).lower()
+        chitchat = {
+            "你好", "您好", "嗨", "哈喽", "hello", "hi",
+            "谢谢", "多谢", "感谢", "thanks", "thankyou",
+            "再见", "拜拜", "bye", "好的", "ok", "嗯嗯", "哈哈",
+            "明白了", "知道了", "收到",
+        }
+        return normalized not in chitchat
 
     # 【什么】构建塞给 LLM 的记忆上下文
     # 【作用】长期召回 + 短期原文拼成一段文本，超 token 就压缩，返回 dict 供 prompt 直接取用
@@ -182,6 +276,33 @@ class MemoryManager:
                 _logger.info("记忆召回字面完全不重合，标记为低置信（触发人工审核）")
 
         _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")
+
+        # ------------------------------------------------------------------
+        # 【时效衰减重排】similarity 只管"语义像不像"，不管"过没过期"。
+        #   有效分 = similarity × 0.5^(天数/半衰期)，默认半衰期 180 天：
+        #     今天写的记忆   天数=0    → 衰减系数 1.00（0.91 → 0.910）
+        #     180 天前的记忆  天数=180  → 衰减系数 0.50（0.91 → 0.455）
+        #     360 天前的记忆  天数=360  → 衰减系数 0.25（0.91 → 0.228）
+        #
+        #   【作用】"去年说的偏好"与"上个月说的偏好"语义分相同时，新者优先。
+        #   【只影响排序不动 similarity 字段】阈值过滤（0.65）已经在前面做完了，
+        #   这里若把衰减后的分写回 similarity，会把刚过阈值的记忆误判成低置信。
+        # ------------------------------------------------------------------
+        if self._half_life_days > 0:
+            now = datetime.now()
+
+            def _effective(item: dict) -> float:
+                try:
+                    t = item.get("time")
+                    days = (now - t).days if t else 0
+                except Exception:
+                    days = 0                                    # 时间字段异常按新记忆算，不惩罚
+                decay = 0.5 ** (max(days, 0) / self._half_life_days)
+                return item["similarity"] * decay
+
+            filtered.sort(key=_effective, reverse=True)
+            _logger.debug(f"记忆召回按时效衰减重排完成: {len(filtered)} 条")
+
         return filtered
 
     # 【什么】关键词二次校验（静态方法，不依赖实例状态）

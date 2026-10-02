@@ -323,6 +323,27 @@ class PGManager:
             """
             ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS task_id VARCHAR(64) DEFAULT '';
             """,
+            # ------------------------------------------------------------------
+            # 【记忆治理两列】memory_status / superseded_by
+            #   memory_status : active(正常可召回) / superseded(已被新记忆取代，不再召回)
+            #   superseded_by : 被哪一条新记忆取代（chat_history.id），冲突可追溯
+            #
+            # 【解决什么】同一主题的新旧记忆并存（如"我住在上海"→"我搬到北京"），
+            #   不加状态列时两条都会被召回，模型两头都说、互相矛盾。
+            #   冲突处理：相似度 ≥ MEMORY_CONFLICT_THRESHOLD(0.90) 判为同一主题，
+            #   旧的那条置 superseded 并记下新条 id，召回 SQL 只取 active。
+            # ------------------------------------------------------------------
+            """
+            ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS memory_status VARCHAR(16) DEFAULT 'active';
+            """,
+            """
+            ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS superseded_by BIGINT;
+            """,
+            # 索引：召回 SQL 的过滤条件是 (user_id, memory_status)，建联合索引加速
+            """
+            CREATE INDEX IF NOT EXISTS idx_history_user_status
+            ON chat_history (user_id, memory_status, created_at DESC);
+            """,
             # 索引：按 task_id 反查某一笔业务流水涉及哪些对话页
             """
             CREATE INDEX IF NOT EXISTS idx_history_task ON chat_history (task_id);
@@ -691,11 +712,21 @@ class PGManager:
         self._reconnect_if_needed()
         import numpy as np
         emb = np.array(query_embedding, dtype=np.float32)   # 问句向量，与历史摘要向量做余弦距离比较
+        # ------------------------------------------------------------------
+        # 【记忆状态过滤】COALESCE(memory_status,'active')='active'
+        #   只召回"活着"的记忆；已被新记忆取代（superseded）的不进结果。
+        #   COALESCE 兜底：万一有行还没补上该列值（NULL），按 active 对待，
+        #   与 ALTER TABLE ... DEFAULT 'active' 的语义一致。
+        #
+        # 【不过滤会怎样】用户先说"我住在上海"再说"我搬到北京"，两条都在库里；
+        #   问"我住哪"时两条都被召回，模型两头都说——这就是"记忆互相矛盾"的根源。
+        # ------------------------------------------------------------------
         self._cur.execute(
             """SELECT user_query, llm_summary, llm_full_answer,
                       1 - (summary_embedding <=> %s) AS similarity, created_at
                FROM chat_history
                WHERE user_id = %s AND summary_embedding IS NOT NULL
+                 AND COALESCE(memory_status, 'active') = 'active'
                ORDER BY summary_embedding <=> %s
                LIMIT %s""",
             (emb, user_id, emb, top_k),     # %s 顺序：相似度里的向量 → user_id → 排序用的向量 → 条数上限
@@ -729,6 +760,88 @@ class PGManager:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # 【记忆冲突处理】入库前的两步：查冲突 → 旧的置 superseded
+    #
+    # 【为什么需要】同一个主题（如"用户的住址"）先后存了两条记忆时，
+    #   向量召回会把两条都带回来塞进 prompt，模型输出自相矛盾。
+    #   处理策略：新记忆入库前先查同用户、相似度 ≥ 阈值(0.90)的旧记忆，
+    #   有 → 旧的置 superseded（不物理删，留审计痕迹），新条照常入库。
+    #
+    # 【为什么不物理删除】"被取代"和"记错要删"是两回事：
+    #   置状态可追溯（superseded_by 指向新条 id），真删了就查无对证。
+    # ------------------------------------------------------------------
+    # 【什么】查同用户中与新记忆高度相似的旧记忆（冲突检测）
+    # 【作用】相似度 ≥ threshold 的第一条旧记忆即判定为冲突；无冲突返回 None
+    @handle_exception(default=None, log_msg="记忆冲突检测异常")
+    def find_conflict_memory(
+        self, summary_embedding: list, user_id: str,
+        threshold: float = 0.90, exclude_id: int | None = None,
+    ) -> dict | None:
+        """
+        冲突检测：找同用户里与新摘要向量最相近的一条 active 记忆。
+
+        【输入输出对照】
+            输入: summary_embedding=[新"我搬到北京"的向量], user_id="cli-user", threshold=0.90
+            库里旧记忆: "用户住址:上海"(active), similarity=0.93
+            输出: {"id": 42, "summary": "用户住址:上海", "similarity": 0.93}
+            若最相近的只有 0.71（不同主题）→ 输出 None（不算冲突，照常插入）
+
+        【为什么阈值 0.90 比召回阈值 0.65 高】
+            召回答的是"像不像"（宽进），冲突答的是"是不是同一件事"（严判）。
+            0.65 会让"我住上海"和"我去上海出差"被判成冲突，误杀正常记忆。
+        """
+        self._reconnect_if_needed()
+        import numpy as np
+        emb = np.array(summary_embedding, dtype=np.float32)
+        # 相似度 ≥ threshold 用 HAVING 式过滤在 SQL 里做（1 - 距离 >= 阈值），
+        # 只取第一条：同主题旧记忆通常也只有一条是 active（前面的已依次取代）
+        cond = " AND id <> %s" if exclude_id else ""
+        params = [emb, user_id, emb, 1 - float(threshold)]
+        if exclude_id:
+            params.append(exclude_id)
+        self._cur.execute(
+            f"""SELECT id, llm_summary, 1 - (summary_embedding <=> %s) AS similarity
+               FROM chat_history
+               WHERE user_id = %s
+                 AND summary_embedding IS NOT NULL
+                 AND COALESCE(memory_status, 'active') = 'active'
+                 AND 1 - (summary_embedding <=> %s) >= %s{cond}
+               ORDER BY summary_embedding <=> %s
+               LIMIT 1""",
+            (*params, emb),
+        )
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "summary": row[1], "similarity": round(float(row[2]), 4)}
+
+    # 【什么】把一条旧记忆标记为"已被新记忆取代"
+    # 【作用】UPDATE 状态列 + 记录取代者的 id；返回是否真的更新了行
+    @handle_exception(default=False, log_msg="记忆取代标记异常")
+    def supersede_memory(self, memory_id: int, superseded_by: int) -> bool:
+        """
+        旧记忆置 superseded：memory_status='superseded'，superseded_by=新条 id。
+
+        【输入输出对照】
+            输入: memory_id=42, superseded_by=57（新插入那条的主键）
+            执行: UPDATE chat_history SET memory_status='superseded',
+                       superseded_by=57 WHERE id=42 AND memory_status='active'
+            输出: True（rowcount=1）；若 42 已是 superseded（重复调用）→ False
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """UPDATE chat_history
+               SET memory_status = 'superseded', superseded_by = %s
+               WHERE id = %s AND COALESCE(memory_status, 'active') = 'active'""",
+            (superseded_by, memory_id),
+        )
+        updated = self._cur.rowcount > 0
+        self._conn.commit()
+        if updated:
+            _logger.info(f"记忆冲突处理: 旧记忆 id={memory_id} 已被 id={superseded_by} 取代")
+        return updated
 
     # 【什么】历史数据回填：把老记录的 user_query 向量写进 query_embedding 列
     # 【作用】为将来的「重复提问检测」备数据；当前检索不用它，属于提前准备
