@@ -315,11 +315,13 @@ class APIServer:
         # 库没装会自动降级回自研链路（降级在工厂里记 warning，这里只兜底异常）
         try:
             from modules.rag.llamaindex_adapter import build_rag
-            self.ctx.rag = build_rag()
+            self.ctx.rag = build_rag()   # 工厂内部按 RAG_BACKEND 决定返回自研链路还是 LlamaIndex 适配
         except Exception as e:
+            # Milvus 没起/依赖没装：RAG 置空，知识库相关接口会回 503，对话主链路不受影响
             _logger.warning(f"RAG 模块降级（Milvus不可用）: {e}")
             self.ctx.rag = None
 
+        # 把前面装配好的单例全部注入 ReAct 引擎；顺序无关，缺哪个传 None 就走对应降级
         react_agent = ReActAgent(
             llm_client=self.ctx.llm,
             tool_registry=self.ctx.tool_registry,
@@ -329,11 +331,12 @@ class APIServer:
             router=router,
             tool_harness=self.ctx.tool_harness,     # 预算账本与拦截逻辑与 registry 共用同一实例
         )
-        self.ctx.agent_graph = AgentGraph(react_agent)
+        self.ctx.agent_graph = AgentGraph(react_agent)   # 包成 LangGraph：路由实际调用的是 agent_graph.run
 
         # 多 Agent 团队：共用上面的 LLM 与工具注册器，团队组成走默认 4 人配置
         try:
             if get_settings().multiagent_enabled:
+                # 团队复用主链路的 LLM 和工具注册器：不另起一套，保证工具治理口径一致
                 self.ctx.harness = build_harness(
                     llm=self.ctx.llm, tool_registry=self.ctx.tool_registry
                 )
@@ -349,6 +352,7 @@ class APIServer:
                        if s2.multiagent_delegation_enabled else "")
                 )
         except Exception as e:
+            # 团队装配失败：/agent/* 接口返回 503，不影响 /chat 主服务
             _logger.warning(f"多 Agent 模块降级（/agent/* 接口不可用）: {e}")
             self.ctx.harness = None
         _logger.info("后端服务组件初始化完成")
