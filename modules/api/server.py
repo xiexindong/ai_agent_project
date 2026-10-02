@@ -260,7 +260,7 @@ class APIServer:
         # 注册内置技能包（含触发词/SOP/推荐工具），供 Agent 每轮开始前按意图匹配
         self.ctx.skill_registry.register_batch(get_default_skills())
         # 打印技能数量：启动日志里据此确认技能包加载成功（数量异常偏少说明装配有问题）
-        _logger.info(f"技能已加载: {len(self.ctx.skill_registry.list_tools())} 个")
+        _logger.info(f"技能已加载: {len(self.ctx.skill_registry.list_skills())} 个")
 
         # ------------------------------------------------------------------
         # 【MCP 技能网关 + Tool-RAG + 分层路由】与 main.py 同一套装配
