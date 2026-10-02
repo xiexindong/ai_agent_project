@@ -244,7 +244,7 @@ class ToolRegistry:
         # get_tool 的返回值：命中=工具实例，未命中=None
         #   get_tool("calculator") → <CalculatorTool object>   有 .name / .run() / .capability
         #   get_tool("calc")       → None
-        tool = self.get_tool(name)
+        tool: BaseTool | None = self.get_tool(name)
         if not tool:
             return ToolResult(success=False, error=f"工具不存在: {name}")
 

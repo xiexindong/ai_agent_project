@@ -129,7 +129,8 @@ class ToolHarness:
     # 【什么】读取并归一化一个工具的能力声明
     # 【作用】工具可以声明 capability（属性/方法/dict），没声明就按默认等级兜底
     def capability_of(self, tool: Any) -> ToolCapability:
-        raw = getattr(tool, "capability", None)
+        raw = getattr(tool, "capability", None)   # 取工具挂出的能力声明，可能是属性/方法/dict，没挂返回 None
+                                                  # 例子：raw = {"risk": "high", "side_effect": True}
         # ------------------------------------------------------------------
         # 【if callable(raw)】判断"这份声明是方法还是值"
         #   工具可以把 capability 写成三种形态：属性（ToolCapability 实例）/ 方法 / dict。
@@ -174,9 +175,9 @@ class ToolHarness:
             except Exception as e:
                 _logger.warning(f"工具能力声明读取失败: {getattr(tool, 'name', '?')} | {e}")
                 raw = None
-        name = getattr(tool, "name", "") or ""
+        name = getattr(tool, "name", "") or ""  # 取工具挂出的名字，没挂返回空字符串
         if raw is None:
-            cap = ToolCapability(name=name, risk=self.policy.default_risk)
+            cap: ToolCapability = ToolCapability(name=name, risk=self.policy.default_risk)
             # isinstance() 是 Python 里最常用的内置函数之一，用来判断一个对象是不是某个类型
         elif isinstance(raw, ToolCapability):
             cap = raw

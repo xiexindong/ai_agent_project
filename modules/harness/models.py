@@ -178,12 +178,12 @@ class ToolPolicy:
     @staticmethod
     def _match(name: str, rules: Tuple[str, ...]) -> bool:
         for rule in rules:
-            if rule.endswith("*"):
-                if name.startswith(rule[:-1]):
+            if rule.endswith("*"):                 # 通配规则："drop_*" 去掉 * 后是前缀 "drop_"
+                if name.startswith(rule[:-1]):     # name 以该前缀开头即命中：drop_table / drop_index 都中
                     return True
-            elif rule == name:
+            elif rule == name:                     # 精确规则：名字一字不差才命中
                 return True
-        return False
+        return False                               # 所有规则都没中：返回 False（由调用方决定放行还是拦）
 
     # 【什么】把工具自己声明的能力与配置覆盖合并
     # 【作用】覆盖只改风险等级，其余字段仍以工具声明为准

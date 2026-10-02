@@ -183,38 +183,67 @@ class DockerRunner(SubprocessRunner):
         return shutil.which("docker") is not None
 
     def run(self, tool: Any, params: Dict[str, Any], timeout_seconds: float = 0.0) -> ToolResult:
-        if not self.available():
+        # ------------------------------------------------------------------
+        # 【什么】容器沙箱执行：把工具的"类名 + 参数"打包成 JSON，喂给 docker 容器里
+        #        跑的 sandbox_worker，由它 import 类、调用、把结果以 JSON 打回 stdout
+        # 【流程】docker 可用？→ 打包 payload → 拼 docker 命令 → 跑容器 → 解析输出
+        #        四个环节里三个可降级（不可用/启动失败/无输出），只有超时不重试
+        #
+        # 【为什么传类名而不是传对象】容器是独立进程，对象没法跨进程传递；
+        #   传 "modules.tools.data_query" + "DataQueryTool" 字符串，
+        #   容器里的 worker 自己 import 加载（与子进程沙箱同一套路）
+        #
+        # 【docker 命令逐参对照】
+        #   --rm          容器跑完自动删除，不留垃圾
+        #   -i            保持标准输入打开：payload 从 stdin 喂进去
+        #   --network none 断网：工具就算想发请求也发不出去（默认值）
+        #   --memory 256m  内存上限：工具写死循环最多吃 256M 就被杀
+        #   --cpus 0.5     CPU 减半：独占不了宿主机算力
+        #   -v 项目:/app   把项目目录挂进容器，worker 才 import 得到工具代码
+        #   -w /app        容器内工作目录设为挂载点
+        #
+        # 【降级三处 vs 不降级一处】
+        #   降级（退回子进程沙箱）：docker 没装 / 启动异常 / 无有效输出
+        #   不降级：超时——重跑大概率还是超时，直接报失败省时间
+        #
+        # 【输入输出对照】tool=DataQueryTool()、params={"sql":"SELECT 1"}：
+        #   payload = '{"module": "modules.tools.data_query", "class": "DataQueryTool",
+        #              "params": {"sql": "SELECT 1"}}'
+        #   正常：ToolResult(success=True, result=..., duration_ms=...)
+        #   断网容器里跑联网工具：工具报错 → success=False（容器活着，错误在容器内）
+        # ------------------------------------------------------------------
+        if not self.available():                                # 机器上没装 docker：降级子进程沙箱（隔离弱一档但可用）
             _logger.warning("docker 不可用，容器沙箱降级为子进程沙箱")
             return super().run(tool, params, timeout_seconds)
-        payload = json.dumps({
-            "module": type(tool).__module__,
-            "class": type(tool).__name__,
+        payload = json.dumps({                                  # 打包"哪个类 + 什么参数"，跨进程只能传字符串
+            "module": type(tool).__module__,                    #   如 "modules.tools.data_query"
+            "class": type(tool).__name__,                       #   如 "DataQueryTool"
             "params": dict(params or {}),
         }, ensure_ascii=False)
         cmd = [
             "docker", "run", "--rm", "-i",
-            "--network", self.network,
-            "--memory", self.memory,
-            "--cpus", self.cpus,
-            "-v", f"{self.project_root}:/app",
+            "--network", self.network,                          # 默认 none：容器内断网
+            "--memory", self.memory,                            # 默认 256m：内存上限
+            "--cpus", self.cpus,                                # 默认 0.5：CPU 上限
+            "-v", f"{self.project_root}:/app",                  # 项目代码挂进容器，worker 才能 import 工具
             "-w", "/app",
-            self.image,
-            "python", "-m", "modules.harness.sandbox_worker",
+            self.image,                                         # 默认 python:3.11-slim
+            "python", "-m", "modules.harness.sandbox_worker",   # 容器里跑的入口：读 stdin 的 JSON，执行工具，stdout 回 JSON
         ]
         timeout = float(timeout_seconds or self.timeout_seconds)
         try:
             proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
                                   encoding="utf-8", errors="replace", timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired:                       # 超时不降级：重试大概率还是超时，直接失败
             return ToolResult(success=False, error=f"容器沙箱执行超时({timeout:g}s)")
-        except Exception as e:
+        except Exception as e:                                  # docker 启动失败等异常：降级子进程重试
             _logger.warning(f"容器沙箱失败，降级子进程: {e}")
             return super().run(tool, params, timeout_seconds)
-        result = self._parse(proc, tool)
-        if not result.success and not (proc.stdout or "").strip():
+        result = self._parse(proc, tool)                        # 从 stdout 里取最后一个合法 JSON 行当结果
+        if not result.success and not (proc.stdout or "").strip():  # 失败且 stdout 全空 = 容器根本没跑起来
             _logger.warning("容器沙箱无有效输出，降级子进程重试")
             return super().run(tool, params, timeout_seconds)
-        return result
+        return result                                           # 成功或"失败但有输出"（工具在容器里真跑过并报错）都原样返回
 
 
 # 【什么】远程沙箱执行

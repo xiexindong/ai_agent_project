@@ -276,9 +276,18 @@ class ToolInstancePool:
     # 【什么】归还实例
     # 【作用】放回空闲栈并唤醒等待者；不归还会让池永久缩容（借一个少一个）
     def checkin(self, instance: Any) -> None:
+        # ------------------------------------------------------------------
+        # 【什么】归还实例：append 回空闲栈 + notify_all 喊醒等待者
+        # 【为什么锁内做】_idle 是普通 list，不拿锁并发 append/pop 会错乱：
+        #   归还的实例"存在但取不到"，等待线程空等到超时——不报错、静默错位
+        # 【为什么先 append 再 notify】顺序反了，被唤醒的线程扑空又回去睡；
+        #   且锁外 notify 会直接抛 RuntimeError（Condition 必须持锁才能 notify）
+        # 【输入输出对照】_idle=[]、线程C 睡在 wait：
+        #   append(#1) → _idle=[#1] → notify 唤醒 C → C pop 走 #1 → _idle=[]
+        # ------------------------------------------------------------------
         with self._available:
-            self._idle.append(instance)
-            self._available.notify_all()
+            self._idle.append(instance)          # 实例放回空闲栈，等下个线程 checkout 时 pop 走复用
+            self._available.notify_all()         # 喊醒睡在 wait 的线程：有货了，快去重查 _idle
 
     # 【什么】上下文管理器形式借还（推荐用法）
     # 【作用】with 结束自动归还，即使块内抛异常也不泄漏实例
@@ -287,13 +296,13 @@ class ToolInstancePool:
 
         @contextlib.contextmanager
         def _ctx():
-            instance = self.checkout(timeout=timeout)
+            instance = self.checkout(timeout=timeout)   # 进 with 时借：拿不到就抛 TimeoutError
             try:
-                yield instance
+                yield instance                          # 把实例交给 with 块内的代码用
             finally:
-                self.checkin(instance)
+                self.checkin(instance)                  # 出 with 时还：块内抛异常也照还，不泄漏实例
 
-        return _ctx()
+        return _ctx()                                   # 返回生成器上下文管理器（支持 with pool.borrow() as x:）
 
     def stats(self) -> Dict[str, int]:
         """池状态：{'size': 上限, 'created': 已创建, 'idle': 当前空闲}。"""
