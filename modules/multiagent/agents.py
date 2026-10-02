@@ -217,6 +217,26 @@ class BaseAgent:
         【为什么限制轮数】不限制的话，模型可能在"调工具→看结果→再调工具"里打转，
             这和单 Agent ReAct 的 max_iterations=10 是同一个问题的不同尺度。
         """
+        # ------------------------------------------------------------------
+        # 【Subagent 上下文隔离的命门：messages 每次就地新建，绝不继承主对话】
+        #   【为什么要这个？】主 Agent 的 messages 随轮次只增不减，迟早撞
+        #       token 上限，旧信息混杂还会诱发幻觉。若让子 Agent 共享这份
+        #       历史，等于把主对话的膨胀复制 N 份——"走子 Agent 省上下文"
+        #       就成了一句空话，隔离必须做在数据结构层而不是提示词约定层。
+        #   【对比例子】
+        #       ✗ 把主 Agent 的整段 messages 透传给子 Agent：
+        #         第 50 轮时每个子任务都背着几万 token 的闲聊与工具结果，
+        #         而且 worker 能看到与自己任务无关的隐私内容。
+        #       ✓ 每次执行只放两条：system（角色提示词）+ user（本次任务
+        #         所需的最小信息包，由 _build_prompt 拼好）。工具循环产生
+        #         的中间轮次也只活在这个局部变量里，方法返回即随栈帧释放。
+        #   【本项目说明】这同时划定了"回流边界"：子 Agent 执行期的全部
+        #       消息不跨方法边界外溢，外界唯一拿得到的是返回值
+        #       AgentOutput.content（见下方 run() 的 return）。
+        #       JS 类比：等价于 new Worker() 后主线程 postMessage(子任务)，
+        #       Worker 在独立作用域里跑，主作用域变量它一个都看不到，
+        #       最后只能 postMessage(最终结果) 回来，中间状态一律不带回。
+        # ------------------------------------------------------------------
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt},
@@ -324,6 +344,11 @@ class BaseAgent:
         delegation_text = self._delegation_text(delegated)
         prompt = self._build_prompt(instruction, upstream_text, vision_text, peer_text, delegation_text)
 
+        # ------------------------------------------------------------------
+        # 【上下文隔离的最后一道边界】从这里往下，子 Agent 能看到的全部信息
+        #   都已压缩进 prompt 这一个字符串；执行结束后只有 AgentOutput 回流，
+        #   内部 messages、工具日志（logs 仅做账单留痕）都不进入主管的上下文。
+        # ------------------------------------------------------------------
         try:
             schemas = self._tool_schemas()
             if schemas:
