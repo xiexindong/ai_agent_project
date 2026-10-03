@@ -163,6 +163,7 @@ $(function () {
                 updateUserInfo();
                 enableControls();
                 refreshKbStats(stats);
+                loadSessionList();          // 连上后恢复历史会话侧边栏（失败只提示，不影响主流程）
                 showToast("连接成功", "success");
             })
             .catch(err => {
@@ -238,6 +239,35 @@ $(function () {
         $li.on("click", () => loadSession(sessionId));
         $sessionList.find(".empty-tip").remove();
         $sessionList.prepend($li);
+    }
+
+    // 【什么】从后端拉取当前用户的历史会话，重建侧边栏
+    // 【作用】页面刷新/重新连接后会话列表不再丢失；只拉封面信息，点条目时才懒加载明细
+    function loadSessionList() {
+        return apiRequest("GET", "/sessions?limit=50")
+            .then(resp => {
+                state.sessions = [];
+                $sessionList.empty();
+                (resp.sessions || []).forEach(s => {
+                    state.sessions.push({ session_id: s.session_id, title: s.title || "" });
+                    // 标题为空（老数据）时兜底显示会话号前 12 位，总不能渲染一行空白
+                    const title = s.title || s.session_id.slice(0, 12);
+                    const $li = $(`<li data-id="${escapeHtml(s.session_id)}" title="${escapeHtml(s.session_id)}">${escapeHtml(title)}</li>`);
+                    $li.on("click", () => loadSession(s.session_id));
+                    $sessionList.append($li);
+                });
+                if (!state.sessions.length) {
+                    $sessionList.html('<li class="empty-tip">暂无会话</li>');
+                }
+                // 若当前正停在某个会话上，恢复它的高亮
+                if (state.currentSessionId) {
+                    $sessionList.find(`li[data-id="${$.escapeSelector(state.currentSessionId)}"]`).addClass("active");
+                }
+            })
+            .catch(err => {
+                // 列表是辅助功能：加载失败不打断鉴权/对话主流程，只给提示
+                showToast("会话列表加载失败: " + err.message, "error");
+            });
     }
 
     function loadSession(sessionId) {

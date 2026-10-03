@@ -761,6 +761,18 @@ class APIServer:
                 "available": {"llamaindex": li_ok(), "crewai": crewai_ok()},  # 实际装没装
             }
 
+        # 【什么】GET /sessions —— 取当前用户的会话列表（侧边栏）
+        # 【作用】只返回本人未归档会话，按最近活跃倒序；点开某条时前端再懒加载 /history/{id}
+        @app.get("/sessions")
+        async def list_sessions(
+            limit: int = 50,    # 单次最多返回多少条，默认 50
+            user: dict = Depends(get_current_user),
+        ):
+            """获取当前用户的会话列表（仅封面信息，不含对话明细）。"""
+            # SQL 层带 user_id 过滤：列表查询同样做会话隔离，不暴露他人会话
+            rows = ctx.pg.list_user_sessions(user["user_id"], limit)
+            return {"sessions": rows}
+
         # 【什么】GET /history/{session_id} —— 取会话历史（带归属校验）
         # 【作用】只返回本人会话的历史；不是自己的会话直接 403
         @app.get("/history/{session_id}")

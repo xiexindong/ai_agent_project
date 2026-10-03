@@ -467,6 +467,31 @@ class PGManager:
         )
         return self._cur.fetchone() is not None
 
+    # 【什么】列出某用户的会话（侧边栏"会话列表"的取数口）
+    # 【作用】只取本人、未归档的会话，按最近活跃倒序；异常返回 []，列表页宁可空也不报错
+    @handle_exception(default=[], log_msg="读取会话列表异常")
+    def list_user_sessions(self, user_id: str, limit: int = 50) -> list:
+        """读取当前用户的会话列表（会话隔离：WHERE 必须带 user_id）。
+
+        【返回】[{session_id, title, created_at, updated_at}, ...]，按 updated_at 倒序
+        【为什么只查封面表 chat_session 不连 chat_history】
+            列表只需要"有哪些会话、叫什么、什么时候聊过"，
+            连历史表会把同一会话放大成 N 行还要 DISTINCT，纯浪费；
+            点开某一条时前端才调 /history/{session_id} 懒加载明细。
+        【archived=0 过滤】离职归档/过期清理会话不进用户列表（冷热分离）。
+        """
+        self._reconnect_if_needed()
+        self._cur.execute(
+            """SELECT session_id, title, created_at, updated_at
+               FROM chat_session
+               WHERE user_id = %s AND archived = 0
+               ORDER BY updated_at DESC
+               LIMIT %s""",
+            (user_id, limit),
+        )
+        cols = ("session_id", "title", "created_at", "updated_at")
+        return [dict(zip(cols, row)) for row in self._cur.fetchall()]
+
     # 【什么】把 Agent 当前进展快照写进会话封面
     # 【作用】断点续跑的落盘端；异常向外抛，让上层知道状态没存成功
     @handle_exception(default=None, log_msg="更新会话状态异常", reraise=True)
@@ -609,6 +634,16 @@ class PGManager:
             ),
         )
         row = self._cur.fetchone()                  # RETURNING id 的返回行，拿新主键
+        # ------------------------------------------------------------------
+        # 【同事务刷新会话封面的 updated_at】
+        #   不刷新的话，多轮续聊的会话在"会话列表"里永远按创建时间排队，
+        #   最近在聊的沉底、早就废弃的反而排在前面。
+        #   放在 commit 之前：与本轮历史同生共死，不会出现"列表时间新了但内容没存上"。
+        # ------------------------------------------------------------------
+        self._cur.execute(
+            "UPDATE chat_session SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s",
+            (session_id,),
+        )
         self._conn.commit()
         history_id = row[0] if row else None        # 新对话页的 id，供审核队列回连
         _logger.info(f"对话记忆保存: history_id={history_id}, session={session_id}")
