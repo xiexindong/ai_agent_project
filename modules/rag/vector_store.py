@@ -458,12 +458,26 @@ class MilvusVectorStore:
     def _search_once(self, collection, query_vec: list, k: int, expr: Optional[str], output_fields: list):
         """执行一次 ANN 检索；expr 为空时不下过滤条件（兼容老集合）。"""
         kwargs = dict(
+            # 查询向量：包一层 list 变成"批次大小=1"——search 接口按批收向量，
+            #   返回结果也按批给，取结果时固定用 hits[0] 取第一组
             data=[query_vec],
+            # 在哪个向量列上搜：必须与建集合/插入时的字段名一致（见 ensure_collection 的 embedding 列）
             anns_field="embedding",
+            # 检索参数：
+            #   metric_type=COSINE 余弦相似度——必须与建索引时一致，换度量等于换尺子，
+            #     查出来的分数全部失真；
+            #   nprobe=16 搜 128 个 IVF 聚类里的前 16 个桶（nlist=128）——
+            #     调大→召回更高但更慢，调小→更快但容易漏。16 是"准确优先"的折中
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            # 只要 top-k 条（k 由上层传入：召回层与重排层各用不同 k）
             limit=k,
+            # 附带返回这些标量列（doc_id/chunk_text/kb_code 等），
+            #   免得拿 id 再回查一次库
             output_fields=output_fields,
         )
+        # 【为什么 expr 不放进上面的 dict】Milvus 的 expr=None 与"不传"不等价：
+        #   显式传 None 在部分版本会触发校验报错。只在真的有过滤条件时才加 key，
+        #   老集合（没有 kb_code 列的）不带过滤也能正常搜——这就是 docstring 说的"兼容老集合"
         if expr:
             kwargs["expr"] = expr
         return collection.search(**kwargs)
