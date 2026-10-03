@@ -845,28 +845,49 @@ class PGManager:
             0.65 会让"我住上海"和"我去上海出差"被判成冲突，误杀正常记忆。
         """
         self._reconnect_if_needed()
+        # 【为什么 numpy 在函数内 import】延迟导入：numpy 是重依赖，
+        #   不用记忆功能（如纯计算器对话）时不付出加载代价；也避免模块顶部强依赖
         import numpy as np
+        # 【为什么必须 float32】pgvector 的向量列只吃 4 字节单精度浮点；
+        #   若上游（embedding 接口）给的是 Python float / float64 列表，
+        #   直接传进 <=> 算子会报类型不匹配，这里统一转成 pgvector 认识的形状
         emb = np.array(summary_embedding, dtype=np.float32)
         # 相似度 ≥ threshold 用 HAVING 式过滤在 SQL 里做（1 - 距离 >= 阈值），
         # 只取第一条：同主题旧记忆通常也只有一条是 active（前面的已依次取代）
+        #
+        # 【exclude_id 是什么】更新场景下，库里"新记忆"已经插进去了，
+        #   回头查冲突时若不排除自己，最相似的必然是它自己（相似度≈1），
+        #   查重形同虚设。cond 只在需要排除时拼进 SQL，保持常态查询最短。
         cond = " AND id <> %s" if exclude_id else ""
+        # 【参数顺序必须与 SQL 里 %s 出现顺序严格一致】（psycopg2 按位置绑定，不是按名字）：
+        #   SELECT 投影里 1 个 emb → user_id → WHERE 相似度里的 emb → 阈值 →（可选 exclude_id）
+        # 【为什么传 1-threshold】pgvector 的 <=> 返回的是"余弦距离"（0=同向，2=反向），
+        #   相似度 = 1 - 距离；要"相似度 ≥ 0.90"就得改写成"距离 ≤ 0.10"，即 1-0.90
         params = [emb, user_id, emb, 1 - float(threshold)]
         if exclude_id:
             params.append(exclude_id)
         self._cur.execute(
+            # 【SQL 逐段解读】
+            # SELECT ... <=> 是 pgvector 余弦距离算子；1-距离 就是常说的余弦相似度（-1~1）
             f"""SELECT id, llm_summary, 1 - (summary_embedding <=> %s) AS similarity
                FROM chat_history
+               -- 会话隔离：记忆按 user_id 分区，绝不跨用户比对向量
                WHERE user_id = %s
+               -- 老对话行没有 embedding（不是记忆条目），NULL 进 <=> 结果也是 NULL，必须先排掉
                  AND summary_embedding IS NOT NULL
+               -- 只跟"仍生效"的记忆比：已被取代(superseded)的不参与，免得反复冲突。
+               -- COALESCE 兼容历史 NULL 值：早期行没这列，NULL 一律按 active 看待
                  AND COALESCE(memory_status, 'active') = 'active'
+               -- 严判线：相似度 ≥ 阈值才算"同一件事"（阈值含义见 docstring 的 0.90 vs 0.65）
                  AND 1 - (summary_embedding <=> %s) >= %s{cond}
+               -- 距离升序 = 相似度降序，最像的排第一；LIMIT 1 取到即可收工，不做全表排序
                ORDER BY summary_embedding <=> %s
                LIMIT 1""",
-            (*params, emb),
+            (*params, emb),   # 最后一个 emb 对应 ORDER BY 里的距离计算
         )
-        row = self._cur.fetchone()
+        row = self._cur.fetchone()   # LIMIT 1 → 最多一行；没有冲突时拿到 None
         if not row:
-            return None
+            return None              # 无相似旧记忆：调用方走"直接插入新记忆"分支
         return {"id": row[0], "summary": row[1], "similarity": round(float(row[2]), 4)}
 
     # 【什么】把一条旧记忆标记为"已被新记忆取代"

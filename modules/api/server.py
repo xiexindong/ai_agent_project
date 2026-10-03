@@ -334,6 +334,38 @@ class APIServer:
         self.ctx.agent_graph = AgentGraph(react_agent)   # 包成 LangGraph：路由实际调用的是 agent_graph.run
 
         # 多 Agent 团队：共用上面的 LLM 与工具注册器，团队组成走默认 4 人配置
+        # ------------------------------------------------------------------
+        # 【这段在装什么】上面 324-333 行装的是"单 Agent 主链路"（/chat 用）：
+        #   一个 ReActAgent 从头干到尾，不会拆任务。这里再装一套"团队模式"
+        #   （/agent/team/run 用）：主管拆任务 → 两个 Worker 并行干 → 审核员
+        #   把关。两条入口、两套运行时，互不影响。
+        #
+        # 【为什么要这个？】复杂问题（"查 Q3/Q4 营收再算环比"）塞给一个 Agent，
+        #   上下文越滚越大，容易顾此失彼甚至编数据。拆成子任务后，每个
+        #   Worker 只背自己那份最小上下文（上下文隔离），还能并行执行，
+        #   主管专职"拆"和"汇总"。
+        #
+        # 【"共用 LLM 与工具注册器"是什么意思】团队不是另起炉灶：
+        #   build_harness 拿到的 llm / tool_registry 与主链路是同一个单例，
+        #   Worker 调 calculator、data_query 时走的并发闸、重试、权限过滤、
+        #   审计日志和 /chat 完全一致——不会出现"团队里的工具调用不受治理"
+        #   的两套口径。JS 类比：像主 HTTP 服务之外再起一个 worker 池，
+        #   但两边共用同一个数据库连接池和 logger，而不是各配一套。
+        #
+        # 【"默认 4 人"是哪 4 人】（agents.py 的 build_default_team）
+        #   supervisor 主管：拆任务、汇总答案，不亲自干活
+        #   researcher_1 检索员：查事实，带 data_query 工具、可看图
+        #   analyst_1 分析员：计算对比，带 calculator 工具
+        #   reviewer_1 审核员：给汇总答案打分，不合格可打回
+        #
+        # 【为什么整段包 try/except】团队是"可选增强"，不是主服务：
+        #   装配失败只把 harness 置 None（/agent/* 返回 503），
+        #   而 /chat 照常服务。若让异常往外抛，整个 API 会起不来——
+        #   为一个可选能力赔上主服务，是典型的过度耦合。
+        #
+        # 【开关】MULTIAGENT_ENABLED 默认 True；置 False 时整段跳过、
+        #   harness 保持 None，连 build_harness 的装配开销都不发生。
+        # ------------------------------------------------------------------
         try:
             if get_settings().multiagent_enabled:
                 # 团队复用主链路的 LLM 和工具注册器：不另起一套，保证工具治理口径一致
