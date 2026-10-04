@@ -3,7 +3,7 @@
 > 面向：读代码读到这里卡住的人
 > 配套：`docs/Planning全流程-阅读文档.md`（全局视角）、`docs/Planning执行闭环补强.md`
 > 本文所有输出均为**实测**（真实驱动 `ReActAgent.plan_step` / `act_step`，LLM 与工具用桩替换）
-> 行号以当前代码为准（2026-10-03 校准）
+> 行号以当前代码为准（2026-10-03 校准；第九节「逐步沙盘」为 2026-10-04 增补，行号同步校准）
 
 ---
 
@@ -60,7 +60,7 @@ const idx = state.subTasks.findIndex(t => t.status === 'pending');
       │
       ▼
  ┌─ prepare 节点 ─────────────────────────────────────────────┐
- │  召回记忆/技能/RAG（你已看过，本文略）                        │
+ │  召回记忆/技能/RAG（逐步沙盘见第九节）                    │
  └──────────────────────────┬─────────────────────────────────┘
                             ▼
  ┌─ 路由 _after_prepare (graph.py:331) ───────────────────────┐
@@ -352,7 +352,359 @@ JS 类比：不是 `tasks.find(t => t.tool === toolName).done = true`，
 
 ---
 
-## 九、复现脚本（可直接在项目根跑）
+## 九、逐步沙盘：一个例子走完每一步（2026-10-04 增补）
+
+前面讲机制，这节用**一个问题**把整条链路的 12 个站位走一遍。
+
+**贯穿全节的例子**：用户 U007（财务部员工）在网页上问：
+
+> "财务部有多少人？平均工资多少？"
+
+每个站位固定四行格式：
+
+```
+【规划】这一步要达成什么
+【执行】真实代码路径（文件:行号）
+【派发】谁，把什么数据，交给谁
+【例子】本例里的真实文本
+```
+
+### 9.0 沙盘总览（先记住这张时间表）
+
+| # | 站位 | 规划什么 | 执行入口 | 派发动作（数据形态）|
+|---|---|---|---|---|
+| 0 | HTTP 入口 | 鉴权、解析身份 | `server.py` /chat | 请求体 → `graph.run()` |
+| 1 | prepare | 备料 6 件事 | [graph.py:142](../modules/agent/graph.py#L142) | → state 被填满 |
+| 2 | 红绿灯① | 拦截/复杂/简单 | [graph.py:329](../modules/agent/graph.py#L329) | 返回 plan/reason/answer |
+| 3 | plan | 拆成有序步骤 | [react_agent.py:339](../modules/agent/react_agent.py#L339) | → `sub_tasks` 列表 |
+| 4 | reason 第1轮 | 问模型"这轮干嘛" | [react_agent.py:434](../modules/agent/react_agent.py#L434) | → `state.action` |
+| 5 | 红绿灯② | 调工具还是答题 | [graph.py:345](../modules/agent/graph.py#L345) | 返回 act/answer |
+| 6 | act 第1轮 | 真执行 data_query | [react_agent.py:729](../modules/agent/react_agent.py#L729) | → observation + 打勾 |
+| 7 | reason 第2轮 | 看到人数，接着算平均 | 同 434 | → calculator action |
+| 8 | act 第2轮 | 真执行 calculator | 同 729 | → "17500" + 打勾 |
+| 9 | reason 第3轮 | 模型看到全 ✅ | 同 434 | → 纯文本，**无** tool_calls |
+| 10 | answer | 完整答案 + 摘要 | [graph.py:219](../modules/agent/graph.py#L219) | → final_answer |
+| 11 | save | 落库 | [graph.py:234](../modules/agent/graph.py#L234) | → PG + MySQL |
+
+---
+
+### 站位 0：HTTP 入口 —— 请求变成初始 state
+
+【规划】校验 API Key、解析出登录身份（principal），把一句话连同身份交给图。
+【执行】`POST /chat` → `AgentGraph.run()`（[graph.py:376](../modules/agent/graph.py#L376)）。
+【派发】HTTP 请求体（JSON）→ 初始 state。**此时 state 只有 5 个字段**（[graph.py:396-402](../modules/agent/graph.py#L396-L402)），别的全是空的；另配 `recursion_limit=30`（图跳转步数的天花板，[graph.py:404](../modules/agent/graph.py#L404)）。
+【例子】
+
+```python
+initial_state = {
+    "session_id": "s-001",
+    "user_id": "U007",
+    "user_query": "财务部有多少人？平均工资多少？",
+    "principal": <Principal 财务身份>,   # CLI 调试时为 None
+    "prepared": False,
+}
+```
+
+通俗版：客人进门，前台只登记了"谁、点了什么"，厨房还一口没动。
+
+### 站位 1：prepare 节点 —— 开工前把料备齐
+
+【规划】一次完成 6 件备料：**开预算账 → 注入检测 → 清洗问句 → 匹配技能 → 召回记忆 → 召回知识库**。
+【执行】[graph.py:142](../modules/agent/graph.py#L142)（`_prepare_node`）→ `prepare_state()`（[react_agent.py:130](../modules/agent/react_agent.py#L130)）。
+【派发】原始 query → 一个被填满的 state，各字段都是后面拼 prompt 的原料。
+
+| 顺序 | 干的事 | 代码行 |
+|---|---|---|
+| 1 | 开一本新预算账（次数/token/墙钟从 0 算） | [react_agent.py:150](../modules/agent/react_agent.py#L150) |
+| 2 | Prompt 注入检测；**命中直接返回 finished**，不进后续流程 | [react_agent.py:153](../modules/agent/react_agent.py#L153) |
+| 3 | 清洗：去控制字符、截断、去空白 | [react_agent.py:L164](../modules/agent/react_agent.py#L164) |
+| 4 | 匹配技能，拿到 SOP 操作上下文 | [react_agent.py:175](../modules/agent/react_agent.py#L175) |
+| 5 | 召回长期/短期记忆（先算 embedding 再向量检索） | [react_agent.py:189](../modules/agent/react_agent.py#L189) |
+| 6 | RAG 召回（按身份过滤知识库）+ 标准答案库 | [react_agent.py:205](../modules/agent/react_agent.py#L205)、[217](../modules/agent/react_agent.py#L217) |
+
+【例子】备完后 state 里有了这些文本（后面会原样拼进 prompt）：
+
+```
+state.memory_context = "U007 上次问过财务部花名册…"
+state.rag_context    = "【知识库参考】员工与薪资表结构…"
+state.skill_context  = "（通用企业助手流程）"
+```
+
+两个细节：
+
+1. 节点返回时打上 `prepared=True`（[graph.py:155](../modules/agent/graph.py#L155)）——循环再经过这里时**不会重复备料**（重复 embedding 和检索都是钱）。
+2. 每一步召回都包了降级：记忆/RAG 服务挂了只记 warning、对应字段置空，对话不中断。
+
+### 站位 2：红绿灯① —— 去 plan、reason 还是 answer
+
+【规划】决定下一站：拦截话术直接收尾、复杂问题先规划、简单问题直接进推理。
+【执行】`_after_prepare()`（[graph.py:329](../modules/agent/graph.py#L329)）。
+【派发】它只返回一个**字符串**，LangGraph 拿字符串当 key 查边表（[graph.py:103-111](../modules/agent/graph.py#L103-L111)）决定下一个节点。
+
+```python
+if state.error or (state.finished and state.final_answer):
+    return "answer"     # 注入拦截：话术必须绕过 LLM，否则会被模型输出盖掉
+if agent.should_plan(state):
+    return "plan"       # 复杂：先拆步骤
+return "reason"         # 简单：直接进 ReAct
+```
+
+【例子】本例命中汇总词"平均"+ 一句问两件事，复杂度打分过门槛 → 返回 `"plan"`。
+
+### 站位 3：plan 节点 —— 拆步骤（只此一次）
+
+【规划】调一次 LLM，把一句话拆成**有序、带工具提示**的步骤。
+【执行】[graph.py:161](../modules/agent/graph.py#L161) → `plan_step()`（[react_agent.py:339](../modules/agent/react_agent.py#L339)）→ `planner.create_plan()`（planner.py:304）。
+【派发】PlanResult → `_save_plan()`（[react_agent.py:366](../modules/agent/react_agent.py#L366)）写四样：`sub_tasks` / `plan_rationale` / `plan_replan_count` / 指针。
+【例子】本例拆出 2 步：
+
+```
+s1: 查询财务部人数与工资总额      （tool_hint=data_query，无依赖）
+s2: 计算平均工资                 （tool_hint=calculator，依赖 s1）
+指针 current_task_index = 0      （第一个未闭合步骤）
+```
+
+再强调一次第三节的结论：**plan 节点到此结束，它一步都不执行。**
+
+### 站位 4：reason 第1轮 —— 拼材料、问模型
+
+【规划】把全部上下文拼成 messages，让模型决定"调不调工具、调哪个、给什么参数"。
+【执行】`reason_step()`（[react_agent.py:434](../modules/agent/react_agent.py#L434)），内部 8 个动作按序：
+
+| 序 | 动作 | 行号 |
+|---|---|---|
+| a | `iteration` 0→1 | [467](../modules/agent/react_agent.py#L467) |
+| b | 预算闸门：超时/token 打满 → 强制收尾 | [475-486](../modules/agent/react_agent.py#L475-L486) |
+| c | 路由出本轮工具名单 + RBAC 权限过滤 | [503-519](../modules/agent/react_agent.py#L503-L519) |
+| d | 拼工具历史文本 | [532](../modules/agent/react_agent.py#L532) |
+| e | 8 槽位模板填出 [system, user] 两条消息 | [548](../modules/agent/react_agent.py#L548) |
+| f | **计划进度拼到 user 消息末尾** | [563-565](../modules/agent/react_agent.py#L563-L565) |
+| g | 调一次 LLM（Function Calling） | [568](../modules/agent/react_agent.py#L568) |
+| h | 拿到 tool_calls → 重复/环/无进展检查 → 写 action | [593-634](../modules/agent/react_agent.py#L593-L634) |
+
+【派发】模型返回的 tool_calls[0] → `state.action`（一个 dict，act 节点只认它）。
+【例子】这一轮模型看到的拼接区：
+
+```
+【执行计划】1.查人数和工资总额 ⬜（当前步骤）  2.算平均工资 ⬜
+【上轮观察】（初始状态，暂无工具观察）
+【工具历史】（无）
+```
+
+模型返回：
+
+```python
+tool_calls = [{"name": "data_query", "arguments": {"dept_code": "D_FIN"}}]
+state.need_tool_call = True
+state.action = {"name": "data_query", "arguments": {"dept_code": "D_FIN"}}
+```
+
+### 站位 5：红绿灯② —— 全图唯一的"act/answer"开关
+
+【规划】模型要干活且没出错 → act；否则 → answer 收尾。
+【执行】`_should_continue()`（[graph.py:345](../modules/agent/graph.py#L345)）。
+
+```python
+if state.finished:                              return "answer"
+if state.need_tool_call and not state.error:    return "act"
+return "answer"   # 想调工具但出错了：也收尾，不再硬调
+```
+
+【例子】`need_tool_call=True`、error 为空 → 返回 `"act"`。
+
+### 站位 6：act 第1轮 —— data_query 真执行
+
+【规划】把模型选的工具真正跑一遍，结果回写，然后给计划打勾。
+【执行】`act_step()`（[react_agent.py:729](../modules/agent/react_agent.py#L729)）。
+【派发】action → `registry.execute_tool()`（[758](../modules/agent/react_agent.py#L758) → [tool_registry.py:205](../modules/tools/tool_registry.py#L205)）。**注意调用时第 4 个参数**：服务端把私有参数（`_scopes/_dept_code/_user_code/_mask_level`）作为 context 注入，模型在 schema 里根本看不到这些字段，也伪造不了（[tool_registry.py:317-319](../modules/tools/tool_registry.py#L317-L319) 后写入覆盖）。
+
+registry 内部按序过闸：查注册表 → 能力裁决 before_call → 单工具限次 → 同参去重/缓存 → **真执行** → after_call 脱敏裁剪。
+
+【例子】
+
+```python
+# 模型给的参数
+{"dept_code": "D_FIN"}
+# 服务端额外注入（模型看不到）
+{"_dept_code": "D_FIN", "_scopes": {"users": "dept", ...}, "_mask_level": 2}
+
+# 工具返回
+ToolResult(success=True, result="财务部共25人，工资总额437,500元")
+```
+
+执行后三连（[react_agent.py:768-787](../modules/agent/react_agent.py#L768-L787)）：
+
+```
+1. 审计落 MySQL
+2. tool_calls_history / tool_call_logs 各加 1 条
+3. state.observation = "财务部共25人，工资总额437,500元"
+```
+
+`_advance_plan()`（[787 调用，410 定义](../modules/agent/react_agent.py#L410)）：s1 打 ✅（附 200 字结果摘要），指针自动前移到 s2。
+
+### 站位 7：reason 第2轮 —— 同样的代码，变化的拼接区
+
+【规划】代码路径与站位 4 **完全相同**；这里重点看模型"凭什么知道下一步"。
+【执行】同 [react_agent.py:434](../modules/agent/react_agent.py#L434)。
+【派发】这一轮的拼接区三处变化（绿色逻辑：全是上一步喂进来的）：
+
+```
+【执行计划】1.查人数和工资总额 ✅ → 结果: 25人，总额437,500
+            2.算平均工资 ⬜（当前步骤）
+【上轮观察】财务部共25人，工资总额437,500元
+【工具历史】data_query({"dept_code":"D_FIN"}) → 25人…
+```
+
+【例子】模型据此返回：
+
+```python
+tool_calls = [{"name": "calculator", "arguments": {"expression": "437500/25"}}]
+```
+
+这就是"模型无状态"的实证：它**不是记得** s1 做完了，而是每轮从拼好的 ✅ 和 observation 里重新读出来的。
+
+### 站位 8：act 第2轮 —— calculator 真执行
+
+【规划】同站位 6：执行 → 记账 → 打勾。
+【执行】同 [react_agent.py:729](../modules/agent/react_agent.py#L729)。
+【例子】
+
+```python
+registry.execute_tool("calculator", {"expression": "437500/25"})
+# → ToolResult(success=True, result="17500")
+
+state.observation = "17500"
+```
+
+`_advance_plan()`：s2 打 ✅，**两个步骤全部闭合，指针走到头**（`current_task_index=2 = len(steps)`）。
+
+### 站位 9：reason 第3轮 —— 模型决定收尾
+
+【规划】代码不替模型判断"做完没"——即使计划已全 ✅，仍要让模型看一眼材料自己决定。
+【执行】同 [react_agent.py:434](../modules/agent/react_agent.py#L434)。
+【派发】拼接区现在是：
+
+```
+【执行计划】1.查人数和工资总额 ✅  2.算平均工资 ✅
+【上轮观察】17500
+【工具历史】2 条记录
+指针：全部步骤已闭合
+```
+
+【例子】**关键区别在模型的返回**：这次没有 tool_calls，只有纯文本。
+
+```python
+content = "财务部共 25 人，平均工资为 17,500 元/人。"
+tool_calls = None
+```
+
+走 else 分支（[react_agent.py:636-637](../modules/agent/react_agent.py#L636-L637)）：
+
+```python
+state.need_tool_call = False
+state.final_answer = "财务部共 25 人，平均工资为 17,500 元/人。"
+```
+
+红绿灯② 随即返回 `"answer"`。**正常出口只有这一个：模型自己不再要工具。**
+
+### 站位 10：answer 节点 —— 出完整答案 + 一句话摘要
+
+【规划】生成（或保留）可发给用户的完整答案，再生成一句话摘要供会话列表展示。
+【执行】[graph.py:219](../modules/agent/graph.py#L219) → `generate_answer()`（[react_agent.py:794](../modules/agent/react_agent.py#L794)）、`generate_summary()`（[react_agent.py:817](../modules/agent/react_agent.py#L817)）。
+【派发】两个分支：
+
+```python
+if state.final_answer and not state.need_tool_call:
+    pass          # 站位9 已产出答案：原样保留，不多花一次 LLM
+else:
+    # 汇总 RAG/观察/推理，再问一次模型补写完整答案
+```
+
+【例子】
+
+```
+final_answer = "财务部共 25 人，平均工资为 17,500 元/人。"
+llm_summary  = "财务部25人，平均工资17,500元"
+finished     = True
+```
+
+### 站位 11：save 节点 —— 全部落库
+
+【规划】把这一轮的对话、摘要向量、工具流水持久化，并触发自动初审。
+【执行】[graph.py:234](../modules/agent/graph.py#L234)。
+【派发】四个落点：
+
+| 落点 | 内容 | 行号 |
+|---|---|---|
+| PG `chat_history` | 原文 + 答案 + 摘要向量 + 工具日志 JSONB | [252](../modules/agent/graph.py#L252) |
+| PG 会话状态快照 | state 序列化（**先剔除 principal**，活体对象无法 JSON 化） | [267-273](../modules/agent/graph.py#L267-L273) |
+| MySQL `tool_call_log` | 每条工具调用一行，审计原始依据 | [274、283](../modules/agent/graph.py#L283) |
+| 人工复核队列 | 命中敏感词/工具失败/低置信/无 RAG 时入队 | [275、299](../modules/agent/graph.py#L299) |
+
+落库完成 → 边 `"save" → END`（[graph.py:123](../modules/agent/graph.py#L123)），终态 dict 返回给前端，网页显示最终答案。
+
+---
+
+### 9.12 "派发任务"的另一层：主管 → 团队成员
+
+上面 12 个站位是**单 Agent** 的循环，它的"派发"其实就是一个 dict：
+
+```python
+state.action = {"name": "calculator", "arguments": {"expression": "437500/25"}}
+```
+
+项目里还有**团队层**的派发——一个主管把活派给多个 Agent 并行干，入口是独立的 `POST /agent/team/run`（[server.py:713](../modules/api/server.py#L713)）。主流程在 [multiagent/harness.py:371](../modules/multiagent/harness.py#L371)，五步：
+
+| 步 | 干的事 | 代码行 |
+|---|---|---|
+| 1 | 主管规划：返回 `PlanResult`——要么 `subtasks`，要么 `direct_answer`（二选一，模型校验强制） | [harness.py:430](../modules/multiagent/harness.py#L430)；规划器定义 [agents.py:457](../modules/multiagent/agents.py#L457) |
+| 2 | `topo_batches()` Kahn 拓扑分层：同批无依赖可并行，环被剔除 | [harness.py:476](../modules/multiagent/harness.py#L476)；定义 [339](../modules/multiagent/harness.py#L339) |
+| 3 | `_run_batch()` 线程池并行执行，`future.result(timeout)` 把单任务超时转成失败 | [harness.py:500](../modules/multiagent/harness.py#L500)；定义 [771、837-845](../modules/multiagent/harness.py#L771) |
+| 4 | 每个产出同时进 `result.outputs`（对外账单）和 `ctx.upstream[task_id]`（下游输入） | [harness.py:506-512](../modules/multiagent/harness.py#L506-L512) |
+| 5 | 一致性检测/仲裁 → 主管汇总 synthesize → reviewer 终审 | [harness.py:540-641](../modules/multiagent/harness.py#L540-L641) |
+
+默认花名册（[agents.py:574](../modules/multiagent/agents.py#L574)）：
+
+```
+supervisor    主管：拆活、汇总
+researcher_1  检索：可用 data_query
+analyst_1    分析：可用 calculator
+reviewer_1   审核：终审打分
+```
+
+【例子】本例在团队模式下，主管规划出的 `PlanResult` 长这样：
+
+```json
+{
+  "thought": "先取事实数据，再做除法，最后成文",
+  "subtasks": [
+    {"id": "t1", "assignee": "researcher_1",
+     "instruction": "查询财务部人数与工资总额", "depends_on": [], "priority": 2},
+    {"id": "t2", "assignee": "analyst_1",
+     "instruction": "用工资总额除以人数，给出平均工资", "depends_on": ["t1"], "priority": 1}
+  ],
+  "needs_review": true
+}
+```
+
+数据怎么流动：t1 跑完，产出进 `ctx.upstream["t1"]` → t2 的 prompt 里出现 `【上游产出 · t1】25人，总额437,500`（拼接逻辑 [agents.py:398-406](../modules/multiagent/agents.py#L398-L406)）→ analyst_1 不用重复查数据，直接算。
+
+**边界（别混淆两种入口）**：
+
+- 普通 `/chat` **不会自动触发**团队派发；团队协作只走 `/agent/team/run`（主管在团队模式内部仍可对寒暄直答，即 `is_direct` 分支，[harness.py:439](../modules/multiagent/harness.py#L439)）。
+- 执行者中途"把自己缺的一块"再转给别人，是**委派**（delegation），和主管事前**派活**（dispatch）不是一回事，详见 [`多Agent委派.md`](./多Agent委派.md)；团队全流程见 [`多Agent协作全景.md`](./多Agent协作全景.md)。
+
+### 9.13 一句话收拢
+
+整条链路就是三句话：
+
+> **prepare 备一次料（站位 0-2）→ plan 拆一次单（站位 3）→ reason↔act 循环若干轮，直到模型自己不再要工具（站位 4-9）→ answer/save 收尾（站位 10-11）。**
+
+代码全程只做"记账 + 摆路牌 + 保险丝"；**每一步做什么，都是模型看完拼好的材料自己决定的**。
+
+---
+
+## 十、复现脚本（可直接在项目根跑）
 
 ```python
 import json, types
@@ -404,7 +756,7 @@ for name, args in [("data_query", {"quarter": "Q4"}), ("data_query", {"quarter":
 
 ---
 
-## 十、五问自测（答得上来就算真懂了）
+## 十一、五问自测（答得上来就算真懂了）
 
 1. `plan_step` 里有没有循环？→ 没有，只调一次 `create_plan`。
 2. 计划靠什么"一步一步"前进？→ `act_step` 末尾的 `_advance_plan`（788 行调用，410 行定义）。
