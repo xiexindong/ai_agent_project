@@ -340,12 +340,15 @@ class ReActAgent:
         """生成执行计划。规划不可用时 planner 会返回单步计划，行为等同不规划。"""
         if self.planner is None:
             return state
+            # 拆解步骤
         plan = self.planner.create_plan(          # TaskPlanner.create_plan() → modules/agent/planner.py:304
             state.user_query,
             tools_desc=self._tools_overview(),
             skill_context=state.skill_context,
         )
+        # 写进state
         self._save_plan(state, plan)
+        # 打印日志
         _logger.info(f"计划已写入 state: {len(state.sub_tasks)} 步 | 思路={state.plan_rationale[:40]}")
         return state
 
@@ -364,7 +367,7 @@ class ReActAgent:
     # 【什么】把计划写回 state
     # 【作用】步骤列表 + 思路 + 重规划次数 + 指针（指向第一个待做步骤）
     def _save_plan(self, state: AgentState, plan: "ExecutionPlan") -> None:
-        state.sub_tasks = [s.to_dict() for s in plan.steps]      # 步骤列表（dict，因为 LangGraph 只认 dict）
+        state.sub_tasks = [s.to_dict() for s in plan.steps]      # 存储子任务 步骤列表（dict，因为 LangGraph 只认 dict）
         state.plan_rationale = plan.rationale                    # 总体思路
         state.plan_replan_count = plan.replan_count              # 已重排几次
         state.current_task_index = next(
@@ -384,14 +387,34 @@ class ReActAgent:
     #         所以计划不走槽位而是直接拼在 user 内容里（无计划时完全不动 messages）
     @staticmethod
     def _with_plan(rec: dict, plan_text: str) -> dict:
+        """把计划进度文本追加到最后一条 user 消息末尾，返回新的 record（不改输入）。
+
+        【输入输出对照】
+            输入 rec={'messages': [{'role':'system','content':'你是助手…'},
+                                   {'role':'user','content':'财务部多少人？'}]}
+                 plan_text='## 执行计划（共2步…）'
+            输出 messages 的 user 变为：
+                 '财务部多少人？\\n\\n## 执行计划（共2步…）'
+                 system 一条原样不动。
+        """
+        # 【先拷贝再动手】list(...) 复制出一份新列表：rec 是上游 build_record
+        #   的产物，直接往里改会污染原始记录（可能还要用于重试/日志）。
         messages = list(rec.get("messages") or [])
+        # 【倒序遍历，找"最后一条"user】range(末位, -1, -1) 即从最后一个下标
+        #   递减到 0：messages 里可能有 system + 多轮 user/assistant，计划要
+        #   贴在最新一句用户消息后，而不是第一条。命中后 break，只改一处。
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                msg = dict(messages[i])
+                msg = dict(messages[i])          # 同样先复制这条 dict，不原地改列表里的对象
+                # 用两个换行隔开原问句和计划：原问句保持完整语义，计划作为补充区
+                # 拼在后面；msg.get 兜底防该条消息没有 content 字段
                 msg["content"] = f"{msg.get('content', '')}\n\n{plan_text}"
                 messages[i] = msg
                 break
-        out = dict(rec)
+        # 【为什么拼 user 而不是 system】system 是角色与流程指令，跨轮稳定、
+        #   可被前缀缓存；计划每轮打勾状态都在变，放 system 会让缓存全部失效。
+        # 没找到 user 消息时 messages 原样返回（不报错）：计划注入不了不该搞挂本轮。
+        out = dict(rec)                          # 复制 record 外壳，保留 token/trimmed 等其他字段
         out["messages"] = messages
         return out
 
@@ -471,10 +494,61 @@ class ReActAgent:
         # 【预算闸门：轮次开始先看账本】
         #   墙钟超时或 token 预算打满时不再问模型（问了也只会再要一次工具），
         #   直接收尾出答案——这对应"上下文膨胀"的最后一道防线。
+        #
+        # 【budget 是什么？】
+        #   budget 是一个 RunBudget 对象（modules/harness/budget.py:44），
+        #   可以理解成这次对话专属的一张「费用账单 + 套餐额度表」：
+        #
+        #     ┌─ spec 套餐上限（BudgetSpec，budget.py:34，来自配置，默认值括号内）
+        #     │    max_calls_per_run(8)   本轮工具总次数上限
+        #     │    max_calls_per_tool(5)  单个工具次数上限（防对一个工具死循环）
+        #     │    token_budget(6000)     回灌 prompt 的累计 token 上限
+        #     │    timeout_seconds(120)   墙钟秒数上限
+        #     └─ 已用部分（边跑边记，budget.py:56-64）
+        #          total_calls 已调次数   per_tool {'data_query':1, ...} 各工具次数
+        #          tokens 已回灌 token    blocked 被预算拦下的次数
+        #          started 开账时刻       deadline = started + 120s 到期时刻
+        #
+        #   【账本实物】跑完 2 个工具后 budget.snapshot()（budget.py:108）示例：
+        #       {'session_id':'s-001','total_calls':2,
+        #        'per_tool':{'data_query':1,'calculator':1},
+        #        'tokens':980,'token_budget':6000,'remaining_seconds':87.4,'blocked':0}
+        #       → 对照额度一看：次数/token/时间都没满，允许继续第 3 轮
+        #
+        #   【账本的一生：建账 → 取用 → 销账】
+        #     建账：prepare 阶段本文件 150 行调 harness.begin_run(sid)
+        #             → harness.py:226 → BudgetManager.begin()（budget.py:139），
+        #               同一轮重复 begin 会重置而不是叠加，保证配额从 0 开始
+        #     取用：本行 harness.budget(sid) → budgets.get()（budget.py:147），
+        #             没建过也会兜底开一本默认账，调用方不用关心顺序
+        #     销账：tool_registry.reset_session() 调 harness.end_run(sid)
+        #             → harness.py:229 → budgets.end()（budget.py:157），
+        #               一轮提问一本账，销掉防止旧账本堆积、配额串到下一轮
+        #
+        # 【为什么要这个？】
+        #   ReAct 最大的风险不是调错工具，而是「停不下来」：
+        #     工具每次返回一大段 → 全部塞进下一轮 prompt，上下文越滚越大
+        #     模型没拿到想要字段 → 换个参数再调，白烧 token
+        #     某个工具一直卡住 → 整条会话挂死
+        #   这三样靠模型自觉没用，只能在「每轮问 LLM 之前」先看账本，
+        #   额度没了就直接收尾，连这一次 LLM 调用都不发起（省的是真金白银）。
+        #
+        # 【对比例子】（✗ 不看账本 vs ✓ 先看账本）
+        #   ✗ 模型已经连着调了 8 次工具、prompt 涨到 6000+ token，
+        #     代码还照常把超长 messages 发给模型 → 接口报 context_length 超限，
+        #     或再被要一次工具，循环彻底失控。
+        #   ✓ 本轮一进门发现 tokens >= 6000 或墙钟 > 120s，
+        #     直接拿已有信息收尾，不再发请求 → 用户拿到一个"基于已有信息"的答案。
+        #
+        # 【本项目说明】这里只查两道（超时 / token），另外两道配额在别处生效：
+        #   总次数(8)、单工具次数(5) 由 registry.execute_tool 内部调 budget.check()
+        #   拦截（tool_registry.py 的限次闸）；reason 节点只关心"还要不要问模型"。
+        #   通俗类比：手机流量套餐 —— 时间到月底了（expired）或流量用完
+        #   （tokens 打满），运营商直接断网，而不是等你刷视频刷到欠费。
         # ------------------------------------------------------------------
         if self.tool_harness is not None:                                           # 没装 Harness 就没有账本，纯 LLM 模式不做预算管控
-            budget = self.tool_harness.budget(state.session_id)                     # ToolHarness.budget() → modules/harness/harness.py:224；取这个会话的预算账本
-            if budget.expired or budget.tokens >= budget.spec.token_budget:         # 超时（120s）或上下文 token 用尽（6000）
+            budget = self.tool_harness.budget(state.session_id)                     # ToolHarness.budget() → modules/harness/harness.py:224；按 session_id 取这本账（没建过会自动开一本默认的）
+            if budget.expired or budget.tokens >= budget.spec.token_budget:         # expired=墙钟超 120s（budget.py:72）；或累计 token ≥ 6000（spec 默认值，配置可覆盖）
                 _logger.warning(f"运行预算已用尽，强制收尾: {budget.snapshot()}")     # 快照含次数/token/剩余秒/blocked，便于分辨是哪一项打满
                 state.need_tool_call = False                                        # 不再走 act 节点（图路由据此跳过工具）
                 state.action = {}                                                   # 清空本轮动作，避免残留上一次的调用
@@ -678,14 +752,32 @@ class ReActAgent:
         """动作指纹：工具名 + 规范化后的参数，形如 'data_query|{"quarter":"Q4"}'。"""
         name = str(call.get("name", "") or "")
         args = call.get("arguments", {}) or {}
+        # ------------------------------------------------------------------
+        # 【把参数序列化成稳定字符串】两个相邻动作要判定"是不是同一个"，
+        #   先得把 dict 压成可逐字符比较的文本。json.dumps 四个参数各有用：
+        #     sort_keys=True   最关键：{"a":1,"b":2} 和 {"b":2,"a":1} 是
+        #                      同一次调用，按 key 排序后序列化结果一致
+        #                      （等价 ToolRegistry._hash_params 的做法）
+        #     ensure_ascii=False 中文原样输出，不转成 \\uXXXX，日志可读
+        #     default=str      遇到 JSON 不认识的类型（datetime/dataclass 等）
+        #                      调 str() 兜住，而不是直接抛 TypeError
+        # ------------------------------------------------------------------
         try:
             args_text = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
         except Exception:
+            # default=str 已兜绝大多数类型，这里再失败（如自定义 __str__ 抛错）
+            # 就退化成 Python 原生 repr 风格字符串 —— 指纹粗糙没关系，
+            # 只要"相同参数每次得到相同文本"，去重和环检测就仍然成立。
             args_text = str(args)                      # 参数里有不可序列化对象时退化为字符串，宁可粗也不崩
+        # 用 | 连接工具名与参数：工具名在前，环检测 split("|",1) 时能原样取回名字
         return f"{name}|{args_text}"
 
     # 【什么】检测「交替环」：A→B→A→B / A→B→C→A→B→C
     # 【作用】补"同名同参去重"抓不到的那类循环——每一步都和上一次不同，但整段在重复
+    #
+    # 【为什么要专门有这一道】registry 的去重/限次只盯"同一个工具"，
+    #   对 A、B 交替的模式完全无感：每个工具都只用了 2 次，远没到上限 5，
+    #   参数也各不相同，但模型其实已经在一个圈里空转、烧 token。
     @classmethod
     def _detect_cycle(cls, history: list, pending_call: dict,
                       min_period: int = 2, max_period: int = 3) -> Optional[Tuple[int, list]]:
@@ -755,7 +847,7 @@ class ReActAgent:
         if not self.tool_registry:
             state.observation = "工具注册器未初始化，无法调用工具"
             return state
-
+        # 工具执行
         result = self.tool_registry.execute_tool(      # ToolRegistry.execute_tool() → modules/tools/tool_registry.py:205
             name=tool_name,
             params=arguments,

@@ -36,26 +36,27 @@
 【默认行为保证】
     enabled=False 或未装配 harness 时，ToolRegistry 走原有流程，行为与改造前一致。
 """
-from __future__ import annotations
+from __future__ import annotations          # 允许类型注解里用未导入的名字（Python 3.7+ 兼容写法）
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional      # 标准库类型：Any 任意类型 / Dict 字典 / Optional 可空
 
-from modules.common.logger import get_logger
-from modules.harness.budget import BudgetManager, BudgetSpec, RunBudget
-from modules.harness.middleware import (
+# 【项目内依赖分组】按"从底层到上层"排列，便于一眼看清 Harness 串了哪些模块
+from modules.common.logger import get_logger                                  # 统一日志工厂
+from modules.harness.budget import BudgetManager, BudgetSpec, RunBudget       # 预算：开账/销账/记账
+from modules.harness.middleware import (                                     # 五道中间件 + 链
     BudgetMiddleware, MiddlewareChain, PermissionMiddleware, RateLimitMiddleware,
     SchemaMiddleware, ScopeMiddleware,
 )
-from modules.harness.models import (
+from modules.harness.models import (                                         # 数据模型与裁决常量
     ACTION_APPROVE, ACTION_DENY, RiskLevel, ToolCallRequest, ToolCapability, ToolPolicy, ToolVerdict,
 )
-from modules.harness.result_filter import ResultFilter, ResultFilterConfig
+from modules.harness.result_filter import ResultFilter, ResultFilterConfig    # 结果脱敏 + 裁剪
 from modules.harness.sandbox import MODE_DOCKER, MODE_NONE, MODE_REMOTE, InProcessRunner, SandboxRunner, build_sandbox
-from modules.tools.base_tool import ToolResult
-from modules.tools.concurrency import ToolConcurrencyGuard
-from modules.tools.retry import ToolRetryPolicy
+from modules.tools.base_tool import ToolResult                               # 工具执行结果统一结构
+from modules.tools.concurrency import ToolConcurrencyGuard                   # 并发闸门（信号量限流）
+from modules.tools.retry import ToolRetryPolicy                              # 重试策略（指数退避）
 
-_logger = get_logger("harness")
+_logger = get_logger("harness")              # 模块级 logger，名字 = "harness"，便于按模块过滤日志
 
 
 # 【什么】工具运行时框架
@@ -86,29 +87,29 @@ class ToolHarness:
         docker_options: Optional[dict] = None,  # 容器沙箱参数（image/network/memory/cpus）
         remote_options: Optional[dict] = None,  # 远程沙箱参数（endpoint/token），mode=remote 时生效
     ):
-        self.policy = policy or ToolPolicy()
-        self.budgets = budgets or BudgetManager()
-        self.chain = chain or MiddlewareChain()
-        self.result_filter = result_filter or ResultFilter()
-        self.gate = gate
+        self.policy = policy or ToolPolicy()                    # 策略裁决器：没传就用默认（默认等级=LOW、禁止/批准名单为空）
+        self.budgets = budgets or BudgetManager()               # 预算管理器：没传就用空管理器（调用 begin_run 时才按 spec 建账）
+        self.chain = chain or MiddlewareChain()                 # 中间件链：没传就空链（等于跳过五道安检）
+        self.result_filter = result_filter or ResultFilter()    # 结果过滤器：没传就用默认（全局 max_chars 裁剪）
+        self.gate = gate                                        # 人工审批闸门；None = 未启用，高风险工具会被 on_no_gate 策略处理
         # 执行期两件套：guard 管"同名工具同时进几个"，retry 管"瞬时故障再试一次"
-        self.guard = guard
-        self.retry = retry
-        self.enabled = bool(enabled)
-        self.audit_enabled = bool(audit_enabled)
-        self.default_sandbox = str(default_sandbox or MODE_NONE)
-        self.default_timeout = float(default_timeout or 0.0) or 15.0
+        self.guard = guard                                      # 并发闸门（信号量）；None = 不限并发
+        self.retry = retry                                      # 重试策略；None = 失败不重试
+        self.enabled = bool(enabled)                            # 总开关；False 时 before_call 直接放行（Harness 变透明）
+        self.audit_enabled = bool(audit_enabled)                # 审计开关；False 时不落 audit 日志
+        self.default_sandbox = str(default_sandbox or MODE_NONE)# 全局默认工位；工具没声明 sandbox 时用它
+        self.default_timeout = float(default_timeout or 0.0) or 15.0  # 全局默认超时；传 0/None 回落到 15s
         # ------------------------------------------------------------------
         # 【容器沙箱参数】来自 TOOL_SANDBOX_IMAGE 等配置，只在 mode=docker 时下发
         #   【不这么写会怎样】把这组参数无条件传给 build_sandbox，
         #   mode=subprocess 时会因 SubprocessRunner 不认 image 抛 TypeError。
         # ------------------------------------------------------------------
-        self.docker_options = dict(docker_options or {})
+        self.docker_options = dict(docker_options or {})        # 容器参数（image/network/memory/cpus）；dict() 浅拷贝防外部篡改
         # 【远程沙箱参数】endpoint/token；与容器参数同理，只在 mode=remote 时下发
-        self.remote_options = dict(remote_options or {})
-        self._registry: Any = None
-        self._capabilities: Dict[str, ToolCapability] = {}
-        self._runners: Dict[str, Any] = {MODE_NONE: InProcessRunner()}
+        self.remote_options = dict(remote_options or {})        # 远程参数（endpoint/token/timeout_seconds）
+        self._registry: Any = None                              # 工具注册表；bind_registry 后才有值，SchemaMiddleware 靠它取 schema
+        self._capabilities: Dict[str, ToolCapability] = {}      # 能力台账：工具名 → 生效后能力（注册期写、调用期只读）
+        self._runners: Dict[str, Any] = {MODE_NONE: InProcessRunner()}  # 工位执行器缓存：mode → runner；none 预建因为最常用
 
     # ------------------------------------------------------------------
     # 装配
@@ -116,19 +117,21 @@ class ToolHarness:
     # 【什么】绑定工具注册表
     # 【作用】SchemaMiddleware 需要按工具名取 JSON Schema，这里延迟注入避免循环依赖
     def bind_registry(self, registry: Any) -> None:
-        self._registry = registry
-        for mw in self.chain.middlewares:
-            if isinstance(mw, SchemaMiddleware):
-                mw._schema_of = self._schema_of
+        self._registry = registry                                # 持有注册表引用，供 _schema_of 查工具
+        for mw in self.chain.middlewares:                        # 遍历已装的中间件
+            if isinstance(mw, SchemaMiddleware):                 # 只替换 SchemaMiddleware 的取数函数
+                mw._schema_of = self._schema_of                  # 把占位函数换成真实的"按名查 schema"
 
+    # 【什么】按工具名取 JSON Schema
+    # 【作用】供 SchemaMiddleware 校验入参；registry 未绑或工具不存在时返回空 dict（= 跳过 schema 校验）
     def _schema_of(self, tool_name: str) -> dict:
-        if self._registry is None:
+        if self._registry is None:                 # 还没 bind_registry → 无 schema 可查
             return {}
-        tool = self._registry.get_tool(tool_name)
-        if tool is None:
+        tool = self._registry.get_tool(tool_name)  # 从注册表取工具实例
+        if tool is None:                           # 工具不存在（被改名/未注册）→ 无 schema
             return {}
-        schema = getattr(tool, "parameters_schema", None)
-        return schema if isinstance(schema, dict) else {}
+        schema = getattr(tool, "parameters_schema", None)  # 工具挂出的参数 schema；没挂返回 None
+        return schema if isinstance(schema, dict) else {}  # 只认 dict 形态，其他一律当无 schema
 
     # ------------------------------------------------------------------
     # ① 能力声明与登记
@@ -223,12 +226,19 @@ class ToolHarness:
     # ------------------------------------------------------------------
     # ④ 预算：开账 / 销账 / 取账
     # ------------------------------------------------------------------
+    # 【什么】为某个会话开一本预算账
+    # 【作用】prepare 阶段调用；同一 session 重复调用会覆盖上一本（避免配额泄漏）
+    #   spec=None 时用 BudgetManager 的默认规格（max_calls/token/timeout 等）
     def begin_run(self, session_id: str, spec: Optional[BudgetSpec] = None) -> RunBudget:
-        return self.budgets.begin(session_id or "default", spec)
+        return self.budgets.begin(session_id or "default", spec)  # 空 session_id 兜底成 "default"
 
+    # 【什么】销掉某会话的预算账
+    # 【作用】reset_session 时调用；不销账会导致下一轮提问继承上一轮的已用配额
     def end_run(self, session_id: str) -> None:
         self.budgets.end(session_id or "default")
 
+    # 【什么】取某会话当前的预算账
+    # 【作用】调用期记账/查账都走它；没开过账时 BudgetManager 会兜底返回默认规格的 RunBudget
     def budget(self, session_id: str) -> RunBudget:
         return self.budgets.get(session_id or "default")
 
@@ -268,7 +278,7 @@ class ToolHarness:
             return ToolVerdict.ok(req.arguments)
         # 【作用】取这把工具的通行证：请求自带的优先，没有就查注册期台账，都没有就按默认等级临时造一张
         cap = req.capability or self._capabilities.get(req.tool_name) or ToolCapability(name=req.tool_name)
-
+        # 【作用】策略裁决：根据能力表判断是否允许执行
         decision = self.policy.decide(cap)
         if decision.denied:                                     # ① 配置层面禁止执行
             _logger.warning(f"工具被策略禁止: {req.tool_name} | {decision.reason}")
@@ -285,27 +295,31 @@ class ToolHarness:
 
     # 【什么】向人工闸门申请批准
     # 【作用】模型只能发起申请；批准通过才放行，且人工可以改参数（modify）
+    #
+    # 【为什么要这一层】高风险工具（删库/转账/发邮件）必须真人确认，模型无权直接执行；
+    #   审批人还能改参数（比如把"删全部"改成"删指定 id"），改后的参数通过 final_args 回传。
     def _ask_human(self, req: ToolCallRequest, arguments: dict, reason: str) -> ToolVerdict:
-        if self.gate is None:
-            if str(self.policy.on_no_gate).lower() == "allow":
+        if self.gate is None:                                              # 未装配人工闸门（CLI/单测/配置没开）
+            if str(self.policy.on_no_gate).lower() == "allow":             # 策略：没闸门时放行（开发环境用）
                 _logger.warning(f"工具 {req.tool_name} 需人工批准但未启用闸门，按配置放行")
                 return ToolVerdict.ok(arguments, action=ACTION_APPROVE, note="需人工批准但未启用闸门")
-            return ToolVerdict.block(
+            return ToolVerdict.block(                                      # 默认 fail-closed：没闸门 = 拒绝
                 "approval_required",
                 f"{reason}；当前未启用人工审批通道，已拒绝执行（模型无权直接调用）",
                 action=ACTION_APPROVE,
             )
         try:
+            # ask_tool 是阻塞调用：把工具名+参数+会话丢给闸门，等人点"批准/拒绝/修改"
             approved, final_args = self.gate.ask_tool(
                 req.tool_name, arguments, agent="react", session_id=req.session_id,
             )
-        except Exception as e:
+        except Exception as e:                                             # 闸门本身异常（网络/超时）→ 按拒绝处理（fail-closed）
             _logger.warning(f"人工审批异常，按拒绝处理: {e}")
-            approved, final_args = False, arguments
-        if not approved:
+            approved, final_args = False, arguments                        # 异常时保留原参数，但 approved=False
+        if not approved:                                                   # 人点了"拒绝"或闸门异常
             return ToolVerdict.block("approval_rejected", f"工具 {req.tool_name} 未获人工批准，已取消执行",
                                      action=ACTION_APPROVE)
-        return ToolVerdict.ok(final_args, action=ACTION_APPROVE, note="人工已批准")
+        return ToolVerdict.ok(final_args, action=ACTION_APPROVE, note="人工已批准")  # 人点了"批准"（参数可能被改过）
 
     # ------------------------------------------------------------------
     # ③ 沙箱执行
@@ -345,31 +359,31 @@ class ToolHarness:
         【执行期三层包裹】Guard（排队拿名额）→ Retry（名额内瞬时故障重试）→ runner（真正执行）。
             重试包在闸门内：一趟在途的所有重试只占一个名额，不会因重试挤占排队者。
         """
-        cap = cap or self.capability_of(tool)
-        mode = cap.sandbox or self.default_sandbox                  # 工具没声明就用全局默认
-        timeout = cap.timeout_seconds or self.default_timeout
-        runner = self._runner_for(mode)
-        call_params = dict(params or {})
-        tool_name = getattr(tool, "name", "")
+        cap = cap or self.capability_of(tool)                          # 没传能力声明就现查注册表（工具自声明→配置覆盖→兜底）
+        mode = cap.sandbox or self.default_sandbox                     # 工位：工具声明优先（none/subprocess/docker/remote），没声明用全局默认
+        timeout = cap.timeout_seconds or self.default_timeout          # 超时秒数同理：单工具可单独配，没配用全局默认
+        runner = self._runner_for(mode)                                # 按 mode 取工位执行器（带缓存，首次构造、之后复用）
+        call_params = dict(params or {})                               # 复制一份参数：执行期改动不影响上游传入的 dict
+        tool_name = getattr(tool, "name", "")                          # 取工具名做限流键；getattr 兜底防裸 dict 没有 name
 
         # 最内层：在选定工位上真正执行一次（runner 契约：返回 ToolResult）
         def _run_once() -> ToolResult:
-            return runner.run(tool, call_params, timeout)
+            return runner.run(tool, call_params, timeout)              # 单次真执行：进程内/子进程/容器/远程，由 runner 决定
 
         # 中间层：失败且属于瞬时故障（超时/连接断开）时指数退避重试
         def _run_with_retry() -> ToolResult:
-            if self.retry is None:
+            if self.retry is None:                                     # 没装配重试器（默认场景）→ 不包这层，直接真跑一次
                 return _run_once()
-            return self.retry.run(tool_name, _run_once)
+            return self.retry.run(tool_name, _run_once)                # 把 _run_once 当回调交进去：重试次数/退避都由 RetryPolicy 控制
 
         # 最外层：同名工具信号量限流；guard=None 时直接执行
-        if self.guard is None:
+        if self.guard is None:                                         # 没装配并发闸门 → 跳过限流，走"重试→真执行"
             return _run_with_retry()
         try:
-            return self.guard.execute(tool_name, _run_with_retry)
-        except TimeoutError as e:
+            return self.guard.execute(tool_name, _run_with_retry)      # 把整个"重试+真执行"包进闸门：一趟在途只占一个名额
+        except TimeoutError as e:                                      # 排队 30s 仍拿不到名额（不是工具执行超时）
             # 排队 30s 仍拿不到名额：转成失败 ToolResult，不向上抛异常（registry 约定不抛）
-            return ToolResult(success=False, error=str(e), meta={"code": "concurrency_timeout"})
+            return ToolResult(success=False, error=str(e), meta={"code": "concurrency_timeout"})  # meta 标码区分于工具自身失败
 
     # ------------------------------------------------------------------
     # ⑤ 结果过滤 + 审计
@@ -383,17 +397,18 @@ class ToolHarness:
             不脱敏 → 工具按自己权限取回的明文（手机号/薪资）直接进 prompt
             不记账 → 预算形同虚设（预算卡的是"回灌的 token"，不是"调用的 token"）
         """
-        cap = cap or req.capability
+        cap = cap or req.capability                                    # 取生效能力声明（优先用传入的，没有就用请求里挂的）
         limit = int(getattr(cap, "max_result_chars", 0) or 0)      # 工具可单独声明裁剪上限；0 = 用全局
-        result = self.result_filter.filter(result, req.principal, max_chars=limit)
+        result = self.result_filter.filter(result, req.principal, max_chars=limit)  # 脱敏（按 principal 权限）+ 裁剪到 limit 字
         try:
-            from modules.common.token_counter import estimate_tokens
+            from modules.common.token_counter import estimate_tokens   # 延迟导入：避免 token_counter 未安装时整个模块崩
+            # 成功就估 result 的 token，失败就估 error 的 token（都是要回灌模型的文本）
             tokens = estimate_tokens(str(result.result if result.success else result.error))
         except Exception:
-            tokens = 0
+            tokens = 0                                                 # 估算失败兜底成 0，不影响主流程
         self.budget(req.session_id).consume(req.tool_name, tokens)   # token 记进预算账
         if self.audit_enabled:
-            self._audit(req, result, cap, approved=True)
+            self._audit(req, result, cap, approved=True)               # 落审计：approved=True 因为能走到这里说明 before_call 已放行
         return result
 
     # 【什么】落一条工具调用审计
@@ -403,39 +418,40 @@ class ToolHarness:
         if req.principal is None:
             return                                     # 无登录态（CLI/单测）不落审计
         try:
-            from modules.enterprise import audit
-            success = bool(result and result.success)
+            from modules.enterprise import audit       # 延迟导入：enterprise 模块可能未安装
+            success = bool(result and result.success)  # 三态判断的第一维：工具执行是否成功
+            # state 三态：allow（批准且成功）/ deny（未批准，被拦）/ error（批准了但执行失败）
             state = "allow" if (approved and success) else ("deny" if not approved else "error")
             audit.log_audit(
-                getattr(req.principal, "user_code", ""),
-                "tool_call",
-                f"tool:{req.tool_name}",
-                state,
-                dept_code=getattr(req.principal, "dept_code", ""),
-                session_id=req.session_id,
+                getattr(req.principal, "user_code", ""),   # 操作人
+                "tool_call",                                # 审计类型
+                f"tool:{req.tool_name}",                    # 资源标识
+                state,                                      # allow/deny/error
+                dept_code=getattr(req.principal, "dept_code", ""),  # 部门码（权限审计用）
+                session_id=req.session_id,                  # 会话关联
                 detail={
-                    "arguments": req.arguments,
-                    "risk": getattr(cap, "risk", RiskLevel.LOW).value if cap else RiskLevel.LOW.value,
-                    "sandbox": getattr(cap, "sandbox", MODE_NONE) if cap else MODE_NONE,
+                    "arguments": req.arguments,             # 模型传入的参数（审计要看"模型想干什么"）
+                    "risk": getattr(cap, "risk", RiskLevel.LOW).value if cap else RiskLevel.LOW.value,  # 风险等级
+                    "sandbox": getattr(cap, "sandbox", MODE_NONE) if cap else MODE_NONE,  # 执行工位
                     # 未获批准（被策略/中间件/人工拒绝）记 denied；需审批且已通过记 approved；其余记 none
                     "approval": ("denied" if not approved
                                  else ("approved" if (cap and cap.needs_approval) else "none")),
-                    "iteration": req.iteration,
-                    "duration_ms": getattr(result, "duration_ms", 0) if result else 0,
-                    "error": (result.error if result and not result.success else ""),
-                    "budget": self.budget(req.session_id).snapshot(),
+                    "iteration": req.iteration,             # 第几轮 ReAct 迭代
+                    "duration_ms": getattr(result, "duration_ms", 0) if result else 0,  # 执行耗时
+                    "error": (result.error if result and not result.success else ""),    # 失败原因
+                    "budget": self.budget(req.session_id).snapshot(),  # 当前预算快照（已用/上限）
                 },
             )
         except Exception as e:
-            _logger.warning(f"工具审计写入失败: {e}")
+            _logger.warning(f"工具审计写入失败: {e}")       # 审计失败不影响主流程，只告警
 
     # 【什么】记录一次被拦截的调用
     # 【作用】拦截也要留痕（审计 + 预算计数），否则"被拒的越权尝试"无从追查
     def record_intercepted(self, req: ToolCallRequest, cap: Optional[ToolCapability],
                            reason: str, code: str = "") -> None:
-        self.budget(req.session_id).record_block()
+        self.budget(req.session_id).record_block()          # 被拦截也算一次调用预算（防模型用"被拒"刷配额）
         if self.audit_enabled:
-            self._audit(req, ToolResult(success=False, error=reason), cap, approved=False)
+            self._audit(req, ToolResult(success=False, error=reason), cap, approved=False)  # state=deny
         _logger.info(f"工具调用已拦截: {req.tool_name} | code={code} | {reason}")
 
     # ------------------------------------------------------------------
@@ -494,21 +510,21 @@ class ToolHarness:
     # 【作用】观测：装了哪些中间件、各工具什么风险、各会话预算用了多少
     def stats(self) -> dict:
         return {
-            "enabled": self.enabled,
-            "policy": {
-                "default_risk": self.policy.default_risk.value,
-                "deny_levels": list(self.policy.deny_levels),
-                "approve_levels": list(self.policy.approve_levels),
-                "deny_tools": list(self.policy.deny_tools),
-                "approve_tools": list(self.policy.approve_tools),
-                "on_no_gate": self.policy.on_no_gate,
+            "enabled": self.enabled,                              # 总开关状态
+            "policy": {                                           # 策略裁决配置
+                "default_risk": self.policy.default_risk.value,   # 默认风险等级
+                "deny_levels": list(self.policy.deny_levels),     # 禁止执行的风险等级
+                "approve_levels": list(self.policy.approve_levels),  # 需人工批准的风险等级
+                "deny_tools": list(self.policy.deny_tools),       # 禁止执行的工具名名单
+                "approve_tools": list(self.policy.approve_tools), # 需人工批准的工具名名单
+                "on_no_gate": self.policy.on_no_gate,             # 没装人工闸门时的策略（allow/deny）
             },
-            "middlewares": self.chain.names(),
-            "gate_enabled": self.gate is not None,
-            "default_sandbox": self.default_sandbox,
-            "docker_options": dict(self.docker_options),
-            "capabilities": self.capabilities(),
-            "budgets": self.budgets.stats(),
+            "middlewares": self.chain.names(),                    # 已装中间件名列表（按执行顺序）
+            "gate_enabled": self.gate is not None,                # 人工审批闸门是否启用
+            "default_sandbox": self.default_sandbox,              # 默认工位
+            "docker_options": dict(self.docker_options),          # 容器沙箱参数
+            "capabilities": self.capabilities(),                  # 所有已登记工具的能力快照
+            "budgets": self.budgets.stats(),                      # 各会话预算使用情况
         }
 
 
@@ -528,57 +544,59 @@ def build_tool_harness(settings: Any = None, gate: Any = None) -> Optional[ToolH
         TOOL_RESULT_MAX_CHARS     结果裁剪上限
     """
     if settings is None:
-        from config import get_settings
+        from config import get_settings                      # 延迟导入：避免循环依赖（config 可能间接 import harness）
         settings = get_settings()
-    if not bool(getattr(settings, "tool_harness_enabled", True)):
+    if not bool(getattr(settings, "tool_harness_enabled", True)):  # 总开关关着 → 返回 None，registry 走原流程
         return None
 
-    policy = ToolPolicy.from_settings(settings)
-    spec = BudgetSpec(
-        max_calls_per_run=int(getattr(settings, "tool_max_calls_per_run", 8) or 8),
-        max_calls_per_tool=int(getattr(settings, "tool_max_calls_per_tool", 5) or 5),
-        token_budget=int(getattr(settings, "tool_token_budget", 6000) or 6000),
-        timeout_seconds=float(getattr(settings, "tool_run_timeout_seconds", 120.0) or 120.0),
-        max_result_chars=int(getattr(settings, "tool_result_max_chars", 2000) or 2000),
+    policy = ToolPolicy.from_settings(settings)              # 策略：从 settings 读默认风险/禁止名单/批准名单
+    spec = BudgetSpec(                                       # 预算规格：四项硬配额 + 结果裁剪上限
+        max_calls_per_run=int(getattr(settings, "tool_max_calls_per_run", 8) or 8),     # 单轮最多调几次工具（防死循环）
+        max_calls_per_tool=int(getattr(settings, "tool_max_calls_per_tool", 5) or 5),   # 单个工具最多调几次（防单工具打转）
+        token_budget=int(getattr(settings, "tool_token_budget", 6000) or 6000),         # 回灌 token 上限（防上下文爆炸）
+        timeout_seconds=float(getattr(settings, "tool_run_timeout_seconds", 120.0) or 120.0),  # 单轮墙钟超时（防挂起）
+        max_result_chars=int(getattr(settings, "tool_result_max_chars", 2000) or 2000), # 单次结果裁剪上限
     )
-    budgets = BudgetManager(spec)
-    chain = MiddlewareChain([
+    budgets = BudgetManager(spec)                            # 预算管理器：持有默认 spec，按 session 建账
+    chain = MiddlewareChain([                                # 五道中间件，顺序固定：schema → permission → scope → rate → budget
         SchemaMiddleware(lambda name: _schema_of_default(name, None)),   # 占位，bind_registry 后生效
-        PermissionMiddleware(),
-        ScopeMiddleware(),
-        RateLimitMiddleware(
-            capacity=int(getattr(settings, "tool_rate_burst", 20) or 20),
-            refill_per_sec=float(getattr(settings, "tool_rate_per_sec", 5.0) or 5.0),
-            per_user_capacity=int(getattr(settings, "tool_rate_burst_per_user", 8) or 8),
-            per_user_refill=float(getattr(settings, "tool_rate_per_user", 2.0) or 2.0),
+        PermissionMiddleware(),                                            # 权限校验：principal 有没有该工具的权限
+        ScopeMiddleware(),                                                 # 数据范围：只能看自己/本部门/全公司
+        RateLimitMiddleware(                                               # 限流：令牌桶（全局限流 + 单用户限流）
+            capacity=int(getattr(settings, "tool_rate_burst", 20) or 20),                  # 全局桶容量（突发上限）
+            refill_per_sec=float(getattr(settings, "tool_rate_per_sec", 5.0) or 5.0),     # 全局每秒补充速率
+            per_user_capacity=int(getattr(settings, "tool_rate_burst_per_user", 8) or 8), # 单用户桶容量
+            per_user_refill=float(getattr(settings, "tool_rate_per_user", 2.0) or 2.0),   # 单用户每秒补充速率
         ),
-        BudgetMiddleware(budgets),
+        BudgetMiddleware(budgets),                                         # 预算校验：调用前检查配额够不够
     ])
-    result_filter = ResultFilter(ResultFilterConfig(max_result_chars=spec.max_result_chars))
+    result_filter = ResultFilter(ResultFilterConfig(max_result_chars=spec.max_result_chars))  # 结果过滤器：用 spec 的裁剪上限
     # 执行期两件套：显式从 settings 取值构造（读不到配置时用各自的默认值 4 / 2 次 / 0.5s）
     guard = ToolConcurrencyGuard(
-        max_concurrent=int(getattr(settings, "tool_max_concurrent", 4) or 4))
+        max_concurrent=int(getattr(settings, "tool_max_concurrent", 4) or 4))  # 同名工具并发上限（信号量）
     retry = ToolRetryPolicy(
-        max_retries=int(getattr(settings, "tool_retry_attempts", 2)),
-        backoff=float(getattr(settings, "tool_retry_backoff", 0.5)),
+        max_retries=int(getattr(settings, "tool_retry_attempts", 2)),           # 瞬时故障最多重试几次
+        backoff=float(getattr(settings, "tool_retry_backoff", 0.5)),            # 退避基数（秒），实际 = backoff * 2^attempt
     )
     return ToolHarness(
         policy=policy, budgets=budgets, chain=chain, result_filter=result_filter, gate=gate,
         guard=guard, retry=retry,
         enabled=True, audit_enabled=True,
-        default_sandbox=str(getattr(settings, "tool_sandbox_mode", MODE_NONE) or MODE_NONE),
-        default_timeout=float(getattr(settings, "tool_sandbox_timeout_seconds", 15.0) or 15.0),
+        default_sandbox=str(getattr(settings, "tool_sandbox_mode", MODE_NONE) or MODE_NONE),  # 默认工位
+        default_timeout=float(getattr(settings, "tool_sandbox_timeout_seconds", 15.0) or 15.0),  # 默认超时
         docker_options={
-            "image": str(getattr(settings, "tool_sandbox_image", "") or "") or "python:3.11-slim",
+            "image": str(getattr(settings, "tool_sandbox_image", "") or "") or "python:3.11-slim",  # 容器镜像，空就用 slim
         },
         remote_options={
-            "endpoint": str(getattr(settings, "tool_sandbox_remote_url", "") or ""),
-            "token": str(getattr(settings, "tool_sandbox_remote_token", "") or ""),
-            "timeout_seconds": float(getattr(settings, "tool_sandbox_remote_timeout", 15.0) or 15.0),
+            "endpoint": str(getattr(settings, "tool_sandbox_remote_url", "") or ""),         # 远程沙箱地址（空=不启用 remote）
+            "token": str(getattr(settings, "tool_sandbox_remote_token", "") or ""),           # 远程鉴权令牌
+            "timeout_seconds": float(getattr(settings, "tool_sandbox_remote_timeout", 15.0) or 15.0),  # 远程调用超时
         },
     )
 
 
 def _schema_of_default(tool_name: str, _unused: Any = None) -> dict:
     """未绑定 registry 时的占位取 schema 函数（恒返回空 → 跳过 schema 校验）。"""
+    # 【作用】bind_registry 之前 SchemaMiddleware 需要一个可调用的 schema 取数函数；
+    #   这个占位永远返回 {}，让 schema 校验"空 schema = 不校验"，等 bind_registry 后被替换成 _schema_of
     return {}

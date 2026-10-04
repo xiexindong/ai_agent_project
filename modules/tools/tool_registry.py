@@ -316,6 +316,7 @@ class ToolRegistry:
         #   harness 未装配 → cap=None，③ 治理段整段跳过（改造前的原行为）
         cap = self.harness.capability_of(tool) if self.harness is not None else None
         # req = 本次调用的"档案袋"：工具名、参数、会话/用户、能力表打包给 Harness
+        # 工具调用
         req = ToolCallRequest(
             tool_name=name, arguments=dict[str, Any](params or {}), session_id=session_id, user_id=user_id,
             principal=principal, capability=cap, iteration=iteration, context=dict(context or {}),
@@ -324,8 +325,10 @@ class ToolRegistry:
         #   before_call = Guard（策略）+ Pipe（参数）+ 中间件 + 人工审批 的总入口。
         #   【为什么拦截也要审计】越权尝试正是安全审计最该看到的东西
         if self.harness is not None:
+            # 调用之前 权限 参数 校验
             verdict = self.harness.before_call(req)
             if not verdict.allowed:
+                # 记录拦截事件
                 self.harness.record_intercepted(req, cap, verdict.reason, verdict.code)
                 return ToolResult(
                     success=False, error=verdict.reason,

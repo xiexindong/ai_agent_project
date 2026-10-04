@@ -194,17 +194,34 @@ class AgentRouter:
         #   prepared —— 上游 prepare_state 已经跑过三级路由，这里直接用结果（零额外开销）
         #   按名字取 —— 上游只留了技能名，用注册表反查（一次字典查找）
         #   现算    —— 都没有时才跑一次三级路由（可能触发 L3 的 LLM 调用，最贵）
+        #
+        # 【同一句提问在三种入口下的对照】query="帮我查报销进度"：
+        #   入口① prepared：prepare 阶段已匹配，skill_match 非空
+        #            → skill=<报销技能> route="prepared" score=0.82，直接复用，不花一分钱
+        #   入口② 按名字取：上游只传来 skill_name="expense_query"
+        #            → get_skill 字典反查，命中 route="prepared"，查不到 route=""
+        #   入口③ 现算：前两者都没有，match() 跑关键词→向量→LLM 三级漏斗
+        #            → 命中后 route 是真实层级 keyword/vector/llm（不是 prepared）
+        #
+        # 【三个变量是什么】
+        #   skill  技能实例（后面取它的 bound_tools 当种子）；全程没命中保持 None
+        #   route  命中层级标记，写进 RoutingDecision.skill_route，日志里展示来源
+        #   score  技能匹配分数，0.0 表示无；仅观测用，不参与工具排序
+        #   注意 elif 链是互斥的：上游结果优先，能不重算就不重算。
         # ------------------------------------------------------------------
         skill, route, score = None, "", 0.0
         if skill_match is not None:
-            skill, route, score = skill_match.skill, "prepared", getattr(skill_match, "score", 0.0)
+            # 入口①：上游已跑完三级路由（如 prepare_state 的技能匹配），整个匹配结果对象直接拿来用
+            skill, route, score = skill_match.skill, "prepared", getattr(skill_match, "score", 0.0)  # route 固定标 prepared：表示"复用上游"，getattr 兜底防结果对象没带 score
         elif skill_name and self.skill_registry:
+            # 入口②：只有技能名字符串（可能来自请求参数/会话恢复），按名反查实例
             skill = self.skill_registry.get_skill(skill_name)           # SkillRegistry.get_skill() → modules/skills/skill_registry.py:143
-            route = "prepared" if skill else ""
+            route = "prepared" if skill else ""                        # 命中才算 prepared；名字写错/技能已下线 → skill=None、route=""，继续往下兜底
         elif self.skill_registry:
-            m = self.skill_registry.match(query, query_emb=query_emb)   # SkillRegistry.match() → modules/skills/skill_registry.py:360
+            # 入口③：什么上游信息都没有，现场跑一次三级路由（关键词→向量→LLM，最贵分支）
+            m = self.skill_registry.match(query, query_emb=query_emb)   # SkillRegistry.match() → modules/skills/skill_registry.py:360；query_emb 复用上游向量，省一次 embedding
             if m:
-                skill, route, score = m.skill, m.route, m.score
+                skill, route, score = m.skill, m.route, m.score         # 这里的 route 是 keyword/vector/llm 真实层级，如实保留，不冒充 prepared
 
         # ------------------------------------------------------------------
         # 【第 3 步：种子 = 技能绑定工具】SOP 点名要用的工具，属于硬需求。

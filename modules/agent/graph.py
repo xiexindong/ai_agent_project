@@ -182,6 +182,7 @@ class AgentGraph:
             f"节点[reason]: iteration={agent_state.iteration + 1} "
             f"query='{agent_state.user_query[:30]}...'"
         )
+        # 调用 ReAct 步骤
         updated = self.agent.reason_step(agent_state)
         updates = {
             "iteration": updated.iteration,

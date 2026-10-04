@@ -138,20 +138,40 @@ class SubprocessRunner(SandboxRunner):
     # 【作用】stdout 里可能混着工具自己的 print，取最后一个合法 JSON 行
     @staticmethod
     def _parse(proc, tool: Any) -> ToolResult:
+        """从子进程 stdout 里捞出 worker 写的那行结果 JSON。
+
+        【为什么 stdout 会"脏"】worker 与工具跑在同一个子进程里，
+            工具内部只要 print 调试信息，文本也会进 stdout：
+                Calculating 3*7...
+                {"success": true, "result": 21, ...}
+            worker 的契约是"结果写在最后一行"，所以这里从后往前找第一个合法 JSON。
+
+        【输入输出对照】
+            输入 stdout="Calculating...\n{\"success\": true, \"result\": 21,\n
+                         \"error\": \"\", \"duration_ms\": 1}\n"
+            输出 ToolResult(success=True, result=21, duration_ms=1)
+            输入 stdout="hello world"（没有 JSON 行）
+            输出 ToolResult(success=False, error="沙箱无有效输出: hello world")
+        """
+        # reversed：从最后一行往前扫 —— 结果行约定在末尾，工具的 print 都在它前面
+        # proc.stdout or ""：进程异常时 stdout 可能为 None，用 or 兜成空串防 splitlines 报错
         for line in reversed((proc.stdout or "").splitlines()):
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
+            line = line.strip()                                  # 去掉首尾空白/换行：缩进过的 JSON 也能认
+            if not line.startswith("{"):                         # 快速预筛：不是 { 开头的一定不是结果 JSON，直接跳过
+                continue                                         #   （print 文本、日志行都在这里被滤掉，省一次 json.loads）
             try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                data = json.loads(line)                          # 正式解析这一行
+            except json.JSONDecodeError:                         # 以 { 开头但不是完整合法 JSON（半截日志/打印了半个字典）
+                continue                                         #   继续往前找上一行，不在这里失败
+            # 命中合法 JSON → 按 worker 的字段契约还原成 ToolResult
             return ToolResult(
-                success=bool(data.get("success")),
-                result=data.get("result"),
-                error=str(data.get("error") or ""),
-                duration_ms=int(data.get("duration_ms") or 0),
+                success=bool(data.get("success")),               # bool()：JSON 里可能是 null/缺字段，统一成确定的 True/False
+                result=data.get("result"),                       # 工具产出（数字/字符串，原样保留，不在这里转类型）
+                error=str(data.get("error") or ""),               # 失败原因；null/缺失转空串
+                duration_ms=int(data.get("duration_ms") or 0),    # 耗时；缺失记 0
             )
+        # 整个 stdout 扫完都没有合法 JSON：worker 根本没按契约输出（崩溃在 import 阶段等）
+        # detail 优先取 stderr（报错栈通常在那），没有再取 stdout；[-300:] 截断防超长刷屏
         detail = (proc.stderr or proc.stdout or "").strip()[-300:]
         return ToolResult(success=False, error=f"沙箱无有效输出: {detail}")
 

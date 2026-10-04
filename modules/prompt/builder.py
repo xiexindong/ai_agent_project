@@ -232,28 +232,51 @@ class PromptBuilder:
         )
         # 上下文变量没传 → 填占位，保证模板能渲染出来；
         # 业务变量（query/answer/...）不在这里，缺了由 tpl.render() 抛错。
+        #
+        # 【这一行做了什么】按 ordered 的优先级顺序，把每个上下文变量统一成
+        #   字符串：调用方传了值（含数字/对象）→ str() 归一；没传或是空
+        #   （None/""/0/[] 都算 falsy）→ 填占位符"（未提供）"。
+        #   先归一化，后面循环只跟字符串打交道，不用反复判类型。
         filled = {k: str(context.get(k) or _EMPTY_PLACEHOLDER) for k in ordered}
 
+        # ------------------------------------------------------------------
+        # 【贪心装包循环】像往一个固定大小的行李箱里按优先级装东西，
+        #   budget=箱子容量（默认 3000 token），used=已占空间。
+        #   每处理一块只有三种下场：整块装下 / 砍断装一截 / 整个丢弃。
+        #
+        #   【一次完整推演】budget=300，优先级顺序：
+        #     permission(40) → tools(60) → observation(120) → rag(200) → memory(80)
+        #     permission: used 0+40≤300   → 整块，used=40
+        #     tools:      40+60≤300       → 整块，used=100
+        #     observation:100+120≤300     → 整块，used=220
+        #     rag:        220+200>300     → 剩 80 ≥ 50，截断到 80，used=300
+        #     memory:     300+80>300      → 剩 0 < 50，整块丢弃，填占位
+        # ------------------------------------------------------------------
         budget = self.max_context_tokens
         used = 0
-        kept: dict = {}
-        trimmed: List[str] = []
+        kept: dict = {}          # 最终塞进模板的变量；每个键都有值（含占位符），保证 render 不缺变量
+        trimmed: List[str] = []  # 裁剪账单：每个被截断/丢弃的动作留一行，build_record 原样带出给排查用
         for key in ordered:
             text = filled[key]
             if not text:
-                continue
-            cost = count_tokens(text)
+                continue                         # 空文本不花预算（占位符不算空，会正常参与）
+            cost = count_tokens(text)            # 这一整块要占多少 token
+            # 【下场①：整块装得下】已用 + 本块 ≤ 容量 → 原样保留，累加占用
             if used + cost <= budget:
                 kept[key] = text
                 used += cost
                 continue
+            # 走到这里说明整块装不下，看还剩多少空间
             remain = budget - used
+            # 【下场②：剩余空间够装一截】≥50 token 才砍断，否则残段没有保留价值
             if remain >= self._MIN_KEEP_TOKENS:
-                clipped = self._clip(text, remain)
+                clipped = self._clip(text, remain)   # 按 token 比例截前段 + 加"（已截断）"，_clip 见 296 行
                 kept[key] = clipped
-                trimmed.append(f"{key}: 截断 {cost} → {count_tokens(clipped)} token")
-                used = budget
+                trimmed.append(f"{key}: 截断 {cost} → {count_tokens(clipped)} token")  # 账单写明砍前砍后，看得到损失
+                used = budget                          # 箱子从此装满，后面的块只剩"丢弃"一条路
             else:
+                # 【下场③：剩余空间 < 50】塞残段只会让模型看到半截依据，
+                #   不如明确告诉它"这一块没有"。
                 # 【丢弃也要留占位符】整块不塞进 prompt 时，模板里的 {xxx} 仍然要填。
                 #   不填 → render() 以"缺少变量"抛错，一次裁剪把整轮对话搞挂；
                 #   填"（未提供）" → 模型明确知道这一块没有，比留空更不容易瞎编。

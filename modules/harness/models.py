@@ -209,15 +209,36 @@ class ToolPolicy:
     # 【什么】对一次调用做裁决
     # 【作用】唯一的"能不能调"判定入口；返回的 reason 会原样回喂给模型
     def decide(self, cap: ToolCapability) -> ToolDecision:
+        """按五条互斥规则裁决，命中即返回：deny名 → deny级 → approve名 → approve级 → allow。
+
+        【为什么 deny 排在 approve 前】一个工具既在名字黑名单、风险又是
+            high 时，禁止优先于审批 —— 不能给一个本该封死的工具留"批准后放行"的口子。
+
+        【输入输出对照】deny_levels=("critical",), approve_levels=("high",)：
+            drop_table 命中 deny_tools "drop_*" → deny（名，盖过等级）
+            mysql_exec(critical)                → deny（级）
+            write_draft(medium) 命中 approve_tools → approve（名，把中风险单独提级）
+            update_config(high)                 → approve（级）
+            calculator(low)                    → allow（兜底）
+        """
         name = cap.name
+        # 【规则①：名字黑名单】精确名或前缀通配（drop_*）命中 → 直接禁止
         if self._match(name, self.deny_tools):
             return ToolDecision(ACTION_DENY, f"工具 {name} 已配置为禁止执行", cap.risk.value)
+        # 【规则②：风险等级黑名单】等级在 deny_levels 里（默认 critical）→ 禁止
+        #   str() 转换：cap.risk 虽是 str 枚举，这里仍显式转，集合判断更稳
         if str(cap.risk.value) in self.deny_levels:
             return ToolDecision(ACTION_DENY, f"工具 {name} 风险等级为 {cap.risk.value}，已配置为禁止执行", cap.risk.value)
+        # 【规则③：名字审批名单】可以把某个等级没到 high 的工具单独提级为需人工批准
         if self._match(name, self.approve_tools):
             return ToolDecision(ACTION_APPROVE, f"工具 {name} 已配置为需人工批准", cap.risk.value)
+        # 【规则④：风险等级审批名单 或 工具显式声明】
+        #   等级在 approve_levels（默认 high/critical），或 cap.requires_approval=True
+        #   （工具自己声明"我必须人批"，即使等级被配置改低了也拦住）
         if str(cap.risk.value) in self.approve_levels or cap.requires_approval:
             return ToolDecision(ACTION_APPROVE, f"工具 {name} 风险等级为 {cap.risk.value}，需人工批准", cap.risk.value)
+        # 【规则⑤：兜底放行】四条拦截都没中（典型 low 级只读工具）→ 直接执行
+        #   reason 留空：放行不需要向模型解释
         return ToolDecision(ACTION_ALLOW, "", cap.risk.value)
 
 

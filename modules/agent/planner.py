@@ -187,26 +187,47 @@ class ExecutionPlan:
     # 【作用】让模型每轮都看见"全局到哪了、我现在该干嘛、前面得到了什么"
     #   这是 Plan-and-Execute 相对裸 ReAct 的关键增量：模型不再只看上一步观察
     def progress_text(self) -> str:
+        """渲染计划进度文本：head（总览+指令）+ body（逐步清单）。
+
+        【完整输出示例】2 步计划跑完第 1 步后：
+
+            ## 执行计划（共 2 步，已完成 1）
+            总体思路：先取人数和工资总额，再算平均工资
+            当前步骤：s2 —— 请只围绕这一步决定要不要调工具、调哪个工具。
+            - [x] s1: 查询财务部人数与工资总额 → 25人，总额437,500
+            - [ ] s2: 计算平均工资（当前步骤）
+
+        【四种状态标记】仿 GitHub checkbox，模型一眼能区分：
+            [x] done 已完成    [!] failed 失败
+            [-] skipped 废弃   [ ] pending 待做
+        """
         if not self.steps:
-            return ""
+            return ""                                   # 没计划就不注入，上层 prompt 不出现该区块
         total = len(self.steps)
-        done_n = len(self.done())
+        done_n = len(self.done())                        # 只数 done：失败/废弃不计入"已完成"，标题数字反映真实成果
+        # 状态码 → checkbox 标记的映射；查不到（异常状态）兜底成待做框，不拼出怪符号
         box = {"done": "[x]", "failed": "[!]", "skipped": "[-]", "pending": "[ ]"}
         lines = []
+        # 【逐行拼 body】每步一行：标记 + 编号 + 指令 + 结果尾巴 + 当前步骤提示
         for s in self.steps:
             mark = box.get(s.status, "[ ]")
-            tail = f" → {s.result}" if s.result else ""
+            tail = f" → {s.result}" if s.result else ""  # 有结果摘要才接箭头，模型能直接看到前步产出，不用翻 observation
+            # 只有"待做且正好是当前步"才标注：s.is_open 排除已关闭步，
+            # s is self.current() 保证整条清单里最多一个（当前步骤），不会出现多个提示
             hint = f"（当前步骤）" if s.is_open and s is self.current() else ""
             lines.append(f"- {mark} {s.id}: {s.instruction}{tail}{hint}")
         cur = self.current()
+        # head 三行：进度数字 → 总体思路 → 状态/当前步骤指令
         head = f"## 执行计划（共 {total} 步，已完成 {done_n}）\n总体思路：{self.rationale or '（未给出）'}\n"
         if cur is None:
+            # cur=None 表示没有 pending 步了（全部 done/failed/skipped）。
             # 【为什么完成时要显式提示汇总】不提示的话模型可能继续找工具调用，
             #   表现为"做完了还在调工具"，最后一轮被 max_iterations 硬截断
             head += "状态：所有步骤已完成，请基于下面的结果汇总出最终答案，不要再调用新的工具。\n"
         else:
+            # 还有当前步：给模型划清行动边界——只决定这一步的工具，不要跳步或自作主张做后面
             head += f"当前步骤：{cur.id} —— 请只围绕这一步决定要不要调工具、调哪个工具。\n"
-        return head + "\n".join(lines)
+        return head + "\n".join(lines)                  # 指令在上、清单在下：先读规则再看明细
 
     def to_dict(self) -> dict:
         return {
@@ -466,7 +487,7 @@ class TaskPlanner:
     # 【什么】按 depends_on 做拓扑排序
     # 【作用】保证被依赖的步骤排在前面；依赖成环或引用不存在的 id 时按原顺序兜底
     @staticmethod
-    def _sort_steps(steps: List[PlanStep]) -> List[PlanStep]:
+    def  _sort_steps(steps: List[PlanStep]) -> List[PlanStep]:
         by_id = {s.id: s for s in steps}
         ordered: List[PlanStep] = []
         placed = set()

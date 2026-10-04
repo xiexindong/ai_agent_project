@@ -92,12 +92,12 @@ class ToolRAGIndex:
         pending: List[tuple] = []
         for tool in tools or []:
             # 【归一化】BaseTool 实例与网关目录 dict 两种来源统一成 (name, desc, schema, meta)
-            #   → _normalize() 见本文件 263 行
+            #   → _normalize() 见本文件 326 行
             name, desc, schema, meta = self._normalize(tool)
             if not name:                                    # 没有名字的工具无法召回（召回结果靠名字取实例），直接跳过
                 continue
             # 【用途画像】"名字。描述 可填参数: a、b" —— 只描述"干什么"，不含 JSON Schema 细节，
-            #   否则参数噪声会干扰相似度 → _routing_text() 见本文件 255 行
+            #   否则参数噪声会干扰相似度 → _routing_text() 见本文件 318 行
             text = self._routing_text(name, desc, schema)
             # 【是否已编码过】向量不可用时恒为 True（没有向量可比对，只靠文本判断）；
             #   向量可用时要求 _vectors 里已有它，否则补一次编码
@@ -170,42 +170,97 @@ class ToolRAGIndex:
     # 【什么】按提问召回最相关的若干工具
     # 【作用】向量优先、关键词兜底；无命中返回空列表交由路由层回退默认工具
     def recall(self, query: str, top_k: Optional[int] = None) -> List[ToolHit]:
+        # ------------------------------------------------------------------
+        # 【前置短路：三种"没法召回"的情况直接给空】
+        #   not self._enabled  总开关关了（配置关闭 Tool-RAG）
+        #   not query          空字符串/None：没有意图可匹配
+        #   not self._texts    索引里一个工具都没有：无候选可返回
+        #   返回 [] 不是异常，上层路由层会回退默认工具（router.py:260）。
+        # ------------------------------------------------------------------
         if not self._enabled or not query or not self._texts:
             return []
+        # ------------------------------------------------------------------
+        # 【定本轮配额 k】显式传了 top_k 就用传入的，否则用索引默认值（5）。
+        #   max(1, ...) 双保险：外部传 0/负数时至少召回 1 个，不会切成空名单。
+        #   int() 兜底：配置可能被读成字符串（如 "5"）。
+        # ------------------------------------------------------------------
         k = max(1, int(top_k or self._top_k))
 
+        # ------------------------------------------------------------------
+        # 【主策略：向量优先，关键词兜底】
+        #   能走向量时先尝试语义召回——余弦相似度是强证据，比 2-gram 关键词准。
+        # ------------------------------------------------------------------
         if self._vector_available:
             hits = self._recall_vector(query, k)
+            # 语义召回到了 → 标记来源并直接返回，不再走关键词（避免弱证据混入）
             if hits:
-                self._last_source = "vector"
+                self._last_source = "vector"    # 记录实际生效通道，stats() 观测用
                 return hits
+            # 语义通道跑通了但一个都没过门槛（hits 为 []）→ 降级关键词再试一次，
+            #   而不是空手而归：库里也许只是向量相似度普遍偏低，关键词还能捞到。
             self._last_source = "keyword"
             return self._recall_keyword(query, k)
+        # 向量开关早已关闭（此前 embedding 失败过）→ 直接走关键词，不再尝试向量，
+        #   省掉注定失败的 embedding 调用。
         self._last_source = "keyword"
         return self._recall_keyword(query, k)
 
     # 【什么】语义召回：编码 query 后与全部工具向量算余弦
     # 【作用】主力召回路径；编码失败就关掉开关交给关键词兜底
     def _recall_vector(self, query: str, k: int) -> List[ToolHit]:
+        # ------------------------------------------------------------------
+        # 【第 1 步：把提问变成向量】
+        #   文本和文本没法直接算"像不像"，先调 embedding 把 query 编码成
+        #   和工具向量同维度的 qv，之后才能两两算余弦。
+        #   这里 embed() 是单条编码（工具侧批量编码用 embed_batch，见 117 行）。
+        #
+        # 【为什么失败要返回 [] 而不是抛异常】
+        #   上层 recall()（172-206 行）的约定是：向量召回返回空 → 自动改走
+        #   _recall_keyword。同时把 _vector_available 永久置 False：
+        #   embedding 服务通常不是"抖一下"，而是无 key/配置错，再试只会重复失败。
+        # ------------------------------------------------------------------
         try:
             from modules.memory.embedding_service import get_embedding_service
-            qv = get_embedding_service().embed(query)
+            qv = get_embedding_service().embed(query)                  # qv = query vector，如 [0.021, -0.04, ...]（智谱 embedding 为 1024 维）
         except Exception as e:
-            self._vector_available = False
+            self._vector_available = False                             # 关掉向量开关：本次后续轮次直接走关键词，不再反复撞 embedding
             _logger.warning(f"Tool-RAG 查询向量失败，降级关键词: {e}")
-            return []
+            return []                                                  # 空列表是约定信号，不是"没召回到工具"——上层据此切关键词通道
+        # ------------------------------------------------------------------
+        # 【第 2 步：给每个工具打分】
+        #   遍历 _vectors 里全部工具向量，各和 qv 算一次余弦相似度（_cosine
+        #   见本文件 364 行），结果包成 ToolHit：
+        #     round(..., 4)  相似度保留 4 位小数，日志清爽、排序不受影响
+        #     "vector"       来源标记：区分于关键词降级分（recall 合并时用）
+        #
+        # 【输入输出对照】query="今天北京天气怎么样"，假设索引 3 个工具：
+        #   scored = [ToolHit("weather", 0.7412, "vector"),
+        #             ToolHit("web_search", 0.5231, "vector"),
+        #             ToolHit("calculator", 0.0318, "vector")]
+        #   → 此时顺序还是字典序，分数高低还没排
+        # ------------------------------------------------------------------
         scored = [
             ToolHit(name, round(_cosine(qv, vec), 4), "vector")
             for name, vec in self._vectors.items()
         ]
+        # ------------------------------------------------------------------
+        # 【第 3 步：按分数降序】h.score 越大说明用途画像和提问越像，
+        #   reverse=True 让最相关的排最前；同分时保持原相对顺序（排序稳定）。
+        # ------------------------------------------------------------------
         scored.sort(key=lambda h: h.score, reverse=True)
+        # ------------------------------------------------------------------
+        # 【第 4 步：先过门槛、再取前 k】两步顺序不能反：
+        #   先 min_score 过滤 —— 工具库里没有相关工具时，前 k 个只是"最不
+        #   差的 k 个无关工具"，宁缺毋滥（理由见 159-162 行总述）；
+        #   再切片 [:k] —— 达标的可能不止 k 个，只带本轮配额内的数量。
+        # ------------------------------------------------------------------
         hits = [h for h in scored if h.score >= self._min_score][:k]
         _logger.debug(
             "Tool-RAG 语义召回: "
-            + ", ".join(f"{h.name}={h.score}" for h in scored[:5])
-            + f" | 命中={len(hits)}"
+            + ", ".join(f"{h.name}={h.score}" for h in scored[:5])     # 只打印前 5 名：工具再多日志也不刷屏，够看排序对不对
+            + f" | 命中={len(hits)}"                                   # "命中"= 过门槛且在 k 内的个数，0 时上层会切关键词
         )
-        return hits
+        return hits                                                    # 可能为空列表（全都低于门槛），由 recall() 兜底走关键词或路由层默认工具
 
     # 【什么】关键词降级召回：按 2-gram 片段重合打分
     # 【作用】embedding 不可用时仍能选出工具；分数乘 _KEYWORD_SCALE=0.6 折算

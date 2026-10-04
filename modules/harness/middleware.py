@@ -302,6 +302,7 @@ class MiddlewareChain:
     def run(self, req: ToolCallRequest) -> ToolVerdict:
         for mw in self.middlewares:
             try:
+                # 【作用】中间件校验：根据请求判断是否拦截
                 hit = mw.check(req)
             except Exception as e:                       # 中间件自身出错不能中断整条链路
                 _logger.warning(f"中间件 {mw.name} 异常，按放行处理: {e}")
