@@ -1,7 +1,20 @@
 # 面试06：工具能 top-5 让模型自己挑，技能为什么必须单选 + 三级路由？
 
-> 配套代码：`modules/skills/skill_registry.py:360-383`（match 主入口）、`modules/tools/tool_rag.py:172`
+> 配套代码：`modules/skills/skill_registry.py:360-383`（match 三级漏斗主入口）、`modules/tools/tool_rag.py:172`（recall 多选召回）、`modules/agent/router.py:148-304`（L0 路由把两者合并成本轮工具名单）
 > 一句话结论：**因为两者注入的东西不一样——工具注入的是"候选清单"（多给几个无害，模型自己挑对的），技能注入的是"整段 SOP 作业流程"（两份混着必打架），误判代价不对称决定了工具要 top-k 排序、技能必须单选三级兜底。**
+
+---
+
+## 零、先扫盲：本文会用到的术语（大白话版）
+
+| 术语 | 大白话解释 |
+|---|---|
+| 工具（Tool） | 模型可以"按一下"的按钮：查天气、算数学、查数据库。给模型看的是一份**说明书**（JSON Schema：名字、干什么、要哪些参数） |
+| 技能（Skill） | 一整套**作业流程**（SOP）：比如"报销咨询"技能会告诉模型"先问清报销类型→再查制度→最后给结论"。注入的是整段指导文字 |
+| Tool-RAG | 把工具说明书做成向量索引，用户提问时只挑出最相关的 top-k 个给模型看，而不是把上百个工具全塞进去 |
+| top-k | "取前 k 个"。比如 top-5 = 把分数最高的 5 个候选都给模型 |
+| 三级路由 | 技能匹配的漏斗：L1 关键词（免费）→ L2 向量（一次 embedding）→ L3 LLM（一次模型调用），命中即停 |
+| prompt | 每次调用大模型时拼给它的那段文字（系统指令 + 记忆 + 工具清单 + 用户问题） |
 
 ---
 
@@ -32,7 +45,68 @@
 
 ---
 
-## 三、输入 → 输出对照
+## 三、两条流水线长什么样（ASCII 流程图）
+
+工具侧（tool_rag.py:172 `recall`）——宽进、多给：
+
+```
+用户提问 "今天北京天气怎么样"
+   │
+   ▼
+query 转向量（embedding）
+   │
+   ▼
+与 _vectors 里全部工具两两算余弦（tool_rag.py:242-245）
+   │
+   ▼
+按分数降序 → 过 min_score=0.25 门槛 → 截前 top_k=5（tool_rag.py:250-257）
+   │
+   ▼
+输出 [city_weather 0.63, web_search 0.41]  ← 2 个都进 prompt，模型自己挑
+```
+
+技能侧（skill_registry.py:360 `match`）——严判、单选：
+
+```
+用户提问 "出差垫的钱怎么核销"
+   │
+   ▼
+L1 关键词打分（score_candidates → _route_keyword，skill_registry.py:173）
+   │  最高分 ≥ 0.6 ──→ 命中，结束
+   │  最高分 < 0.1 ──→ 判无关，走通用对话
+   │  卡在中间 ──────→ 下沉 ↓
+   ▼
+L2 向量精判（_route_vector，skill_registry.py:223）
+   │  只在 L1 候选前 N 个里算余弦（漏斗只收窄）
+   │  最高相似度 ≥ 0.75 ──→ 命中，结束
+   │  否则 ──────────────→ 下沉 ↓
+   ▼
+L3 LLM 兜底（_route_llm，skill_registry.py:282）
+   │  把提问 + 候选清单丢给模型分类，输出 JSON {skill_name, confidence}
+   │  confidence ≥ 0.5 ──→ 命中
+   │  否则 ──────────────→ None，走通用对话
+```
+
+`match` 主入口的真实代码（skill_registry.py:371-383）——注意命中即停：
+
+```python
+decision, candidates = self._route_keyword(query)
+if decision == "hit":
+    return candidates[0]         # L1 定了，L2/L3 根本不执行
+if decision == "miss":
+    return None
+m = self._route_vector(query, candidates, query_emb)   # L2 只吃 L1 的候选
+if m:
+    return m
+m = self._route_llm(query, candidates)                 # L3 同理
+if m:
+    return m
+return None                      # 三层都没判中 → 走通用助手流程
+```
+
+---
+
+## 四、输入 → 输出对照
 
 ```python
 # 工具侧（tool_rag.py:172 recall）：多选，分数够就都给
@@ -46,9 +120,31 @@ match("帮我按报销流程提交发票")
 # 即便 L2 向量算出 0.78 和 0.74 两个高分技能，也只返回第 1 个
 ```
 
+两个结果最后在 L0 路由层合并成一份本轮工具名单（router.py:232-254）：
+
+```python
+# 第 3 步：种子 = 技能绑定工具（SOP 点名要用的，强约束记 1.0 分）
+if skill is not None:
+    for name in getattr(skill, "bound_tools", []) or []:
+        if name in pool and name not in chosen:
+            chosen.append(name)
+            scores[name] = 1.0          # 1.0 = 技能强绑定，不被截断挤掉
+
+# 第 4 步：Tool-RAG 语义召回补位（top_k=5 里过 0.25 门槛的）
+for hit in self.tool_index.recall(query, top_k=self.top_k):
+    if hit.name in pool and hit.name not in scores:
+        rag_hits.append(hit.name)
+        scores[hit.name] = hit.score
+
+merged = chosen + rag_hits              # 种子在前、召回在后
+truncated = merged[: self.max_tools]    # 硬截断：默认最多 8 个
+```
+
+可以看到：技能单选决定"种子"，工具多选负责"补位"——**单选与多选并不矛盾，它们在 router.py 里各管一段**。
+
 ---
 
-## 四、为什么要这么写
+## 五、关键设计对照表：为什么是这么写
 
 | 做法 | 原因（不这么写会怎样） |
 |---|---|
@@ -56,11 +152,31 @@ match("帮我按报销流程提交发票")
 | 工具照旧 top-k | 只给 1 个工具：模型没得选，工具描述稍有偏差就调不了；多给几个 = 给模型留纠错余地 |
 | 技能向量不进 Milvus、自己算 | 技能就几个，进 Milvus 是用牛刀杀鸡还多一个外部依赖（详见面试08） |
 | 三级漏斗而不是一步到位 | 全靠关键词：换说法就漏；全靠向量：明确提问也要付 embedding 成本；全靠 LLM：每句话多一次调用 |
+| L2 候选只吃 L1 输出 | 向量若在全表自由发挥，可能把 L1 已判"低分"的技能又捞回来——漏斗只收窄不放宽，保证前级的判断不被后级推翻 |
 
 ---
 
-## 五、简单总结
+## 六、面试追问（附回答要点）
+
+**Q1：为什么技能不能也给 top-2，让模型自己挑？**
+要点：工具说明书是"中性的候选"，模型读完 5 份挑 1 份调用，不读的没副作用；技能 SOP 是"带指令性的流程"，只要进了 prompt 就会改变模型行为。两份 SOP 对同一件事的步骤定义几乎必然有差异（"先问需求" vs "直接执行"），模型会拼出一个四不像的混合流程。注入物的"中性程度"不同，决定了能不能多选。
+
+**Q2：三级路由会不会太慢？**
+要点：绝大多数流量在 L1 就停了——关键词匹配是纯字符串比对，零外部调用、亚毫秒。只有 L1 卡在模糊地带（0.1~0.6）才花一次 embedding（L2），L2 也判不出才花一次 LLM 调用（L3）。成本结构与提问难度成正比，比"每句话都问 LLM"便宜几个数量级。
+
+**Q3：L2 向量的候选池为什么用 L1 的输出，而不是全量技能？**
+要点：两个原因。① 省钱：embedding 比对次数被 vec_top_n 卡住（skill_registry.py:237 `candidates[: self._vec_top_n]`）。② 防推翻：向量分虚高，若全表比对，可能把关键词已判低分的技能捞回来；漏斗语义是"逐级精判"而不是"逐级翻案"。
+
+**Q4：如果技能也想支持"多技能组合"怎么办？**
+要点：那是另一个设计（如编排层把多技能串成 pipeline），但绝不是"把多段 SOP 同时塞进一个 prompt"。组合发生在**调用编排**层（先跑技能 A 的流程、再跑技能 B 的），每轮对话内模型仍只看一份 SOP。本项目当前未做，因为 4 个技能的业务场景没有组合需求。
+
+**Q5：技能绑定工具和 Tool-RAG 召回冲突时谁优先？**
+要点：绑定工具优先。router.py:232-238 先把 bound_tools 当"种子"（分数记 1.0 强约束），Tool-RAG 召回只能"补位"（router.py:246-251 跳过已在种子里的）；合并后截断也是种子在前不被挤掉（router.py:253-254）。原因：SOP 点名的工具是流程跑通的硬需求，语义召回可能因措辞差异漏掉它。
+
+---
+
+## 七、简单总结
 
 1. 分岔的根：**注入物不同**——工具是候选清单（多选无害），技能是 SOP 指令（多选冲突），误判代价不对称
-2. 因此工具走**单层向量 top-k**（tool_rag.py:172），技能走**三级串行漏斗**（skill_registry.py:360），命中即停
+2. 因此工具走**单层向量 top-k**（tool_rag.py:172），技能走**三级串行漏斗**（skill_registry.py:360），命中即停；两者在 router.py:232-254 合并，技能绑定当种子、语义召回补位
 3. 记住对比锚点：工具 top-k=**5**、技能单选=**1**；工具阈值 0.25（宽进），技能阈值 0.6/0.75/0.5（层层严判）
