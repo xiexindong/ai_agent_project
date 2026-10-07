@@ -183,6 +183,15 @@ class AgentGraph:
             f"query='{agent_state.user_query[:30]}...'"
         )
         # 调用 ReAct 步骤
+        # ------------------------------------------------------------------
+        # 【reason_step 内含防打转的三道刹车，命中任何一道都会跳过 act 直接收尾】
+        #   ① 同名同参：本次动作与最近一次成功调用完全一致 → 回灌旧结果收尾
+        #   ② 交替环：把「历史 + 本次待执行」各压成指纹（工具名|排序后参数），
+        #      检查序列尾部是否为周期 2~3 的片段原样重复两遍（A→B→A→B）
+        #   ③ 无进展：动作不成环也不重复，但最近 3 次成功调用的结果一字不差
+        #   命中即 need_tool_call=False，把原因写进 observation 让模型直接作答
+        #   （实现见 react_agent.py:684 起的 loop_guard 段）
+        # ------------------------------------------------------------------
         updated = self.agent.reason_step(agent_state)
         updates = {
             "iteration": updated.iteration,

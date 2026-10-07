@@ -186,6 +186,7 @@ class ReActAgent:
                 query_emb = None
                 from modules.memory.embedding_service import get_embedding_service
                 query_emb = get_embedding_service().embed(clean_query)
+                # 这个很重要 历史常记忆 段记忆 都要召回 触发压缩
                 mem_ctx = self.memory.build_context(      # MemoryManager.build_context() → modules/memory/memory_manager.py:65
                     session_id, user_id, clean_query, query_emb
                 )                                          # 返回 dict：context_text + 长期/短期记忆 + 两个观测标记
@@ -199,9 +200,11 @@ class ReActAgent:
                 _logger.warning(f"记忆召回降级（关闭长期记忆）: {e}")
                 state.memory_context = ""
         # 根据权限载体生成知识库过滤表达式
+        #principal 为 None 时按不限制处理，RAG 只在可见库里捞数据
         if self.rag:
             try:
                 expr = self._kb_expr(principal)
+                # 这个地方 尤其是权限找回的要阅读清楚
                 rag_ctx = self.rag.build_context(clean_query, expr=expr)      # RAGChain.build_context() → modules/rag/rag_chain.py:124；拼成"## 知识库参考"文本
                 state.rag_context = rag_ctx
                 state.rag_sources = self.rag.retrieve(clean_query, expr=expr) if rag_ctx else []   # RAGChain.retrieve() → modules/rag/rag_chain.py:75；单独取来源清单供前端展示引用
@@ -448,6 +451,7 @@ class ReActAgent:
         if not ok and self.planner is not None:
             plan = self.planner.replan(plan, observation=state.observation or "",    # TaskPlanner.replan() → modules/agent/planner.py:368
                                        tools_desc=self._tools_overview())
+        # 添加子计划
         self._save_plan(state, plan)
         _logger.info(f"计划推进: {step.id} → {'完成' if ok else '失败'} | "
                      f"进度 {len(plan.done())}/{len(plan.steps)}")
@@ -678,30 +682,41 @@ class ReActAgent:
                 return state                                                # 提前返回：跳过 act，省掉一次工具调用
             # 【两道补充闸：交替环 + 无进展】"同名同参"那条抓的是"原地打转"，
             #   下面两条抓的是"换着花样打转"——A→B→A→B 这种环、以及每次都拿到一模一样的结果
-            if self._loop_guard_enabled:
+            if self._loop_guard_enabled:                                    # 总开关（agent_loop_guard_enabled，默认 True）；关掉则只留上面的"同名同参"闸
+                # --------------------------------------------------------------
+                # 【闸①·交替环】抓 A→B→A→B 这种"换着花样打转"。
+                #   做法：把「历史 + 本次待执行」的每个动作压成指纹（工具名+参数，
+                #   见 _action_key），检查序列尾部是不是同一长度为 p（2~3）的
+                #   片段连续重复了两遍。判定细节见 _detect_cycle。
+                # --------------------------------------------------------------
                 cycle = self._detect_cycle(
-                    getattr(state, "tool_calls_history", []), tool_calls[0],
-                    self._cycle_min_period, self._cycle_max_period,
+                    getattr(state, "tool_calls_history", []), tool_calls[0],    # 历史 + 即将执行的动作：还没执行就先查，省一次注定空转的真实调用
+                    self._cycle_min_period, self._cycle_max_period,             # 候选环长范围，默认 2~3（周期2=A→B→A→B，周期3=A→B→C→A→B→C）
                 )
-                if cycle is not None:
-                    period, names = cycle
+                if cycle is not None:                                           # 命中交替环
+                    period, names = cycle                                       # 解包：环长 p + 环内工具名（按环内顺序）
                     _logger.warning(f"检测到交替循环调用（周期 {period}）: {' → '.join(names)} → …，强制收敛")
-                    state.need_tool_call = False
+                    state.need_tool_call = False                                # 跳过 act：这一轮不再执行任何工具
                     state.observation = (
                         f"检测到调用循环：{' → '.join(names)} 已重复 {2} 轮（周期 {period}），"
                         "继续调用不会得到新信息。请基于已有结果直接作答，不要换工具重试同一件事。"
-                    )
-                    state.final_answer = ""
-                    return state
-                if self._no_progress(getattr(state, "tool_calls_history", []), self._stall_rounds):
-                    last = (getattr(state, "tool_calls_history", []) or [])[-1]
+                    )                                                           # 用解释文字代替工具结果回灌，模型有明确指令可循，不会空转
+                    state.final_answer = ""                                     # 清掉上一轮残留答案，让 answer 节点重新生成
+                    return state                                                # 提前收尾：省掉本次工具调用与下一轮 reason
+                # --------------------------------------------------------------
+                # 【闸②·无进展】动作各不相同、也没成环，但最近 N 次成功调用
+                #   拿回的结果一模一样 —— "换着花样却拿到同样的东西"，照样刹车。
+                #   判定细节见 _no_progress。
+                # --------------------------------------------------------------
+                if self._no_progress(getattr(state, "tool_calls_history", []), self._stall_rounds):   # 连续 _stall_rounds 次（默认 3）成功结果全等 → True
+                    last = (getattr(state, "tool_calls_history", []) or [])[-1]     # 取最新一条记录，把它的结果回灌给模型当作答依据
                     _logger.warning(f"检测到连续 {self._stall_rounds} 次调用结果无变化，强制收敛")
-                    state.need_tool_call = False
+                    state.need_tool_call = False                                    # 同闸①：跳过 act，直接进入回答环节
                     state.observation = (
                         f"最近 {self._stall_rounds} 次工具调用返回的结果完全一致，判定为无进展。\n"
                         f"最新结果：{str(last.get('result', ''))[:300]}\n"
                         "请基于这个结果直接作答，不要再尝试其他工具。"
-                    )
+                    )                                                               # 结果截前 300 字：够模型作答，又不撑爆上下文
                     state.final_answer = ""
                     return state
             state.need_tool_call = True                                     # 正常路径：这一轮要调工具

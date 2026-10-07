@@ -16,7 +16,7 @@
 
 | 常见说法 | 实际情况 | 证据 |
 |---|---|---|
-| 「一切最终都是 Milvus」 | Milvus 只存**知识库文档向量**；对话记忆存在 **PostgreSQL + pgvector** | 知识库：`rag_chain.py:68` `self.vector_store.search()`；记忆：`memory_manager.py:160` `self.pg.search_memory_by_vector()` |
+| 「一切最终都是 Milvus」 | Milvus 只存**知识库文档向量**；对话记忆存在 **PostgreSQL + pgvector** | 知识库：`rag_chain.py:68` `self.vector_store.search()`；记忆：`memory_manager.py:250` `self.pg.search_memory_by_vector()` |
 | 「ReAct 控制循环」 | ReAct 只决定「建哪些节点、叫什么」，节点叫 `reason`/`act` 是它的影响 | 循环的连线在 `graph.py:97` |
 
 这两条如果不纠正，后面所有推理都会偏。
@@ -56,7 +56,7 @@
 |---|---|---|---|
 | 技能 SOP | `skill_context` | `SkillRegistry.build_skill_context()` | `react_agent.py:104` |
 | 知识库召回 | `rag_context` | **Milvus** 粗召回 → BGE 精排 | `rag_chain.py:78` `build_context()` |
-| 记忆 | `memory_context` | **PG + pgvector** 长期摘要 + 最近 3 轮原文 | `memory_manager.py:53` `build_context()` |
+| 记忆 | `memory_context` | **PG + pgvector** 长期摘要 + 最近 3 轮原文 | `memory_manager.py:159` `build_context()` |
 | 历史工具调用 | `tool_history` | 前几轮的 `tool_calls_history` | `react_agent.py:196` |
 | 工具观察结果 | `observation` | 上一轮 `act_step` 写入的工具返回 | `react_agent.py:274` |
 | 工具描述 | `tools_desc` | `ToolRegistry.get_openai_tools_schema()` 转文本 | `react_agent.py:191` |

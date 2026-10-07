@@ -119,20 +119,45 @@ class MilvusVectorStore:
 
     def _ensure_collection(self, name: str):
         """确保指定集合存在（不存在则建 + 建索引），加载并返回。"""
+        # ------------------------------------------------------------------
+        # 【建表：Milvus 的"集合"≈ 关系库的"表"】
+        #   一张表由若干字段组成：除了 embedding 向量列，还要带上 chunk_id/content/
+        #   kb_code 等标量列——检索先按向量找到"最相近的行"，再把这些列读回来
+        #   （正文内容、来源、属于哪个知识库）。
+        #
+        # 【为什么要这个？】集合不存在直接写数据会报错；所以先 has_collection 查，
+        #   不存在才建。max_length 按该列最长内容预留：content 放整片给 65535，
+        #   kb_code 只是短编码给 64。
+        #
+        # 【对比例子】文档一个分片入库后的一行：
+        #   chunk_id="chk_42" | doc_id="doc_7" | content="报销需要提交发票..."
+        #   kb_code="finance" | dept_code="D_FIN" | embedding=[0.01,-0.3,...共1024维]
+        # ------------------------------------------------------------------
         if not self._utility.has_collection(name):
             fields = [
+                # is_primary=True：分片唯一主键，Milvus 靠它去重/定位单行
                 self._FieldSchema(name="chunk_id", dtype=self._DataType.VARCHAR, max_length=128, is_primary=True),
-                self._FieldSchema(name="doc_id", dtype=self._DataType.VARCHAR, max_length=128),
-                self._FieldSchema(name="content", dtype=self._DataType.VARCHAR, max_length=65535),
-                self._FieldSchema(name="source", dtype=self._DataType.VARCHAR, max_length=512),
-                self._FieldSchema(name="file_name", dtype=self._DataType.VARCHAR, max_length=256),
-                self._FieldSchema(name="updated_at", dtype=self._DataType.VARCHAR, max_length=32),
-                self._FieldSchema(name="kb_code", dtype=self._DataType.VARCHAR, max_length=64),
-                self._FieldSchema(name="dept_code", dtype=self._DataType.VARCHAR, max_length=64),
+                self._FieldSchema(name="doc_id", dtype=self._DataType.VARCHAR, max_length=128),     # 所属文档 id，同文档多分片共用
+                self._FieldSchema(name="content", dtype=self._DataType.VARCHAR, max_length=65535),  # 分片正文，给最大长度
+                self._FieldSchema(name="source", dtype=self._DataType.VARCHAR, max_length=512),     # 来源路径/链接
+                self._FieldSchema(name="file_name", dtype=self._DataType.VARCHAR, max_length=256),  # 上传文件名
+                self._FieldSchema(name="updated_at", dtype=self._DataType.VARCHAR, max_length=32),  # 更新时间（存字符串）
+                self._FieldSchema(name="kb_code", dtype=self._DataType.VARCHAR, max_length=64),     # 知识库编码：权限过滤靠它
+                self._FieldSchema(name="dept_code", dtype=self._DataType.VARCHAR, max_length=64),   # 部门编码：部门级隔离用
+                # 唯一的向量列：dim 必须与 embedding 模型输出维度一致（本项目 1024）
                 self._FieldSchema(name="embedding", dtype=self._DataType.FLOAT_VECTOR, dim=self._dim),
             ]
-            schema = self._CollectionSchema(fields, description="企业知识库RAG向量索引")
-            collection = self._Collection(name, schema=schema)
+            
+            schema = self._CollectionSchema(fields, description="企业知识库RAG向量索引")  # 字段清单打包成表结构
+            collection = self._Collection(name, schema=schema)    # 此时才真正在 Milvus 创建空集合
+            # ------------------------------------------------------------------
+            # 【建索引：给 embedding 列装"向量查找目录"】
+            #   不建索引只能全表逐行算距离（十万行就很慢）；索引把向量预先分桶，
+            #   查询只扫最可能命中的桶，用一点精度换大幅提速。
+            #     index_type=IVF_FLAT：向量聚成 nlist 个桶，查时只扫最近的几个桶
+            #     metric_type=COSINE ：余弦距离，和我们 embedding 的口径一致
+            #     nlist=128          ：桶的数量，数据越多可调越大
+            # ------------------------------------------------------------------
             collection.create_index(
                 field_name="embedding",
                 index_params={
@@ -142,11 +167,11 @@ class MilvusVectorStore:
                 },
             )
             _logger.info(f"Milvus集合创建: {name}")
-        collection = self._Collection(name)
-        collection.load()
-        self._collections[name] = collection
+        collection = self._Collection(name)                        # 集合此刻必然存在（刚建或原本有），取句柄
+        self._collections[name] = collection                       # 先进缓存
+        collection.load()                                          # load 进内存才能被检索；不 load 查询会报错
         _logger.info(
-            f"Milvus集合就绪: {name} | 知识库隔离字段={self._has_field(name, 'kb_code')}"
+            f"Milvus集合就绪: {name} | 知识库隔离字段={self._has_field(name, 'kb_code')}"  # 顺带报告老集合有没有权限字段
         )
         return collection
 

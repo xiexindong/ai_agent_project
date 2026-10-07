@@ -379,12 +379,12 @@ JS 类比：不是 `tasks.find(t => t.tool === toolName).done = true`，
 | 3 | plan | 拆成有序步骤 | [react_agent.py:339](../modules/agent/react_agent.py#L339) | → `sub_tasks` 列表 |
 | 4 | reason 第1轮 | 问模型"这轮干嘛" | [react_agent.py:434](../modules/agent/react_agent.py#L434) | → `state.action` |
 | 5 | 红绿灯② | 调工具还是答题 | [graph.py:345](../modules/agent/graph.py#L345) | 返回 act/answer |
-| 6 | act 第1轮 | 真执行 data_query | [react_agent.py:729](../modules/agent/react_agent.py#L729) | → observation + 打勾 |
+| 6 | act 第1轮 | 真执行 data_query | [react_agent.py:836](../modules/agent/react_agent.py#L836) | → observation + 打勾 |
 | 7 | reason 第2轮 | 看到人数，接着算平均 | 同 434 | → calculator action |
 | 8 | act 第2轮 | 真执行 calculator | 同 729 | → "17500" + 打勾 |
 | 9 | reason 第3轮 | 模型看到全 ✅ | 同 434 | → 纯文本，**无** tool_calls |
-| 10 | answer | 完整答案 + 摘要 | [graph.py:219](../modules/agent/graph.py#L219) | → final_answer |
-| 11 | save | 落库 | [graph.py:234](../modules/agent/graph.py#L234) | → PG + MySQL |
+| 10 | answer | 完整答案 + 摘要 | [graph.py:229](../modules/agent/graph.py#L229) | → final_answer |
+| 11 | save | 落库 | [graph.py:244](../modules/agent/graph.py#L244) | → PG + MySQL |
 
 ---
 
@@ -515,8 +515,8 @@ return "answer"   # 想调工具但出错了：也收尾，不再硬调
 ### 站位 6：act 第1轮 —— data_query 真执行
 
 【规划】把模型选的工具真正跑一遍，结果回写，然后给计划打勾。
-【执行】`act_step()`（[react_agent.py:729](../modules/agent/react_agent.py#L729)）。
-【派发】action → `registry.execute_tool()`（[758](../modules/agent/react_agent.py#L758) → [tool_registry.py:205](../modules/tools/tool_registry.py#L205)）。**注意调用时第 4 个参数**：服务端把私有参数（`_scopes/_dept_code/_user_code/_mask_level`）作为 context 注入，模型在 schema 里根本看不到这些字段，也伪造不了（[tool_registry.py:317-319](../modules/tools/tool_registry.py#L317-L319) 后写入覆盖）。
+【执行】`act_step()`（[react_agent.py:836](../modules/agent/react_agent.py#L836)）。
+【派发】action → `registry.execute_tool()`（[865](../modules/agent/react_agent.py#L865) → [tool_registry.py:205](../modules/tools/tool_registry.py#L205)）。**注意调用时第 4 个参数**：服务端把私有参数（`_scopes/_dept_code/_user_code/_mask_level`）作为 context 注入，模型在 schema 里根本看不到这些字段，也伪造不了（[tool_registry.py:317-319](../modules/tools/tool_registry.py#L317-L319) 后写入覆盖）。
 
 registry 内部按序过闸：查注册表 → 能力裁决 before_call → 单工具限次 → 同参去重/缓存 → **真执行** → after_call 脱敏裁剪。
 
@@ -532,7 +532,7 @@ registry 内部按序过闸：查注册表 → 能力裁决 before_call → 单�
 ToolResult(success=True, result="财务部共25人，工资总额437,500元")
 ```
 
-执行后三连（[react_agent.py:768-787](../modules/agent/react_agent.py#L768-L787)）：
+执行后三连（[react_agent.py:875-896](../modules/agent/react_agent.py#L875-L896)）：
 
 ```
 1. 审计落 MySQL
@@ -566,7 +566,7 @@ tool_calls = [{"name": "calculator", "arguments": {"expression": "437500/25"}}]
 ### 站位 8：act 第2轮 —— calculator 真执行
 
 【规划】同站位 6：执行 → 记账 → 打勾。
-【执行】同 [react_agent.py:729](../modules/agent/react_agent.py#L729)。
+【执行】同 [react_agent.py:836](../modules/agent/react_agent.py#L836)。
 【例子】
 
 ```python
@@ -610,7 +610,7 @@ state.final_answer = "财务部共 25 人，平均工资为 17,500 元/人。"
 ### 站位 10：answer 节点 —— 出完整答案 + 一句话摘要
 
 【规划】生成（或保留）可发给用户的完整答案，再生成一句话摘要供会话列表展示。
-【执行】[graph.py:219](../modules/agent/graph.py#L219) → `generate_answer()`（[react_agent.py:794](../modules/agent/react_agent.py#L794)）、`generate_summary()`（[react_agent.py:817](../modules/agent/react_agent.py#L817)）。
+【执行】[graph.py:229](../modules/agent/graph.py#L229) → `generate_answer()`（[react_agent.py:901](../modules/agent/react_agent.py#L901)）、`generate_summary()`（[react_agent.py:923](../modules/agent/react_agent.py#L923)）。
 【派发】两个分支：
 
 ```python
@@ -631,15 +631,15 @@ finished     = True
 ### 站位 11：save 节点 —— 全部落库
 
 【规划】把这一轮的对话、摘要向量、工具流水持久化，并触发自动初审。
-【执行】[graph.py:234](../modules/agent/graph.py#L234)。
+【执行】[graph.py:244](../modules/agent/graph.py#L244)。
 【派发】四个落点：
 
 | 落点 | 内容 | 行号 |
 |---|---|---|
-| PG `chat_history` | 原文 + 答案 + 摘要向量 + 工具日志 JSONB | [252](../modules/agent/graph.py#L252) |
-| PG 会话状态快照 | state 序列化（**先剔除 principal**，活体对象无法 JSON 化） | [267-273](../modules/agent/graph.py#L267-L273) |
-| MySQL `tool_call_log` | 每条工具调用一行，审计原始依据 | [274、283](../modules/agent/graph.py#L283) |
-| 人工复核队列 | 命中敏感词/工具失败/低置信/无 RAG 时入队 | [275、299](../modules/agent/graph.py#L299) |
+| PG `chat_history` | 原文 + 答案 + 摘要向量 + 工具日志 JSONB | [262](../modules/agent/graph.py#L262) |
+| PG 会话状态快照 | state 序列化（**先剔除 principal**，活体对象无法 JSON 化） | [277-283](../modules/agent/graph.py#L277-L283) |
+| MySQL `tool_call_log` | 每条工具调用一行，审计原始依据 | [293、296](../modules/agent/graph.py#L296) |
+| 人工复核队列 | 命中敏感词/工具失败/低置信/无 RAG 时入队 | [309、331](../modules/agent/graph.py#L331) |
 
 落库完成 → 边 `"save" → END`（[graph.py:123](../modules/agent/graph.py#L123)），终态 dict 返回给前端，网页显示最终答案。
 

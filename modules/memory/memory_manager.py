@@ -197,6 +197,7 @@ class MemoryManager:
 
         context_text = self._format_context(long_term, short_term, query)
         compressed = False
+        # 这个地方 有一个疑问 为什么要熔断
         if check_token_overflow(context_text, self._max_history_tokens):
             _logger.warning("记忆上下文溢出，触发压缩（边界4）")
             long_term = self._compress_long_term(long_term, user_id, query)
@@ -259,23 +260,42 @@ class MemoryManager:
                 f"历史记忆召回{len(results)}条但全部低于阈值{self._similarity_threshold}，已舍弃"
             )
 
-        self._low_confidence = False
+        # ------------------------------------------------------------------
+        # 【关键词二次校验】向量说"语义像"，再问一句"字面有没有交集"
+        #
+        # 【为什么要这个？】向量召回只看余弦距离，存在"语义近但字面完全不同"的
+        #   误匹配（问"报销流程"召回"差旅审批怎么走"）。在相似度阈值之外再加一道
+        #   字面复核（中文 2-gram / 英文按词），两边有共同词块才保留 = 双保险。
+        #
+        # 【对比例子】query = "公司的报销流程是什么"
+        #   ✓ "报销流程需要提交发票"  交集 {报销 销流 流程} → 保留
+        #   ✗ "差旅审批怎么走"        交集 {}              → 丢弃
+        #
+        # 【本项目说明·三种结果走向】
+        #   全部命中 → 原样保留；部分命中 → 丢掉无重合的并打日志；
+        #   全部不中 → 不清空（相似度明明过阈值，可能只是措辞差异），
+        #              保留原结果 + 置 _low_confidence=True，交上层触发人工审核
+        # ------------------------------------------------------------------
+        self._low_confidence = False                          # 每次召回先复位：上一轮的低置信标记不能带进这一轮
+        # 两个前置条件：过了相似度阈值的结果非空 + 配置开关 memory_keyword_check 打开
         if filtered and get_settings().memory_keyword_check:
+            # 列表推导逐条做字面复核，通过的收进 checked
             checked = [
                 r for r in filtered
+                # 优先比 summary；摘要缺失时用 or 短路退回原始问句 query（两个都没有时 _has_keyword_overlap 内部按空串处理）
                 if self._has_keyword_overlap(query, r.get("summary", "") or r.get("query", ""))
             ]
-            if checked:
-                if len(checked) < len(filtered):
+            if checked:                                       # 至少一条字面重合 → 走"精筛"分支
+                if len(checked) < len(filtered):              # 只在部分被丢时打日志；全部通过不刷屏
                     _logger.info(
                         f"记忆关键词二次校验: 丢弃 {len(filtered) - len(checked)} 条无字面重合的召回"
                     )
-                filtered = checked
+                filtered = checked                            # 用精筛结果替换原召回
             else:
-                self._low_confidence = True
-                _logger.info("记忆召回字面完全不重合，标记为低置信（触发人工审核）")
+                self._low_confidence = True                   # 全部无字面重合：标低置信，filtered 保留不做清空
+                _logger.info("记忆召回字面完全不重合，标记为低置信（触发人工审核）")  # 写明标记原因，排查"这条为什么进了人工审核"
 
-        _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")
+        _logger.info(f"长期记忆召回: 命中={len(filtered)}/{len(results)}")  # 最终命中数/原始召回数，一行观测收口
 
         # ------------------------------------------------------------------
         # 【时效衰减重排】similarity 只管"语义像不像"，不管"过没过期"。
@@ -288,20 +308,20 @@ class MemoryManager:
         #   【只影响排序不动 similarity 字段】阈值过滤（0.65）已经在前面做完了，
         #   这里若把衰减后的分写回 similarity，会把刚过阈值的记忆误判成低置信。
         # ------------------------------------------------------------------
-        if self._half_life_days > 0:
-            now = datetime.now()
+        if self._half_life_days > 0:                           # 开关：半衰期=0 时整段跳过，保持召回原顺序
+            now = datetime.now()                               # 全程只取一次当前时刻，所有条目共用同一基准
 
-            def _effective(item: dict) -> float:
+            def _effective(item: dict) -> float:               # sort 的 key：把一条记忆换算成"相似度 × 时效系数"
                 try:
-                    t = item.get("time")
-                    days = (now - t).days if t else 0
+                    t = item.get("time")                       # 记忆创建时间；可能缺失(None)或不是 datetime
+                    days = (now - t).days if t else 0          # 有时间算距今天数；缺失按 0 天 = 不衰减
                 except Exception:
                     days = 0                                    # 时间字段异常按新记忆算，不惩罚
-                decay = 0.5 ** (max(days, 0) / self._half_life_days)
-                return item["similarity"] * decay
+                decay = 0.5 ** (max(days, 0) / self._half_life_days)  # 每过一个半衰期系数减半；max 防未来日期算出负天数
+                return item["similarity"] * decay              # 有效分只喂给排序，不写回 similarity 字段
 
-            filtered.sort(key=_effective, reverse=True)
-            _logger.debug(f"记忆召回按时效衰减重排完成: {len(filtered)} 条")
+            filtered.sort(key=_effective, reverse=True)        # 按有效分降序：又新又像的排前面
+            _logger.debug(f"记忆召回按时效衰减重排完成: {len(filtered)} 条")  # debug 级：常规召回不刷屏
 
         return filtered
 
@@ -313,7 +333,7 @@ class MemoryManager:
         关键词二次校验：中文按 2-gram、英文按词，判定问句与历史摘要是否有字面重合。
 
         【作用】向量召回只保证「语义相近」，可能召回「语义像但字面无关」的历史；
-        这里做字面复核，两边字块有交集才放行。调用处见第 157-170 行，开关是
+        这里做字面复核，两边字块有交集才放行。调用处见第 278-297 行，开关是
         memory_keyword_check；若全部被否掉，会把 _low_confidence 置 True 触发人工审核。
 
         【实跑：输入 → 切分中间值 → 判定】
@@ -328,7 +348,7 @@ class MemoryManager:
              交集 {} → False
 
         ③ 英文·有重合（无汉字即走分词）
-             注意第 179 行已先删掉所有空白，句子会粘成一整串，分词退化成「整句当一个词」：
+             注意第 372 行已先删掉所有空白，句子会粘成一整串，分词退化成「整句当一个词」：
              query "how to reset password"  → {howtoresetpassword}
              text  "reset your password here" → {resetyourpasswordhere}
              交集 {} → False     ← 两边都含 reset、password，却判「不重合」
@@ -341,12 +361,12 @@ class MemoryManager:
 
         ⑤ 边界情况
              query "好" → range(len-1) = range(0) → 切出空集合 → 永远 False（单字查询必丢）
-             query "报销，流程" → {报销 销， ，流 流程} → 第 179 行只删空白不删标点，
+             query "报销，流程" → {报销 销， ，流 流程} → 第 372 行只删空白不删标点，
                    标点会切断本该命中的 2-gram（此处"销流"被逗号切没了）。
 
         【结论】③ 的后果最严重：本校验对英文几乎恒为 False。英文提问时召回的记忆
         会被整批丢弃、并触发人工审核 —— 全程不报错，只是英文用户的长期记忆从不生效。
-        修法两处：先分词再删空白（即调换第 179 与 182 行的顺序），以及中英分开处理，
+        修法两处：先分词再删空白（即调换第 372 与 375 行的顺序），以及中英分开处理，
         不要「含一个汉字」就整段按 2-gram 切。
         """
         def grams(s: str) -> set:

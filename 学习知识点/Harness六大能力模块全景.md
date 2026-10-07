@@ -141,7 +141,7 @@ _result_cache   # 会话ID → {去重键: 成功结果}   （重复调用直接
 
 ### 2.4 执行期三层包裹（Guard → Retry → runner）
 
-这是已经接好线的真实执行链（见 [harness.py 的 execute()](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/harness/harness.py#L334-L370)）：
+这是已经接好线的真实执行链（见 [harness.py 的 execute()](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/harness/harness.py#L344-L380)）：
 
 ```
 ToolRegistry.execute_tool

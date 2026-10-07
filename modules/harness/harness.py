@@ -285,8 +285,18 @@ class ToolHarness:
             return ToolVerdict.block(code="policy_denied", reason=decision.reason, action=ACTION_DENY)
 
         # 【作用】五道安检：参数 → 权限 → 数据范围 → 限流 → 预算，任一不过直接拦下
-        verdict = self.chain.run(req)                           # ② 五道中间件
-        if not verdict.allowed:
+        # ------------------------------------------------------------------
+        # 【verdict 是什么 = 五道中间件给出的"裁决单" ToolVerdict，五个字段】
+        #   allowed   : bool，True=放行 / False=拦截（下面这行只看它）
+        #   action    : "allow" 直接执行 / "approve" 待人工批准 / "deny" 禁止
+        #   code      : 机器可读拦截码，如 schema_invalid / rate_limited / budget_exceeded
+        #   reason    : 拦截原因（人话），会回喂给模型让它知道为什么被拦
+        #   arguments : 最终参数 dict；放行时原样带出，人工批准后可能是改过的
+        # 全过 = ToolVerdict.ok(args)：allowed=True；任一拦截 =
+        # ToolVerdict.block(code, reason)：allowed=False（链在命中处短路）
+        # ------------------------------------------------------------------
+        verdict = self.chain.run(req)                           # ② 五道中间件 → ToolVerdict 裁决单
+        if not verdict.allowed:                                # 被拦：直接把裁决单返回给 execute，不进入真实执行
             return verdict
 
         if decision.action == ACTION_APPROVE:                   # ③ 高风险：人工批准

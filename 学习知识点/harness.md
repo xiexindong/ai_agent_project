@@ -12,11 +12,11 @@
 |---|---|---|---|
 | 注册期 | `tool_registry.py:95` → `harness.py:210` | 写能力台账 | — |
 | ① 裁决 | `harness.py:248` → `models.py:211` | 禁止 / 要审批 / 放行 | `policy_denied` |
-| ② 中间件 | `harness.py:288` → `middleware.py:302` | 参数/权限/范围/限流/预算 | 5 种拦截码 |
-| ③ 人工审批 | `harness.py:292` → `harness.py:301` | 高风险问人 | `approval_required` / `approval_rejected` |
-| ④ 沙箱执行 | `harness.py:350` → `sandbox.py:205` | 选工位执行 | 超时/崩溃隔离在沙箱里 |
-| ⑤ 结果过滤 | `harness.py:391` → `result_filter.py:67` | 脱敏 + 裁剪 | — |
-| ⑥ 记账审计 | `harness.py:409` → `budget.py:91` / `harness.py:416` | token 记账 + 落审计 | — |
+| ② 中间件 | `harness.py:298` → `middleware.py:302` | 参数/权限/范围/限流/预算 | 5 种拦截码 |
+| ③ 人工审批 | `harness.py:302` → `harness.py:311` | 高风险问人 | `approval_required` / `approval_rejected` |
+| ④ 沙箱执行 | `harness.py:360` → `sandbox.py:205` | 选工位执行 | 超时/崩溃隔离在沙箱里 |
+| ⑤ 结果过滤 | `harness.py:401` → `result_filter.py:67` | 脱敏 + 裁剪 | — |
+| ⑥ 记账审计 | `harness.py:419` → `budget.py:91` / `harness.py:426` | token 记账 + 落审计 | — |
 
 串起这六步的是 `tool_registry.py:226` 的 `execute_tool`。
 
@@ -138,7 +138,7 @@ ToolRegistry.register(tool)                  tool_registry.py:73
         return self._runner_for(mode).run(tool, dict(params or {}), timeout)
 ```
 
-`_runner_for`（`harness.py:327`）按 mode 取执行器，`build_sandbox`（`sandbox.py`）四选一：
+`_runner_for`（`harness.py:337`）按 mode 取执行器，`build_sandbox`（`sandbox.py`）四选一：
 
 | mode | 类 | 关键代码 | 隔离手段 |
 |---|---|---|---|
@@ -176,7 +176,7 @@ ToolRegistry.register(tool)                  tool_registry.py:73
 | 脱敏 | `result_filter.py:93-98` | `mask_level > 0` 且结果是 dict/list → `mask_record()`（复用企业模块，不另造口径） |
 | 裁剪 | `result_filter.py:102-105` | 超长就切到 `max_result_chars` 并追加"已裁剪"提示 |
 | 记账 | `budget.py:91` `consume()` | `total_calls += 1`、`per_tool[name] += 1`、`tokens += n` |
-| 审计 | `harness.py:416` `_audit()` | 写 MySQL；`approval` 记 `none`/`approved`/`denied` |
+| 审计 | `harness.py:426` `_audit()` | 写 MySQL；`approval` 记 `none`/`approved`/`denied` |
 
 ---
 
@@ -231,9 +231,9 @@ ToolRegistry.register(tool)                  tool_registry.py:73
 ## 简单总结
 
 1. **台账**：`ToolCapability`（`models.py:64`）+ `ToolPolicy`（`models.py:123`）+ `RunBudget`（`budget.py:44`），注册期写定、调用期只读。
-2. **三段链**：`before_call`（`harness.py:248`）= 裁决 + 5 道中间件 + 人工审批；`execute`（`harness.py:350`）= 按 `cap.sandbox` 选执行器；`after_call`（`harness.py:391`）= 脱敏裁剪 + token 记账 + 审计。
+2. **三段链**：`before_call`（`harness.py:248`）= 裁决 + 5 道中间件 + 人工审批；`execute`（`harness.py:360`）= 按 `cap.sandbox` 选执行器；`after_call`（`harness.py:401`）= 脱敏裁剪 + token 记账 + 审计。
 3. **串联点**：`tool_registry.py:327/374/386`，三处 `harness is not None` 决定"装不装都可用"。
 4. **拦截码是关节**：`policy_denied`、`schema_invalid`、`permission_denied`、`scope_denied`、`rate_limited`、`budget_exceeded`、`approval_required`、`approval_rejected`——每个码对应一处代码 + 一条"被拦下"的测试。
-5. **降级写死在代码里**：`harness.py:277`（enabled=False 直接放行）、`middleware.py:307`（中间件报错按放行）、`sandbox.py:217`（docker 降级子进程）、`harness.py:307`（无闸门默认 deny）。
+5. **降级写死在代码里**：`harness.py:277`（enabled=False 直接放行）、`middleware.py:307`（中间件报错按放行）、`sandbox.py:217`（docker 降级子进程）、`harness.py:312`（无闸门默认 deny）。
 
 要我接着把「五道中间件的判定顺序为什么是这样」按这同样的方式——每道给出代码行号 + 反例——拆开讲吗？
