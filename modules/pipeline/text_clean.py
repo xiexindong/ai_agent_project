@@ -9,7 +9,7 @@
     清洗在前，等于先把输入压成规则能认出的形态。
 
 【清洗什么】
-    ① 零宽/不可见字符（\u200b 等）：看不见但会打断正则匹配
+    ① 零宽/不可见字符（​ 等）：看不见但会打断正则匹配
     ② 控制字符（\x00-\x1f）：搞坏 prompt 结构
     ③ 全角字母数字 → 半角：让 "ＡＢＣ" 和 "ABC" 走同一条规则
     ④ 连续空白/空行：省 token，也让文本更规整
@@ -28,7 +28,7 @@ _logger = get_logger("pipeline.clean")                          # 本模块日�
 # 【字符类】零宽与不可见字符：不占视觉宽度，但会让正则匹配失败
 #   ​ 零宽空格  ‌-‏ 方向控制  ﻿ BOM  ‪-‮ 方向嵌入
 # ----------------------------------------------------------------------
-_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff\u202a-\u202e\u00ad]")
+_ZERO_WIDTH_RE = re.compile(r"[​-‏﻿‪-‮­]")
 
 # 控制字符（保留 \t \n \r，它们是合法排版字符）
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -84,7 +84,7 @@ def clean_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> CleanResult:  
         CleanResult：永远非 None；输入为空时返回 text="" 且 changed=False
 
     【输入输出对照】
-        输入 "你\u200b好\x00啊"          → text="你好啊", removed=["零宽字符x1","控制字符x1"]
+        输入 "你​好\x00啊"          → text="你好啊", removed=["零宽字符x1","控制字符x1"]
         输入 "ＡＢＣ　１２３"             → text="ABC 123"
         输入 "注意。。。。。。"           → text="注意。"
         输入 "A" * 6000                  → text="A"*5000, removed 含 "超长截断6000->5000"
@@ -115,7 +115,7 @@ def clean_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> CleanResult:  
     out = half                                              # 更新工作副本
 
     # ④ 空白规整：每行内部多空格压成 1 个，空行最多保留 1 个
-    norm = "\n".join(re.sub(r"[ \t\u3000]+", " ", line).strip() for line in out.split("\n"))  # 逐行压空白并 strip
+    norm = "\n".join(re.sub(r"[ \t　]+", " ", line).strip() for line in out.split("\n"))  # 逐行压空白并 strip
     norm = _BLANK_LINES_RE.sub("\n\n", norm).strip()        # 3 个以上换行压成 2 个，整体去首尾空白
     if norm != out:                                         # 有实际变化
         removed.append("空白规整")                          # 记录

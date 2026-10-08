@@ -81,7 +81,7 @@ def estimate_tokens(text: str) -> int:
     if not text:                               # 空文本
         return 0                               # 直接 0，不进公式
     # 【公式】中文字 * 2 + 其余字符 * 1.3，最后 int() 截断取整
-    chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')  # CJK 基本区 U+4E00~U+9FFF 的字数
+    chinese = sum(1 for c in text if '\\u4e00' <= c <= '\\u9fff')  # CJK 基本区 U+4E00~U+9FFF 的字数
     other = len(text) - chinese                                  # 其余字符数（英文、数字、标点、空白）
     return int(chinese * 2 + other * 1.3)                        # 例："abc你好" → 3*1.3+2*2 = 7.9 → 7
 

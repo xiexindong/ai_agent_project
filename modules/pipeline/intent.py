@@ -89,7 +89,7 @@ _RULE_FALLBACK: List[tuple] = [
 _COMPILED_FALLBACK = [(t, d, re.compile(p), c) for t, d, p, c in _RULE_FALLBACK]  # 四元组中的正则串编译成 Pattern 对象
 
 # 兜底用的关键词抽取：中文词 2-6 字 + 英文单词 2 字以上
-_WORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,}")  # 中文连续 2~6 字或英文 2 字母以上记为一个词
+_WORD_RE = re.compile(r"[一-龥]{2,6}|[A-Za-z]{2,}")  # 中文连续 2~6 字或英文 2 字母以上记为一个词
 
 
 # 【什么】按正则从文本里抽关键词（去重、限数量）
