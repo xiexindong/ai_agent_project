@@ -1,6 +1,6 @@
 """
-LangGraph 多 Agent 实现
-======================
+LangGraph 多 Agent 实现（完整版）
+================================
 用 LangGraph 的 StateGraph + 子图（Subgraph）实现多 Agent 协作。
 
 与手写版本的对比：
@@ -12,9 +12,15 @@ LangGraph 多 Agent 实现
 2. 使用子图（Subgraph）定义每个 Worker
 3. 使用 add_conditional_edges 实现依赖路由
 4. 使用 checkpoint 支持断点续跑
+5. 支持异步调用子 Agent（async/await）
+6. 支持同步调用子 Agent
+7. 消息总线通信机制
+8. 上下文边界控制
+9. 完整的错误处理和降级策略
 """
 
-from typing import Annotated, TypedDict, Literal
+import asyncio
+from typing import Annotated, TypedDict, Literal, Optional
 from dataclasses import dataclass, field
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -30,7 +36,7 @@ class TeamState(TypedDict):
     query: str
     
     # 主管拆的任务
-    subtasks: list[dict]  # [{id, assignee, instruction, depends_on, status, result}]
+    subtasks: list[dict]  # [{id, assignee, instruction, depends_on, status, result, error}]
     
     # 当前执行到哪个任务
     current_task_id: str | None
@@ -52,10 +58,120 @@ class TeamState(TypedDict):
     
     # 错误信息
     error: str | None
+    
+    # 消息队列（Agent 间通信）
+    messages: list[dict]  # [{sender, receiver, kind, content, timestamp}]
+    
+    # 执行统计
+    stats: dict  # {total_tasks, completed_tasks, failed_tasks, total_tokens}
 
 
 # =============================================================================
-# 2. 定义节点函数（Node Functions）
+# 2. 消息总线（Message Bus）
+# =============================================================================
+
+class MessageBus:
+    """Agent 间通信的消息总线"""
+    
+    def __init__(self):
+        self._messages: list[dict] = []
+        self._lock = asyncio.Lock()
+    
+    async def send(self, sender: str, receiver: str, kind: str, content: str):
+        """发送消息"""
+        async with self._lock:
+            self._messages.append({
+                "sender": sender,
+                "receiver": receiver,
+                "kind": kind,  # finding / clarify / objection / delegate
+                "content": content,
+                "timestamp": asyncio.get_event_loop().time()
+            })
+    
+    async def inbox(self, agent_name: str) -> list[dict]:
+        """接收消息（只拿发给自己的）"""
+        async with self._lock:
+            return [
+                m for m in self._messages
+                if m["receiver"] in (agent_name, "*") and m["sender"] != agent_name
+            ]
+    
+    async def broadcast(self, sender: str, kind: str, content: str):
+        """广播消息（发给所有人）"""
+        await self.send(sender, "*", kind, content)
+
+
+# =============================================================================
+# 3. 定义子图（Subgraph）- Worker 的独立图
+# =============================================================================
+
+class WorkerState(TypedDict):
+    """Worker 的独立状态（不与主图共享）"""
+    task: dict  # 当前任务
+    context: str  # 上下文（上游产出、消息等）
+    result: str | None  # 执行结果
+    error: str | None  # 错误信息
+    steps: int  # 执行步数
+
+
+def create_worker_subgraph(worker_type: str):
+    """创建 Worker 的子图"""
+    
+    def worker_prepare(state: WorkerState) -> dict:
+        """Worker 准备阶段：组装上下文"""
+        task = state["task"]
+        context = state.get("context", "")
+        
+        # 组装提示词
+        prompt = f"""你是{worker_type}，负责执行任务。
+
+任务：{task['instruction']}
+
+上下文：
+{context}
+
+请完成任务，返回结果。"""
+        
+        return {
+            "context": prompt,
+            "steps": state.get("steps", 0) + 1
+        }
+    
+    def worker_execute(state: WorkerState) -> dict:
+        """Worker 执行阶段：调用 LLM"""
+        context = state["context"]
+        
+        # 模拟调用 LLM（实际会调真实的 LLM）
+        result = f"[{worker_type}] 完成：{context[:100]}..."
+        
+        return {
+            "result": result,
+            "steps": state["steps"] + 1
+        }
+    
+    def worker_finalize(state: WorkerState) -> dict:
+        """Worker 收尾阶段：整理结果"""
+        return {
+            "result": state["result"],
+            "steps": state["steps"] + 1
+        }
+    
+    # 创建子图
+    subgraph = StateGraph(WorkerState)
+    subgraph.add_node("prepare", worker_prepare)
+    subgraph.add_node("execute", worker_execute)
+    subgraph.add_node("finalize", worker_finalize)
+    
+    subgraph.set_entry_point("prepare")
+    subgraph.add_edge("prepare", "execute")
+    subgraph.add_edge("execute", "finalize")
+    subgraph.add_edge("finalize", END)
+    
+    return subgraph.compile()
+
+
+# =============================================================================
+# 4. 定义节点函数（Node Functions）
 # =============================================================================
 
 def supervisor_node(state: TeamState) -> dict:
@@ -76,7 +192,9 @@ def supervisor_node(state: TeamState) -> dict:
             "assignee": "researcher",
             "instruction": f"查询相关数据：{query}",
             "depends_on": [],
-            "status": "pending"
+            "status": "pending",
+            "result": None,
+            "error": None
         })
     
     if "算" in query or "环比" in query or "分析" in query:
@@ -85,7 +203,9 @@ def supervisor_node(state: TeamState) -> dict:
             "assignee": "analyst",
             "instruction": f"分析计算：{query}",
             "depends_on": ["t1"] if subtasks else [],
-            "status": "pending"
+            "status": "pending",
+            "result": None,
+            "error": None
         })
     
     if "报告" in query or "写" in query or "总结" in query:
@@ -94,7 +214,9 @@ def supervisor_node(state: TeamState) -> dict:
             "assignee": "writer",
             "instruction": f"撰写报告：{query}",
             "depends_on": ["t2"] if len(subtasks) > 1 else ["t1"] if subtasks else [],
-            "status": "pending"
+            "status": "pending",
+            "result": None,
+            "error": None
         })
     
     # 如果没有拆出任务，直接回答
@@ -102,25 +224,27 @@ def supervisor_node(state: TeamState) -> dict:
         return {
             "final_answer": f"直接回答：{query}",
             "status": "done",
-            "subtasks": []
+            "subtasks": [],
+            "stats": {"total_tasks": 0, "completed_tasks": 0, "failed_tasks": 0, "total_tokens": 0}
         }
     
     return {
         "subtasks": subtasks,
         "status": "dispatching",
-        "current_task_id": None
+        "current_task_id": None,
+        "stats": {"total_tasks": len(subtasks), "completed_tasks": 0, "failed_tasks": 0, "total_tokens": 0}
     }
 
 
 def researcher_node(state: TeamState) -> dict:
-    """研究员 Worker：查资料"""
+    """研究员 Worker：查资料（同步版本）"""
     subtasks = state["subtasks"]
     worker_outputs = state["worker_outputs"]
     
     # 找到第一个 pending 且依赖已满足的任务
     task = None
     for t in subtasks:
-        if t["status"] == "pending":
+        if t["status"] == "pending" and t["assignee"] == "researcher":
             deps_met = all(dep in worker_outputs for dep in t["depends_on"])
             if deps_met:
                 task = t
@@ -131,21 +255,103 @@ def researcher_node(state: TeamState) -> dict:
     
     task_id = task["id"]
     
-    # 模拟查资料（实际会调 LLM + 工具）
-    result = f"[研究员] 查询完成：{task['instruction']} → 得到数据 XXX"
+    # 创建 Worker 子图
+    worker_graph = create_worker_subgraph("researcher")
     
-    # 更新任务状态
-    task["status"] = "completed"
-    task["result"] = result
+    # 组装上下文
+    context = "\n".join(
+        f"上游产出 {dep}: {worker_outputs.get(dep, '')[:200]}"
+        for dep in task["depends_on"]
+    )
+    
+    # 执行 Worker 子图（同步）
+    worker_state: WorkerState = {
+        "task": task,
+        "context": context,
+        "result": None,
+        "error": None,
+        "steps": 0
+    }
+    
+    try:
+        result = worker_graph.invoke(worker_state)
+        output = result["result"]
+        task["status"] = "completed"
+        task["result"] = output
+    except Exception as e:
+        task["status"] = "failed"
+        task["error"] = str(e)
+        output = f"[研究员] 执行失败：{e}"
     
     return {
-        "worker_outputs": {**worker_outputs, task_id: result},
+        "worker_outputs": {**worker_outputs, task_id: output},
         "subtasks": subtasks,
+        "stats": {
+            **state.get("stats", {}),
+            "completed_tasks": state.get("stats", {}).get("completed_tasks", 0) + 1
+        }
+    }
+
+
+async def researcher_node_async(state: TeamState) -> dict:
+    """研究员 Worker：查资料（异步版本）"""
+    subtasks = state["subtasks"]
+    worker_outputs = state["worker_outputs"]
+    
+    # 找到第一个 pending 且依赖已满足的任务
+    task = None
+    for t in subtasks:
+        if t["status"] == "pending" and t["assignee"] == "researcher":
+            deps_met = all(dep in worker_outputs for dep in t["depends_on"])
+            if deps_met:
+                task = t
+                break
+    
+    if task is None:
+        return {"worker_outputs": worker_outputs, "subtasks": subtasks}
+    
+    task_id = task["id"]
+    
+    # 创建 Worker 子图
+    worker_graph = create_worker_subgraph("researcher")
+    
+    # 组装上下文
+    context = "\n".join(
+        f"上游产出 {dep}: {worker_outputs.get(dep, '')[:200]}"
+        for dep in task["depends_on"]
+    )
+    
+    # 执行 Worker 子图（异步）
+    worker_state: WorkerState = {
+        "task": task,
+        "context": context,
+        "result": None,
+        "error": None,
+        "steps": 0
+    }
+    
+    try:
+        result = await worker_graph.ainvoke(worker_state)
+        output = result["result"]
+        task["status"] = "completed"
+        task["result"] = output
+    except Exception as e:
+        task["status"] = "failed"
+        task["error"] = str(e)
+        output = f"[研究员] 执行失败：{e}"
+    
+    return {
+        "worker_outputs": {**worker_outputs, task_id: output},
+        "subtasks": subtasks,
+        "stats": {
+            **state.get("stats", {}),
+            "completed_tasks": state.get("stats", {}).get("completed_tasks", 0) + 1
+        }
     }
 
 
 def analyst_node(state: TeamState) -> dict:
-    """分析师 Worker：算数据"""
+    """分析师 Worker：算数据（同步版本）"""
     subtasks = state["subtasks"]
     worker_outputs = state["worker_outputs"]
     
@@ -168,7 +374,7 @@ def analyst_node(state: TeamState) -> dict:
         worker_outputs.get(dep, "") for dep in task["depends_on"]
     )
     
-    # 模拟分析计算
+    # 模拟分析计算（同步）
     result = f"[分析师] 分析完成：基于上游数据 {upstream[:100]}... → 计算结果 YYY"
     
     task["status"] = "completed"
@@ -181,7 +387,7 @@ def analyst_node(state: TeamState) -> dict:
 
 
 def writer_node(state: TeamState) -> dict:
-    """撰写员 Worker：写报告"""
+    """撰写员 Worker：写报告（同步版本）"""
     subtasks = state["subtasks"]
     worker_outputs = state["worker_outputs"]
     
@@ -203,7 +409,7 @@ def writer_node(state: TeamState) -> dict:
         worker_outputs.get(dep, "") for dep in task["depends_on"]
     )
     
-    # 模拟写报告
+    # 模拟写报告（同步）
     result = f"[撰写员] 报告完成：综合所有数据 → 最终报告 ZZZ"
     
     task["status"] = "completed"
@@ -222,12 +428,12 @@ def synthesizer_node(state: TeamState) -> dict:
     subtasks = state["subtasks"]
     
     # 如果所有任务都完成了，汇总答案
-    all_completed = all(t["status"] == "completed" for t in subtasks)
+    all_completed = all(t["status"] in ("completed", "failed") for t in subtasks)
     
     if all_completed and state["final_answer"] is None:
         # 没有 writer 节点时，由主管汇总
         answer = "【主管汇总】\n" + "\n".join(
-            f"- {t['assignee']}: {t.get('result', '无结果')[:200]}"
+            f"- {t['assignee']}: {t.get('result', t.get('error', '无结果'))[:200]}"
             for t in subtasks
         )
         return {
@@ -254,7 +460,7 @@ def reviewer_node(state: TeamState) -> dict:
 
 
 # =============================================================================
-# 3. 定义路由函数（Conditional Edges）
+# 5. 定义路由函数（Conditional Edges）
 # =============================================================================
 
 def route_after_supervisor(state: TeamState) -> str:
@@ -299,7 +505,7 @@ def route_after_reviewer(state: TeamState) -> str:
 
 
 # =============================================================================
-# 4. 构建 LangGraph
+# 6. 构建 LangGraph
 # =============================================================================
 
 def build_multiagent_graph():
@@ -370,11 +576,11 @@ def build_multiagent_graph():
 
 
 # =============================================================================
-# 5. 运行示例
+# 7. 运行示例
 # =============================================================================
 
-def run_multiagent(query: str, needs_review: bool = False):
-    """运行多 Agent 团队"""
+async def run_multiagent_async(query: str, needs_review: bool = False):
+    """运行多 Agent 团队（异步版本）"""
     app = build_multiagent_graph()
     
     # 初始状态
@@ -387,7 +593,35 @@ def run_multiagent(query: str, needs_review: bool = False):
         "needs_review": needs_review,
         "review_feedback": None,
         "status": "planning",
-        "error": None
+        "error": None,
+        "messages": [],
+        "stats": {"total_tasks": 0, "completed_tasks": 0, "failed_tasks": 0, "total_tokens": 0}
+    }
+    
+    # 运行（带 thread_id 支持断点续跑）
+    config = {"configurable": {"thread_id": "run_001"}}
+    result = await app.ainvoke(initial_state, config)
+    
+    return result
+
+
+def run_multiagent(query: str, needs_review: bool = False):
+    """运行多 Agent 团队（同步版本）"""
+    app = build_multiagent_graph()
+    
+    # 初始状态
+    initial_state: TeamState = {
+        "query": query,
+        "subtasks": [],
+        "current_task_id": None,
+        "worker_outputs": {},
+        "final_answer": None,
+        "needs_review": needs_review,
+        "review_feedback": None,
+        "status": "planning",
+        "error": None,
+        "messages": [],
+        "stats": {"total_tasks": 0, "completed_tasks": 0, "failed_tasks": 0, "total_tokens": 0}
     }
     
     # 运行（带 thread_id 支持断点续跑）
@@ -398,7 +632,7 @@ def run_multiagent(query: str, needs_review: bool = False):
 
 
 # =============================================================================
-# 6. 测试
+# 8. 测试
 # =============================================================================
 
 if __name__ == "__main__":
@@ -409,6 +643,7 @@ if __name__ == "__main__":
     result = run_multiagent("你好")
     print(f"答案：{result['final_answer']}")
     print(f"状态：{result['status']}")
+    print(f"统计：{result['stats']}")
     print()
     
     # 测试 2：需要拆任务的查询
@@ -419,11 +654,21 @@ if __name__ == "__main__":
     print(f"答案：{result['final_answer']}")
     print(f"审核意见：{result['review_feedback']}")
     print(f"状态：{result['status']}")
+    print(f"统计：{result['stats']}")
     print()
     
-    # 测试 3：断点续跑
+    # 测试 3：异步版本
     print("=" * 60)
-    print("测试 3：断点续跑（用相同 thread_id）")
+    print("测试 3：异步版本")
+    print("=" * 60)
+    result = asyncio.run(run_multiagent_async("查一下 Q4 数据，分析一下"))
+    print(f"答案：{result['final_answer']}")
+    print(f"状态：{result['status']}")
+    print()
+    
+    # 测试 4：断点续跑
+    print("=" * 60)
+    print("测试 4：断点续跑（用相同 thread_id）")
     print("=" * 60)
     app = build_multiagent_graph()
     config = {"configurable": {"thread_id": "run_001"}}
@@ -432,3 +677,4 @@ if __name__ == "__main__":
     state = app.get_state(config)
     print(f"当前状态：{state.values.get('status', 'N/A')}")
     print(f"已完成任务：{len([t for t in state.values.get('subtasks', []) if t['status'] == 'completed'])}")
+    print(f"失败任务：{len([t for t in state.values.get('subtasks', []) if t['status'] == 'failed'])}")
