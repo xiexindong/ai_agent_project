@@ -302,14 +302,14 @@ class BaseAgent:
     # 【作用】拼好提示词后按有无工具走两条路径，统一产出 AgentOutput（失败也不外抛）
     def run(self, task: Optional[SubTask], ctx: RunContext) -> AgentOutput:
         """执行一次子任务（Supervisor 之外的所有 Agent 走这里）。"""
-        started = time.time()
-        instruction = task.instruction if task else ctx.query
-        upstream_text = self._upstream_text(ctx)
-        vision_text = self.describe_images(ctx)
+        started = time.time()                                           # 记开始时间，最后算执行耗时
+        instruction = task.instruction if task else ctx.query           # 有工单读指令，没工单直接用用户原话
+        upstream_text = self._upstream_text(ctx)                        # 拼上游产出文本（依赖任务的结果）
+        vision_text = self.describe_images(ctx)                         # 把图片翻译成文字描述
         # 同伴消息（横向对话）：取 bus 上发给自己的点对点消息与广播（*）,
         #   排除自己发出的，按时间正序取最近 20 条，每条正文截断 400 字符，
         #   拼成 "- [kind] sender: content"；无人发消息时返回 ""，可直接拼进 prompt
-        peer_text = ctx.bus.inbox_text(self.name) if ctx.bus is not None else ""
+        peer_text = ctx.bus.inbox_text(self.name) if ctx.bus is not None else ""  # 有总线就读消息，没总线走空串
 
         # ------------------------------------------------------------------
         # 【委派：先把"更适合别人的那部分"转出去，再带着结果做自己的部分】
@@ -320,62 +320,62 @@ class BaseAgent:
         #   【转不出去会怎样】decide 解析失败、或治理不放行 → 返回 None，
         #   本 Agent 照常自己干，绝不因为"想转没转成"就让任务失败。
         # ------------------------------------------------------------------
-        delegated: list = []
-        dex = getattr(ctx, "delegation", None)
+        delegated: list = []                                            # 记录转派出去的委派记录，最后带回报账
+        dex = getattr(ctx, "delegation", None)                          # 取委派器，可能没装 → None
         if dex is not None and getattr(dex, "enabled", False) \
-                and self.spec.can_delegate and task is not None:
-            decision = decide_delegation(
+                and self.spec.can_delegate and task is not None:         # 四道闸：有委派器 / 开关开了 / 有资格 / 有任务
+            decision = decide_delegation(                               # 问 LLM"要不要转派、转给谁"
                 self.llm, instruction, dex.candidates(self.name), self.system_prompt
             )
-            if decision is not None and decision.should_delegate:
-                rec = dex.delegate(
-                    from_agent=self.name,
-                    to_agent=decision.to_agent,
-                    instruction=decision.instruction,
-                    parent_task_id=task.id,
-                    depth=getattr(ctx, "delegation_depth", 0),
-                    reason=decision.reason,
-                    chain=list(getattr(ctx, "delegation_chain", []) or []),
+            if decision is not None and decision.should_delegate:       # LLM 说转
+                rec = dex.delegate(                                     # 真正执行转派，走五道治理闸
+                    from_agent=self.name,                               # 我从谁来的
+                    to_agent=decision.to_agent,                         # 转给谁
+                    instruction=decision.instruction,                   # 转什么活
+                    parent_task_id=task.id,                             # 挂在哪个父任务下
+                    depth=getattr(ctx, "delegation_depth", 0),          # 当前委派深度（防无限递归）
+                    reason=decision.reason,                             # 转派原因（留痕）
+                    chain=list(getattr(ctx, "delegation_chain", []) or []),  # 委派链（防环）
                 )
-                if rec is not None:
-                    delegated.append(rec)
+                if rec is not None:                                     # 转成功
+                    delegated.append(rec)                               # 记入账本
                     _logger.info(f"[{self.name}] 已把部分工作委派给 {rec.to_agent}: {rec.instruction[:60]}")
 
-        delegation_text = self._delegation_text(delegated)
-        prompt = self._build_prompt(instruction, upstream_text, vision_text, peer_text, delegation_text)
+        delegation_text = self._delegation_text(delegated)              # 把委派结果拼成可读文本
+        prompt = self._build_prompt(instruction, upstream_text, vision_text, peer_text, delegation_text)  # 组装最终提示词
 
         # ------------------------------------------------------------------
         # 【上下文隔离的最后一道边界】从这里往下，子 Agent 能看到的全部信息
         #   都已压缩进 prompt 这一个字符串；执行结束后只有 AgentOutput 回流，
         #   内部 messages、工具日志（logs 仅做账单留痕）都不进入主管的上下文。
         # ------------------------------------------------------------------
-        try:
-            schemas = self._tool_schemas()
-            if schemas:
+        try:                                                            # 异常捕获：执行失败不崩整轮
+            schemas = self._tool_schemas()                              # 取本 Agent 允许的工具 schema 列表
+            if schemas:                                                 # 有工具 → 走工具循环（调 LLM → 调工具 → 再调 LLM）
                 content, steps, logs = self._run_with_tools(prompt, self.spec.max_steps, ctx.session_id)
-            else:
+            else:                                                       # 没工具 → 直接调 LLM 给答案
                 content = self.llm.invoke(prompt, system_prompt=self.system_prompt,
                                           temperature=self.spec.temperature)
-                steps, logs = 1, []
-            return AgentOutput(
-                agent=self.name,
-                role=self.spec.role,
-                task_id=task.id if task else "",
-                content=(content or "").strip(),
-                success=True,
-                steps=steps,
-                tool_calls=logs,
-                duration_ms=int((time.time() - started) * 1000),
-                multimodal=bool(vision_text),
-                delegations=delegated,                                   # 我转出去的活（账）
-                delegated_by=getattr(ctx, "delegated_by", "") or "",     # 我是受谁委派来的
+                steps, logs = 1, []                                     # 记 1 步、空工具日志
+            return AgentOutput(                                         # 包装成功结果
+                agent=self.name,                                        # 我叫什么
+                role=self.spec.role,                                    # 我的角色（researcher/analyst/…）
+                task_id=task.id if task else "",                        # 对应哪个工单，直答时为空
+                content=(content or "").strip(),                        # 产出内容，去首尾空白
+                success=True,                                           # 成功标记
+                steps=steps,                                            # 走了几步（含工具调用轮次）
+                tool_calls=logs,                                        # 工具调用账单
+                duration_ms=int((time.time() - started) * 1000),       # 总耗时（毫秒）
+                multimodal=bool(vision_text),                           # 是否处理了图片
+                delegations=delegated,                                  # 我转出去的活（账）
+                delegated_by=getattr(ctx, "delegated_by", "") or "",    # 我是受谁委派来的
             )
-        except Exception as e:
-            _logger.error(f"[{self.name}] 执行失败: {type(e).__name__}: {e}")
-            return AgentOutput.failed(
-                self.name, task.id if task else "", f"{type(e).__name__}: {e}",
+        except Exception as e:                                          # 执行抛异常（LLM 挂了 / 工具超时 / 网络断了）
+            _logger.error(f"[{self.name}] 执行失败: {type(e).__name__}: {e}")  # 打错误日志
+            return AgentOutput.failed(                                  # 包装失败结果，不崩整轮
+                self.name, task.id if task else "", f"{type(e).__name__}: {e}",  # agent 名 / 任务 ID / 错误信息
                 role=self.spec.role,
-                duration_ms=int((time.time() - started) * 1000),
+                duration_ms=int((time.time() - started) * 1000),       # 即使失败也记耗时
                 delegations=delegated,
                 delegated_by=getattr(ctx, "delegated_by", "") or "",
             )
@@ -432,7 +432,41 @@ class BaseAgent:
 class SupervisorAgent(BaseAgent):
     """主管：负责拆任务（plan）与汇总结论（synthesize）。"""
 
-    PLAN_PROMPT = (   # 规划提示词模板：占位符为 query / modality / roster / schema
+    # ------------------------------------------------------------------
+    # 【PLAN_PROMPT 规划提示词模板】
+    #   四个占位符在 plan() 里被替换：
+    #     {query}    → 用户原始提问（ctx.query）
+    #     {modality} → 输入形态（纯文本 / 文本+图片）
+    #     {roster}   → 可用成员列表（从 roster 参数拼接）
+    #     {schema}   → PlanResult 的 JSON Schema（模型按此格式填空）
+    #
+    # 【填充后完整示例】
+    #   ## 用户问题
+    #   查一下 Q3 和 Q4 营收，算一下环比增长，写个报告
+    #
+    #   ## 输入形态
+    #   纯文本
+    #
+    #   ## 可用成员
+    #   - researcher_1（researcher）: 通用执行者，可用工具: data_query
+    #   - analyst_1（analyst）: 通用执行者，可用工具: calculator
+    #   - reviewer_1（reviewer）: 通用执行者
+    #
+    #   ## 成员产出规则
+    #   - 能并行的任务不要串行（不要写无谓的 depends_on）
+    #   - 一个任务只派一个人
+    #   - 简单问题直接给 direct_answer
+    #
+    #   ## 输出结构（严格遵守）
+    #   {"thought": "string", "subtasks": [{"id": "string", "assignee": "string", ...}], ...}
+    #
+    #   只输出一个 JSON 对象，不要多余文字。
+    #
+    # 【为什么给 schema 而不是让模型自由发挥】
+    #   模型可能返回 "1. 先查… 2. 再算…" 这种列表文本，正则抠字段极其脆弱。
+    #   喂 schema 后模型只在格子里填空，model_validate 当场校验，错了还能重试。
+    # ------------------------------------------------------------------
+    PLAN_PROMPT = (
         "## 用户问题\n{query}\n\n"
         "## 输入形态\n{modality}\n\n"
         "## 可用成员\n{roster}\n\n"
