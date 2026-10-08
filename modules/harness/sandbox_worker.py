@@ -34,13 +34,16 @@
     stdin  {"module":"不存在的模块","class":"X","params":{}}
     stdout {"success": false, "result": null, "error": "ModuleNotFoundError: ...", ...} 退出码 1
 """
-from __future__ import annotations
+from __future__ import annotations           # 允许类型注解里用未导入的名字（Python 3.7+ 兼容写法）
 
-import importlib
-import json
-import sys
+import importlib                             # 标准库动态导入：按"模块名字符串"加载模块
+import json                                  # 标准库 JSON：payload 解析与结果回写
+import sys                                   # 标准库 sys：读写 stdin/stdout 管道
 
 
+# 【什么】子进程入口
+# 【作用】读 stdin 的类坐标 payload → 动态 import → 执行工具 → 往 stdout 写一行 JSON 结果
+# 【为什么】统一协议（stdin 进 JSON、stdout 出 JSON、退出码 0/1）让主进程解析逻辑极简
 def main() -> int:
     """子进程入口。约定：返回 0 = 正常，返回 1 = 出错（即进程退出码）。"""
     try:
@@ -49,7 +52,7 @@ def main() -> int:
         #   sys.stdin.read()  读全部标准输入，就是主进程打包的那段 JSON
         #   or "{}"           读到空内容时当成空 JSON，避免 json.loads("") 直接报错
         #   json.loads()      JSON 字符串 → Python 字典
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json.loads(sys.stdin.read() or "{}")  # 读 stdin 全部内容并解析成字典；空输入兜底 "{}"
 
         # 【什么】按"模块坐标"动态 import 工具所在的模块
         # 【作用】等价于写 import modules.tools.file_tool，只不过是运行时才导入
@@ -60,7 +63,7 @@ def main() -> int:
         # 【什么】从模块里取出工具类本身
         # 【作用】等价于 tool_cls = modules.tools.file_tool.FileReadTool
         #   payload["class"] 是类名字符串，如 "FileReadTool"
-        tool_cls = getattr(module, payload["class"])
+        tool_cls = getattr(module, payload["class"])                 # 按类名字符串取出类对象
 
         # 【什么】实例化工具并真正执行
         # 【作用】这一行就是干活的：读文件 / 调 MCP / 查数据库都在这里发生
@@ -76,7 +79,7 @@ def main() -> int:
         #   json.dumps           字典 → JSON 字符串
         #   ensure_ascii=False   中文原样输出，不被转成 \uXXXX
         #   + "\n"               必须换行，主进程按行解析
-        sys.stdout.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+        sys.stdout.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")  # 结果行写 stdout（最后一行契约）
         return 0                                                    # 0 = 正常退出
 
     except Exception as e:
@@ -88,15 +91,16 @@ def main() -> int:
         #     ③ 工具 run() 内部抛出（即使它自己兜底也可能漏）
         #   为什么必须兜：不兜的话子进程 stderr 一片 traceback、stdout 空，
         #   主进程只能报"沙箱无有效输出"，模型拿不到可用信息去重试
-        sys.stdout.write(json.dumps({
-            "success": False, "result": None,
-            "error": f"{type(e).__name__}: {e}", "duration_ms": 0,
-        }, ensure_ascii=False) + "\n")
+        sys.stdout.write(json.dumps({                                # 错误也按固定结构写成一行 JSON
+            "success": False, "result": None,                        # 失败标志 + 空结果
+            "error": f"{type(e).__name__}: {e}", "duration_ms": 0,   # 异常类型名 + 异常信息；耗时记 0
+        }, ensure_ascii=False) + "\n")                               # 中文不转义 + 换行结尾
         return 1                                                    # 1 = 异常退出
 
 
 # 【什么】脚本入口
 # 【作用】直接 `python -m modules.harness.sandbox_worker` 时执行 main()，
 #         并把它返回的 0/1 作为进程退出码交给操作系统
+# 【为什么】用 SystemExit 包裹：main 的返回值才真正变成进程退出码，主进程可据此判生死
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main())                                         # main 返回值 → 进程退出码

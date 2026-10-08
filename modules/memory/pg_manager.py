@@ -80,18 +80,19 @@ PostgreSQL + pgvector 管理模块
 """
 # 【什么】标准库与项目内依赖
 # 【作用】json 转 JSONB 列、MemoryException 抛记忆错误、handle_exception 统一兜异常、get_settings 读连接参数
-import json
-from typing import List, Optional
-from datetime import datetime
-from modules.common.logger import get_logger
-from modules.common.exceptions import MemoryException, handle_exception
-from config import get_settings
+import json                                                   # 序列化 dict/list，写 JSONB 列前必须转成 JSON 字符串
+from typing import List, Optional                             # 类型标注工具（当前签名未直接用到，保留以备扩展）
+from datetime import datetime                                 # 时间类型标注备用（created_at 等列的 Python 侧类型）
+from modules.common.logger import get_logger                  # 统一日志工厂，产出带 "pg" 前缀的 logger
+from modules.common.exceptions import MemoryException, handle_exception  # 记忆层异常类型 + 统一兜底装饰器
+from config import get_settings                               # 全局配置：PG 连接参数与向量维度都从它读
 
 _logger = get_logger("pg")                          # 模块级日志器，前缀 pg
 
 
 # 【什么】PG 连接与 4 张表的读写入口（单例）
 # 【作用】全项目唯一的记忆持久化层：会话、对话页、工具流水、审核队列都走它
+# 【为什么】连接与游标是昂贵资源，单例保证全进程共用一份，避免每个模块各自建连拖垮 PG
 class PGManager:
     """PostgreSQL 连接与表结构管理（带pgvector扩展）。"""
 
@@ -99,32 +100,35 @@ class PGManager:
 
     # 【什么】控制实例只创建一次
     # 【作用】反复 PGManager() 拿到同一对象，连接与游标全进程共用一份
+    # 【为什么】__init__ 每次都会跑，但 __new__ 只建一次对象——单例的"唯一性"在 __new__ 层保证
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        if cls._instance is None:                             # 还没建过实例才走创建分支
+            cls._instance = super().__new__(cls)              # 调父类 object.__new__ 真正分配对象
+        return cls._instance                                  # 已建过则直接返回旧实例，保证全局唯一
 
     # 【什么】首次实例化时才真正建连
     # 【作用】_connected 是"已连过"标记，单例下避免每次 PGManager() 都重连一次
+    # 【为什么】__init__ 在单例下会被反复调用，没有标记守卫就会反复重连、反复建表
     def __init__(self):
-        if not hasattr(self, "_connected"):
-            self._connect()
+        if not hasattr(self, "_connected"):                   # 没有 _connected 属性 = 首次实例化
+            self._connect()                                   # 真正建立连接、装扩展、建表
             self._connected = True                  # 连成功才打标记；失败时 _connect 已抛异常
 
     # 【什么】建立连接、装 pgvector 扩展、建表
     # 【作用】一次性把"能存向量"的三件事做齐；失败直接抛 MemoryException，不做降级
+    # 【为什么】记忆层是核心依赖，连不上就该启动失败暴露问题，静默降级会让记忆悄悄失效更难查
     def _connect(self):
         """连接 PG 并注册 pgvector 扩展。"""
         try:
-            import psycopg2
-            from pgvector.psycopg2 import register_vector
-            s = get_settings()
-            self._conn = psycopg2.connect(
-                host=s.pg_host,
-                port=s.pg_port,
-                user=s.pg_user,
-                password=s.pg_password,
-                dbname=s.pg_database,
+            import psycopg2                                   # 延迟导入：PG 驱动是重依赖，用到才加载
+            from pgvector.psycopg2 import register_vector     # pgvector 的 psycopg2 适配器注册函数
+            s = get_settings()                                # 读全局配置，下面 5 个连接参数都从它取
+            self._conn = psycopg2.connect(                    # 建立到 PostgreSQL 的 TCP 连接
+                host=s.pg_host,                               # PG 主机地址
+                port=s.pg_port,                               # PG 端口
+                user=s.pg_user,                               # 登录用户名
+                password=s.pg_password,                       # 登录密码
+                dbname=s.pg_database,                         # 目标数据库名
             )
             self._conn.autocommit = False            # 关自动提交：每条写操作后由代码显式 commit
 
@@ -147,7 +151,7 @@ class PGManager:
             #   若换成官方 postgres:16 镜像，会报 could not open extension control
             #   file，属于「换个镜像就炸」的隐性依赖。
             # ------------------------------------------------------------------
-            self._cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            self._cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")   # 装 pgvector 扩展（幂等）
 
             # ------------------------------------------------------------------
             # 【为什么要单独 commit】因为上面关掉了自动提交
@@ -167,10 +171,10 @@ class PGManager:
             #   register_vector() 要先去 pg_type 查出 vector 类型的 OID 才能注册
             #   适配器，所以顺序只能是「先让扩展生效，再注册」，两句不能调换。
             # ------------------------------------------------------------------
-            self._conn.commit()
+            self._conn.commit()                               # 提交"装扩展"这个独立事务，让扩展永久生效
 
             # ------------------------------------------------------------------
-            # 【上面这句 + 这两行，三层合起来在干什么】让「存向量」从不可能变成可能
+            # 【上面那句 + 这两行，三层合起来在干什么】让「存向量」从不可能变成可能
             #
             #   第 1 层（上面那句 execute）—— 数据库服务端视角
             #       CREATE EXTENSION vector：让 PostgreSQL 自己认识 vector 类型。
@@ -199,15 +203,16 @@ class PGManager:
             #   数据库认识 vector（服务端） + Python 会收发 vector（客户端）
             #   + 表里真有 vector 列（业务）= 能写入 1024 维摘要向量并按语义检索。
             # ------------------------------------------------------------------
-            register_vector(self._conn)
-            self._init_tables()
-            _logger.info(f"PG连接成功: {s.pg_host}:{s.pg_port}/{s.pg_database}")
+            register_vector(self._conn)                       # 注册 vector 类型适配器（客户端视角的"会收发"）
+            self._init_tables()                               # 建齐 4 张表与索引（业务视角的"有列可存"）
+            _logger.info(f"PG连接成功: {s.pg_host}:{s.pg_port}/{s.pg_database}")  # 启动日志：连的是哪个库
         except Exception as e:
-            _logger.error(f"PG连接失败: {e}")
-            raise MemoryException("PG连接失败", str(e))
+            _logger.error(f"PG连接失败: {e}")                 # 先落错误日志，保留原始异常信息
+            raise MemoryException("PG连接失败", str(e))       # 包装成记忆层异常向上抛，让启动直接失败
 
     # 【什么】建表与建索引（幂等，可反复执行）
     # 【作用】把 5 张表 + 索引建齐；每条 DDL 带 IF NOT EXISTS，重复启动不报错
+    # 【为什么】启动时自动建表免去人工初始化；幂等设计让老库升级只补新列、不丢数据
     def _init_tables(self):
         """创建生产级表结构（幂等）。
 
@@ -254,7 +259,7 @@ class PGManager:
                 查询条件常是 "某个会话 + 某个用户 + 按时间倒序"，建联合索引一次搞定
                 类比：书的目录 + 按作者排序
         """
-        s = get_settings()
+        s = get_settings()                                    # 读全局配置，向量维度从它取
         dim = s.embedding_dimension                 # 向量维度，默认 1024，决定 vector(N) 里的 N
         # 【什么】DDL 列表：建表 / 加列 / 建索引，按顺序逐条执行
         # 【作用】新增列一律用 ALTER ... IF NOT EXISTS，老库升级不必重建表，数据不丢
@@ -406,25 +411,27 @@ class PGManager:
         ]
         # 【执行与提交】逐条执行后统一 commit 一次
         #   任一条 DDL 失败会走 except 抛 MemoryException，已执行的因未提交而回滚
-        for sql in ddl:
-            self._cur.execute(sql)
-        self._conn.commit()
-        _logger.info("PG表结构初始化完成（chat_session, chat_history, tool_call_log, review_queue）")
+        for sql in ddl:                                       # 按列表顺序逐条执行 DDL（建表→补列→建索引）
+            self._cur.execute(sql)                            # 执行单条 DDL；失败抛异常，未提交部分整体回滚
+        self._conn.commit()                                   # 全部成功后统一提交，表结构永久生效
+        _logger.info("PG表结构初始化完成（chat_session, chat_history, tool_call_log, review_queue）")  # 启动日志：建表收口
 
     # 【什么】写操作前的心跳探活，断了就重连
     # 【作用】每个对外方法开头都调一次，避免"连接被 PG 掐断后第一次操作直接报错"
+    # 【为什么】PG 服务端会掐死长时间空闲的连接（idle timeout），探活自愈让长驻进程不用重启
     def _reconnect_if_needed(self):
         """连接断开时自动重连（心跳探活 + 失败自愈）。"""
         try:
             self._cur.execute("SELECT 1")           # 最轻的探活语句：能执行就说明连接还活着
-        except Exception:
-            _logger.warning("PG连接断开，尝试重连...")
-            self._connected = False
-            self._connect()
+        except Exception:                                     # 探活失败 = 连接已断（网络抖动/服务端重启等）
+            _logger.warning("PG连接断开，尝试重连...")         # warning 级：发生了自愈，需要被监控看见
+            self._connected = False                           # 清掉"已连"标记，保持状态诚实
+            self._connect()                                   # 重新走完整建连流程（连 + 装扩展 + 建表，均幂等）
 
 
     # 【什么】建一个新会话（给新笔记本贴封面）
     # 【作用】每轮对话落库前先确保会话存在；异常向外抛，由上层决定是否降级
+    # 【为什么】会话是记忆的容器，容器建不出来后续落库全是空谈，必须让上层感知失败
     @handle_exception(default=None, log_msg="创建会话异常", reraise=True)
     def create_session(self, session_id: str, user_id: str, title: str = "") -> None:
         """创建新会话（相当于给新笔记本贴封面）。
@@ -441,17 +448,18 @@ class PGManager:
             不写这句 → 重复调用会直接崩："duplicate key value violates unique constraint"
             类比 JS：Map.set 之前先 has() 检查一遍；或理解为 upsert 的"只插不覆盖"版本。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活：连接断了先自愈
         self._cur.execute(
-            "INSERT INTO chat_session (session_id, user_id, title) VALUES (%s, %s, %s) "
-            "ON CONFLICT (session_id) DO NOTHING",
+            "INSERT INTO chat_session (session_id, user_id, title) VALUES (%s, %s, %s) "  # 插入三列：编号/归属/标题
+            "ON CONFLICT (session_id) DO NOTHING",            # 编号已存在就跳过不报错（幂等插入）
             (session_id, user_id, title),   # 依次填 SQL 里 3 个 %s：会话号 / 用户号 / 标题
         )
-        self._conn.commit()
-        _logger.info(f"会话创建: session={session_id}, user={user_id}")
+        self._conn.commit()                                   # 显式提交，新会话真正落库
+        _logger.info(f"会话创建: session={session_id}, user={user_id}")  # 留创建日志，便于追踪会话生命周期
 
     # 【什么】判断会话是否存在且属于该用户
     # 【作用】server.py 的归属校验专用：只查记录存在性，与 agent_state 内容无关
+    # 【为什么】归属校验是新会话续聊的入口关卡，用 get_session_state 会把空状态新会话误判成不存在
     @handle_exception(default=False, log_msg="校验会话归属异常")
     def session_belongs_to(self, session_id: str, user_id: str) -> bool:
         """会话存在且归属该用户 → True；不存在/不属于/异常 → False。
@@ -460,15 +468,16 @@ class PGManager:
             新会话 agent_state 为 NULL 时会被判成"不存在"，续聊被误拦（403）。
             归属校验只关心"有没有这条记录"，不看状态字段。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
-            "SELECT 1 FROM chat_session WHERE session_id = %s AND user_id = %s",
-            (session_id, user_id),
+            "SELECT 1 FROM chat_session WHERE session_id = %s AND user_id = %s",  # 只查存在性：常数 1 比取整行便宜
+            (session_id, user_id),                            # 两个 %s 按位置绑定：会话号 + 用户号
         )
-        return self._cur.fetchone() is not None
+        return self._cur.fetchone() is not None               # 取到行 = 存在且归属；None = 不存在或不属于你
 
     # 【什么】列出某用户的会话（侧边栏"会话列表"的取数口）
     # 【作用】只取本人、未归档的会话，按最近活跃倒序；异常返回 []，列表页宁可空也不报错
+    # 【为什么】会话列表是展示型数据，拿不到时前端显示空列表即可，弹错误反而打断用户
     @handle_exception(default=[], log_msg="读取会话列表异常")
     def list_user_sessions(self, user_id: str, limit: int = 50) -> list:
         """读取当前用户的会话列表（会话隔离：WHERE 必须带 user_id）。
@@ -480,20 +489,21 @@ class PGManager:
             点开某一条时前端才调 /history/{session_id} 懒加载明细。
         【archived=0 过滤】离职归档/过期清理会话不进用户列表（冷热分离）。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
             """SELECT session_id, title, created_at, updated_at
                FROM chat_session
                WHERE user_id = %s AND archived = 0
                ORDER BY updated_at DESC
                LIMIT %s""",
-            (user_id, limit),
+            (user_id, limit),                                 # %s 顺序：用户号 → 条数上限（默认 50）
         )
-        cols = ("session_id", "title", "created_at", "updated_at")
-        return [dict(zip(cols, row)) for row in self._cur.fetchall()]
+        cols = ("session_id", "title", "created_at", "updated_at")  # 列名顺序与 SELECT 严格对应
+        return [dict(zip(cols, row)) for row in self._cur.fetchall()]  # 每行 tuple 配列名转成 dict 返回
 
     # 【什么】把 Agent 当前进展快照写进会话封面
     # 【作用】断点续跑的落盘端；异常向外抛，让上层知道状态没存成功
+    # 【为什么】状态没落上却假装成功，重启后会从错误断点续跑——比不续跑更糟，必须让上层感知
     @handle_exception(default=None, log_msg="更新会话状态异常", reraise=True)
     def update_session_state(self, session_id: str, agent_state: dict) -> None:
         """更新 Agent 结构化任务状态（支持断点续跑）。
@@ -517,18 +527,19 @@ class PGManager:
         【为什么 agent_state 要 json.dumps？】
             Python 里是 dict，PG 里是 JSONB 列，中间必须转成 JSON 字符串才能传，
             %s 占位符收到的就是这个字符串。
-            ensure_ascii=False → 中文保持原样（否则 "你好" 会被存成 "\\u4f60\\u597d"）
+            ensure_ascii=False → 中文保持原样（否则 "你好" 会被存成 "\u4f60\u597d"）
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
-            "UPDATE chat_session SET agent_state = %s, updated_at = CURRENT_TIMESTAMP "
-            "WHERE session_id = %s",
+            "UPDATE chat_session SET agent_state = %s, updated_at = CURRENT_TIMESTAMP "  # 覆盖整段状态 + 刷新活跃时间
+            "WHERE session_id = %s",                          # 定位目标会话行
             (json.dumps(agent_state, ensure_ascii=False), session_id),  # dict 转 JSON 字符串才能进 JSONB 列
         )
-        self._conn.commit()
+        self._conn.commit()                                   # 显式提交，快照真正落库
 
     # 【什么】读取 Agent 任务状态（断点续跑的读回端）
     # 【作用】同时充当越权校验：WHERE 带 user_id，不属于你的会话返回空 dict
+    # 【为什么】读回状态与鉴权合并成一次查询：不该看的会话连"存在与否"都不该泄露
     @handle_exception(default={}, log_msg="读取会话状态异常")
     def get_session_state(self, session_id: str, user_id: str) -> dict:
         """读取 Agent 任务状态（断点续跑用）。
@@ -550,10 +561,10 @@ class PGManager:
                 row is None         → 压根没这条会话记录
                 row[0] 是空的 {}    → 有记录但状态是空的（{} 是假值）
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
-            "SELECT agent_state FROM chat_session WHERE session_id = %s AND user_id = %s",
-            (session_id, user_id),
+            "SELECT agent_state FROM chat_session WHERE session_id = %s AND user_id = %s",  # 双条件：会话号定位 + 用户号鉴权
+            (session_id, user_id),                            # 两个 %s 按位置绑定
         )
         row = self._cur.fetchone()                  # 取一行；没有匹配行时返回 None
 
@@ -562,6 +573,7 @@ class PGManager:
 
     # 【什么】把一轮对话写进 chat_history（四数据落库）
     # 【作用】记忆的唯一写入口；异常向外抛，上层据此降级，不能静默丢记忆
+    # 【为什么】记忆是 Agent 的核心资产，写失败必须显式暴露——静默丢记忆比报错更难排查
     @handle_exception(default=None, log_msg="保存对话记忆异常", reraise=True)
     def save_history(
         self,
@@ -609,8 +621,8 @@ class PGManager:
                 id=42, session_id="abc123", ... created_at=NOW
             返回: 42（新行的主键 ID，用于后续 add_to_review_queue 关联）
         """
-        self._reconnect_if_needed()
-        import numpy as np
+        self._reconnect_if_needed()                           # 写前探活
+        import numpy as np                                    # 延迟导入：不用记忆功能时不付 numpy 加载代价
         emb = np.array(summary_embedding, dtype=np.float32) if summary_embedding else None    # pgvector 只认 numpy 数组
         q_emb = np.array(query_embedding, dtype=np.float32) if query_embedding else None      # 问句向量同理，可为空
         # ------------------------------------------------------------------
@@ -619,8 +631,8 @@ class PGManager:
         #   PG 的 chat_history 必须落同一个号，否则定时对账会判定为"单边缺失"。
         #   取不到就是空串——宁可空着，也不要造一个假号（假号比空号更难查）。
         # ------------------------------------------------------------------
-        from modules.common import context as req_ctx
-        task_id = task_id or req_ctx.get_task_id()
+        from modules.common import context as req_ctx         # 请求上下文模块：存当前请求的 task_id（延迟导入防循环依赖）
+        task_id = task_id or req_ctx.get_task_id()            # 显式值优先；空串时退回请求上下文里的号
         self._cur.execute(
             """INSERT INTO chat_history
                (session_id, user_id, task_id, user_query, llm_full_answer, llm_summary,
@@ -641,16 +653,17 @@ class PGManager:
         #   放在 commit 之前：与本轮历史同生共死，不会出现"列表时间新了但内容没存上"。
         # ------------------------------------------------------------------
         self._cur.execute(
-            "UPDATE chat_session SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s",
-            (session_id,),
+            "UPDATE chat_session SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s",  # 刷新会话活跃时间
+            (session_id,),                                    # 单个占位符：会话号（注意单元素元组的逗号）
         )
-        self._conn.commit()
+        self._conn.commit()                                   # 两条写（插历史 + 刷封面）同一事务提交
         history_id = row[0] if row else None        # 新对话页的 id，供审核队列回连
-        _logger.info(f"对话记忆保存: history_id={history_id}, session={session_id}")
-        return history_id
+        _logger.info(f"对话记忆保存: history_id={history_id}, session={session_id}")  # 落库日志：哪个会话新增了哪页
+        return history_id                                     # 返回新行主键；极端拿不到行时返回 None
 
     # 【什么】取当前会话最近 N 轮完整对话（短期记忆）
     # 【作用】让模型接得上话；异常返回 []，宁可没有上下文也不中断对话
+    # 【为什么】短期记忆是增强项不是必需项：拿不到时模型靠本轮问句也能回答，不该让对话崩掉
     @handle_exception(default=[], log_msg="读取短期记忆异常")
     def get_short_term_history(self, session_id: str, user_id: str, rounds: int = 3) -> list:
         """读取最近 N 轮完整对话（短期记忆）。
@@ -692,15 +705,15 @@ class PGManager:
             SQL 里必须 DESC 排序才能 LIMIT 到"最新 3 条"（ASC 会取到最老的），
             但拿到的顺序是反的，模型读着别扭，所以翻转成正序再返回。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
             """SELECT user_query, llm_full_answer, llm_summary, created_at
                FROM chat_history
                WHERE session_id = %s AND user_id = %s
                ORDER BY created_at DESC LIMIT %s""",
-            (session_id, user_id, rounds),
+            (session_id, user_id, rounds),                    # %s 顺序：会话号 → 用户号 → 轮数上限
         )
-        rows = self._cur.fetchall()
+        rows = self._cur.fetchall()                           # 取回最新的 N 行（此刻是新→旧倒序）
         rows.reverse()                              # SQL 为取"最新 N 条"用 DESC，这里翻回旧→新的自然语序
         return [
             {"query": r[0], "answer": r[1], "summary": r[2], "time": r[3]}   # 顺序对应 SELECT 的 4 列
@@ -709,6 +722,7 @@ class PGManager:
 
     # 【什么】按摘要向量语义召回历史对话（长期记忆）
     # 【作用】跨会话找语义相近的旧记忆；异常返回 []，不打断本轮对话
+    # 【为什么】长期召回是锦上添花：拿不到时靠短期记忆与当前问句也能回答，对话不能因此中断
     @handle_exception(default=[], log_msg="向量召回历史记忆异常")
     def search_memory_by_vector(self, query_embedding: list, user_id: str, top_k: int = 3) -> list:
         """
@@ -761,8 +775,8 @@ class PGManager:
                 → 这些拼成 memory_context 塞回 prompt，让 LLM 知道"以前聊过类似话题"
                 → 若用户问的是数学题，召回历史也涉及数学，模型回答更连贯
         """
-        self._reconnect_if_needed()
-        import numpy as np
+        self._reconnect_if_needed()                           # 读前探活
+        import numpy as np                                    # 延迟导入 numpy，理由同 save_history
         emb = np.array(query_embedding, dtype=np.float32)   # 问句向量，与历史摘要向量做余弦距离比较
         # ------------------------------------------------------------------
         # 【记忆状态过滤】COALESCE(memory_status,'active')='active'
@@ -804,7 +818,7 @@ class PGManager:
         #   2) 客户端游标：execute 时结果已全读进本机内存，fetchall 省不了内存，
         #      要流式取数需用命名游标 conn.cursor(name=...)。批量任务留意这点。
         # ------------------------------------------------------------------
-        rows = self._cur.fetchall()
+        rows = self._cur.fetchall()                           # 取回 top_k 行结果集（已按相似度降序）
         return [
             {
                 "query": r[0], "summary": r[1], "answer": r[2],      # 原问句 / 摘要 / 完整原文
@@ -826,6 +840,7 @@ class PGManager:
     # ------------------------------------------------------------------
     # 【什么】查同用户中与新记忆高度相似的旧记忆（冲突检测）
     # 【作用】相似度 ≥ threshold 的第一条旧记忆即判定为冲突；无冲突返回 None
+    # 【为什么】检测失败返回 None 会走"照常插入"分支——最坏只是两条并存，不会误杀旧记忆
     @handle_exception(default=None, log_msg="记忆冲突检测异常")
     def find_conflict_memory(
         self, summary_embedding: list, user_id: str,
@@ -844,7 +859,7 @@ class PGManager:
             召回答的是"像不像"（宽进），冲突答的是"是不是同一件事"（严判）。
             0.65 会让"我住上海"和"我去上海出差"被判成冲突，误杀正常记忆。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         # 【为什么 numpy 在函数内 import】延迟导入：numpy 是重依赖，
         #   不用记忆功能（如纯计算器对话）时不付出加载代价；也避免模块顶部强依赖
         import numpy as np
@@ -858,14 +873,14 @@ class PGManager:
         # 【exclude_id 是什么】更新场景下，库里"新记忆"已经插进去了，
         #   回头查冲突时若不排除自己，最相似的必然是它自己（相似度≈1），
         #   查重形同虚设。cond 只在需要排除时拼进 SQL，保持常态查询最短。
-        cond = " AND id <> %s" if exclude_id else ""
+        cond = " AND id <> %s" if exclude_id else ""          # 需要排除自身时才拼这段 SQL，常态保持空串
         # 【参数顺序必须与 SQL 里 %s 出现顺序严格一致】（psycopg2 按位置绑定，不是按名字）：
         #   SELECT 投影里 1 个 emb → user_id → WHERE 相似度里的 emb → 阈值 →（可选 exclude_id）
         # 【为什么传 1-threshold】pgvector 的 <=> 返回的是"余弦距离"（0=同向，2=反向），
         #   相似度 = 1 - 距离；要"相似度 ≥ 0.90"就得改写成"距离 ≤ 0.10"，即 1-0.90
-        params = [emb, user_id, emb, 1 - float(threshold)]
+        params = [emb, user_id, emb, 1 - float(threshold)]    # 按 %s 出现顺序组参：相似度向量→用户→过滤向量→距离上限
         if exclude_id:
-            params.append(exclude_id)
+            params.append(exclude_id)                         # 有排除需求时追加第 5 个参数
         self._cur.execute(
             # 【SQL 逐段解读】
             # SELECT ... <=> 是 pgvector 余弦距离算子；1-距离 就是常说的余弦相似度（-1~1）
@@ -888,10 +903,11 @@ class PGManager:
         row = self._cur.fetchone()   # LIMIT 1 → 最多一行；没有冲突时拿到 None
         if not row:
             return None              # 无相似旧记忆：调用方走"直接插入新记忆"分支
-        return {"id": row[0], "summary": row[1], "similarity": round(float(row[2]), 4)}
+        return {"id": row[0], "summary": row[1], "similarity": round(float(row[2]), 4)}  # 冲突记忆三要素：主键/摘要/相似度
 
     # 【什么】把一条旧记忆标记为"已被新记忆取代"
     # 【作用】UPDATE 状态列 + 记录取代者的 id；返回是否真的更新了行
+    # 【为什么】逻辑删除而非物理删除：留下 superseded_by 指针，整条取代链可审计可回溯
     @handle_exception(default=False, log_msg="记忆取代标记异常")
     def supersede_memory(self, memory_id: int, superseded_by: int) -> bool:
         """
@@ -903,21 +919,22 @@ class PGManager:
                        superseded_by=57 WHERE id=42 AND memory_status='active'
             输出: True（rowcount=1）；若 42 已是 superseded（重复调用）→ False
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
             """UPDATE chat_history
                SET memory_status = 'superseded', superseded_by = %s
                WHERE id = %s AND COALESCE(memory_status, 'active') = 'active'""",
-            (superseded_by, memory_id),
+            (superseded_by, memory_id),                       # %s 顺序：新条 id → 旧条 id（WHERE 的 active 条件防重复取代）
         )
-        updated = self._cur.rowcount > 0
-        self._conn.commit()
+        updated = self._cur.rowcount > 0                      # 受影响行数 > 0 才算真改到了行
+        self._conn.commit()                                   # 显式提交，状态变更落库
         if updated:
-            _logger.info(f"记忆冲突处理: 旧记忆 id={memory_id} 已被 id={superseded_by} 取代")
-        return updated
+            _logger.info(f"记忆冲突处理: 旧记忆 id={memory_id} 已被 id={superseded_by} 取代")  # 取代链审计日志
+        return updated                                        # 重复调用（已是 superseded）时返回 False
 
     # 【什么】历史数据回填：把老记录的 user_query 向量写进 query_embedding 列
     # 【作用】为将来的「重复提问检测」备数据；当前检索不用它，属于提前准备
+    # 【为什么】改造前入库的老数据没有问句向量，将来上重复提问检测时会漏检——提前补票
     @handle_exception(default=0, log_msg="回填问句向量异常")
     def backfill_query_embeddings(self, user_id: str | None = None, batch_size: int = 64) -> int:
         """
@@ -937,9 +954,9 @@ class PGManager:
 
         返回：实际回填的行数。
         """
-        self._reconnect_if_needed()
-        import numpy as np
-        from modules.memory.embedding_service import get_embedding_service
+        self._reconnect_if_needed()                           # 读写前探活
+        import numpy as np                                    # 延迟导入 numpy，转 pgvector 需要的数组形状
+        from modules.memory.embedding_service import get_embedding_service  # 延迟导入向量服务，避免模块级循环依赖
 
         svc = get_embedding_service()               # 复用向量服务单例，内部自动按 64 条切批
         # 【筛选意图】只捞问句向量为空、且问句非空的行：已回填过的不会重算，故可重复执行
@@ -948,37 +965,38 @@ class PGManager:
             "WHERE query_embedding IS NULL AND user_query IS NOT NULL AND user_query <> ''"
         )
         total = 0                                   # 累计回填行数，最终作为返回值
-        while True:
-            params = []
-            sql = base_sql
+        while True:                                           # 分批循环：每批处理 batch_size 条，直到取空
+            params = []                                       # 本批 SQL 参数，按拼接顺序收集
+            sql = base_sql                                    # 从基础查询出发，按需追加条件
             if user_id:                             # 传了就只补这一个用户，不传全量补
-                sql += " AND user_id = %s"
-                params.append(user_id)
+                sql += " AND user_id = %s"                    # 追加用户过滤条件
+                params.append(user_id)                        # 参数同步追加
             sql += " ORDER BY id LIMIT %s"          # 按主键顺序取一批，保证不重不漏
             params.append(batch_size)               # 每批 batch_size 条（默认 64）
 
-            self._cur.execute(sql, params)
-            rows = self._cur.fetchall()
-            if not rows:
-                break
+            self._cur.execute(sql, params)                    # 执行本批查询
+            rows = self._cur.fetchall()                       # 取回本批待回填行
+            if not rows:                                      # 一行都没取到 = 全部回填完毕
+                break                                         # 退出循环
 
             ids = [r[0] for r in rows]                      # 本批主键，UPDATE 时按 id 定位
             vectors = svc.embed_batch([r[1] for r in rows]) # 本批问句向量，与 ids 一一对应
-            self._cur.executemany(
+            self._cur.executemany(                            # 批量 UPDATE：比逐条 execute 省 N-1 次网络往返
                 "UPDATE chat_history SET query_embedding = %s WHERE id = %s",
-                [(np.array(v, dtype=np.float32), _id) for _id, v in zip(ids, vectors)],
+                [(np.array(v, dtype=np.float32), _id) for _id, v in zip(ids, vectors)],  # (向量, 主键) 二元组列表
             )
-            self._conn.commit()
-            total += len(ids)
-            _logger.info(f"回填问句向量: 本批 {len(ids)} 行，累计 {total} 行")
+            self._conn.commit()                               # 每批独立提交：中途失败只丢本批，已完成的不用重跑
+            total += len(ids)                                 # 累计已回填行数
+            _logger.info(f"回填问句向量: 本批 {len(ids)} 行，累计 {total} 行")  # 分批进度日志，便于观察长任务
             if len(rows) < batch_size:              # 取到的不足一批 = 已到末尾，结束循环
                 break
-        _logger.info(f"回填问句向量完成: 共 {total} 行")
-        return total
+        _logger.info(f"回填问句向量完成: 共 {total} 行")       # 收口日志：本次任务总量
+        return total                                          # 返回实际回填行数
 
 
     # 【什么】记录一次工具调用的全量信息
     # 【作用】排障、性能分析、安全审计的依据；异常只记日志，不阻断对话
+    # 【为什么】工具流水是旁路审计数据：记不上不该影响主对话流程，所以异常不向上抛
     @handle_exception(default=None, log_msg="保存工具日志异常")
     def save_tool_log(
         self, session_id: str, user_id: str,          # 哪个会话、哪个用户触发的
@@ -1011,24 +1029,25 @@ class PGManager:
             ② 性能优化：duration_ms 能看出哪个工具慢，拖慢整体响应
             ③ 安全审计：谁在什么时间调用了什么，事后可追溯（企业级合规要求）
         """
-        from modules.common import context as req_ctx
-        task_id = task_id or req_ctx.get_task_id()
-        self._reconnect_if_needed()
+        from modules.common import context as req_ctx         # 请求上下文：取当前请求的 task_id（延迟导入防循环依赖）
+        task_id = task_id or req_ctx.get_task_id()            # 显式值优先；空串时退回请求上下文
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
             """INSERT INTO tool_call_log
                (session_id, user_id, task_id, tool_name, tool_type, tool_input, tool_output, status, duration_ms)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
-                session_id, user_id, task_id, tool_name, tool_type,
+                session_id, user_id, task_id, tool_name, tool_type,  # 前 5 个 %s：归属三件套 + 工具名 + 工具类型
                 json.dumps(tool_input, ensure_ascii=False),  # dict 转 JSON 字符串才能进 JSONB 列
-                tool_output, status, duration_ms,
+                tool_output, status, duration_ms,            # 后 3 个 %s：出参文本 + 状态 + 耗时毫秒
             ),
         )
-        self._conn.commit()
+        self._conn.commit()                                   # 显式提交，流水落库
 
 
     # 【什么】把一轮对话挂进人工审核队列
     # 【作用】高风险内容先不直接采信，插旗等人复核；history_id 让审核员能回看原文
+    # 【为什么】AI 拿不准的内容需要人来兜底；记原文指针而非原文副本，避免敏感内容多处冗余存储
     @handle_exception(default=None, log_msg="加入审核队列异常")
     def add_to_review_queue(
         self, session_id: str, user_id: str,              # 定位会话与用户
@@ -1056,17 +1075,18 @@ class PGManager:
             它指向 chat_history 的那一行，审核员点开就能看到完整对话上下文，
             而不是只看被挑出来的那一句话。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
             """INSERT INTO review_queue (session_id, user_id, history_id, content, review_type)
                VALUES (%s, %s, %s, %s, %s)""",
-            (session_id, user_id, history_id, content, review_type),
+            (session_id, user_id, history_id, content, review_type),  # 5 个 %s 按 SELECT 列序绑定
         )
-        self._conn.commit()
-        _logger.info(f"加入审核队列: history_id={history_id}, type={review_type}")
+        self._conn.commit()                                   # 显式提交，审核条目落库
+        _logger.info(f"加入审核队列: history_id={history_id}, type={review_type}")  # 审核入口日志
 
     # 【什么】查询待人工审核的记录列表
     # 【作用】供管理页展示待办清单；异常返回 []，页面不至于白屏
+    # 【为什么】审核列表是运营页面，查询失败时显示空清单比报错页更可用
     @handle_exception(default=[], log_msg="查询待审核列表异常")
     def get_pending_reviews(self, limit: int = 20) -> list:
         """查询待人工审核的记录列表（也就是所有插着小红旗、还没处理的页）。
@@ -1089,83 +1109,87 @@ class PGManager:
             下次再查就不会重复出现，相当于一个待办清单。
             API 层对应路由 GET /reviews/pending，前端管理页直接展示这个列表。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         # 【筛选意图】status='pending' 只捞未处理的；审核后变 approved/rejected，不会再出现在清单里
         self._cur.execute(
             """SELECT id, session_id, user_id, history_id, content, review_type, created_at
                FROM review_queue WHERE status = 'pending'
                ORDER BY created_at DESC LIMIT %s""",
-            (limit,),
+            (limit,),                                         # 单占位符：条数上限（默认 20）
         )
         return [
             {"id": r[0], "session_id": r[1], "user_id": r[2], "history_id": r[3],
              "content": r[4], "review_type": r[5], "created_at": r[6]}
-            for r in self._cur.fetchall()
+            for r in self._cur.fetchall()                     # 每行 tuple 按下标映射成 dict
         ]
 
     # 【什么】审核处置：pending 改为 approved / rejected
     # 【作用】记录审核人与意见，返回是否真的改到了行；异常返回 False
+    # 【为什么】WHERE 带上 pending 条件：处置动作幂等，已处置的行不会被后到的请求覆盖结论
     @handle_exception(default=False, log_msg="审核处置异常")
     def update_review_status(
         self, review_id: int, status: str, reviewer: str, note: str = ""
     ) -> bool:
         """人工审核处置：把 pending 置为 approved / rejected，并记录审核人与意见。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         # 【筛选意图】WHERE 带 status='pending'：已处置过的行不会被重复改，审核结论不会被覆盖
         self._cur.execute(
             """UPDATE review_queue
                SET status=%s, reviewer=%s, review_note=%s, reviewed_at=CURRENT_TIMESTAMP
                WHERE id=%s AND status='pending'""",
-            (status, reviewer, note, review_id),
+            (status, reviewer, note, review_id),              # %s 顺序：新状态→审核人→意见→目标行 id
         )
-        self._conn.commit()
+        self._conn.commit()                                   # 显式提交，处置结果落库
         return self._cur.rowcount > 0           # 0 行受影响 = id 不存在或已处置过，返回 False
 
     # 【什么】把人工修正后的标准答案写入标准答案库
     # 【作用】审核结论反哺 Few-shot，下次同类问题可直接给标准答案
+    # 【为什么】人工审核的价值不只在纠错，更在沉淀——入库后同类问题不再依赖 LLM 现场发挥
     @handle_exception(default=None, log_msg="标准答案入库异常")
     def add_standard_answer(
         self, question: str, answer: str, source_review_id: int | None = None   # 溯源：来自哪条审核记录
     ) -> int | None:
         """审核沉淀：把人工修正后的标准答案写入标准答案库，反哺 Few-shot。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
             """INSERT INTO standard_answers (question, answer, source_review_id)
                VALUES (%s, %s, %s) RETURNING id""",
-            (question, answer, source_review_id),
+            (question, answer, source_review_id),             # 3 个 %s：标准问 + 标准答 + 溯源审核单号（可空）
         )
-        new_id = self._cur.fetchone()[0]
-        self._conn.commit()
-        _logger.info(f"标准答案入库: id={new_id} source_review={source_review_id}")
-        return new_id
+        new_id = self._cur.fetchone()[0]                      # RETURNING id：取回新行主键
+        self._conn.commit()                                   # 显式提交，标准答案落库
+        _logger.info(f"标准答案入库: id={new_id} source_review={source_review_id}")  # 沉淀日志：含溯源指针
+        return new_id                                         # 返回新行主键，供上层回显或关联
 
     # 【什么】关键词粗匹配标准答案库
     # 【作用】命中后作为 Few-shot 投喂模型；异常返回 []，走正常回答流程
+    # 【为什么】标准答案是加速通道：匹配失败时退回正常 LLM 回答，功能只是变回"没有加速"而非故障
     @handle_exception(default=[], log_msg="标准答案召回异常")
     def match_standard_answers(self, query: str, limit: int = 2) -> list:
         """关键词匹配标准答案库，命中后作为 Few-shot 投喂模型（人工审核沉淀反哺）。
 
         PG 的 simple 全文配置对中文不分词，故这里用 ILIKE 做关键词粗匹配。
         """
-        import re
+        import re                                             # 延迟导入正则模块，抽关键词用
         kws = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}", query)   # 中文取 2 字以上，英数取 2 字符以上
         kws.sort(key=len, reverse=True)                                   # 长词优先：越长的词区分度越高
         kws = kws[:3]                                                     # 最多取 3 个关键词，控制 SQL 条件数
         if not kws:
             return []                                                     # 一个关键词都抽不出就直接放弃匹配
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                                       # 读前探活
         where = " OR ".join(["question ILIKE %s"] * len(kws))   # 任一关键词命中即算匹配，ILIKE 忽略大小写
         self._cur.execute(
             f"SELECT id, question, answer FROM standard_answers WHERE {where} LIMIT %s",
-            (*[f"%{k}%" for k in kws], limit),
+            (*[f"%{k}%" for k in kws], limit),                # 每个关键词包成 %词% 通配形式，最后追加 limit
         )
         return [
             {"id": r[0], "question": r[1], "answer": r[2]}
-            for r in self._cur.fetchall()
+            for r in self._cur.fetchall()                     # 每行 tuple 映射成 dict 返回
         ]
 
     # 【什么】统计指定用户未归档的会话数
     # 【作用】离职对账用，只读不写；异常返回 {}，对账方按 0 处理
+    # 【为什么】对账场景下查不到数应当作"0 个会话"继续走流程，而不是让整批对账任务崩掉
     @handle_exception(default={}, log_msg="活跃会话统计异常")
     def count_active_sessions(self, user_codes: list) -> dict:
         """统计指定用户未归档的会话数（离职对账用，只读不写）。
@@ -1173,18 +1197,19 @@ class PGManager:
         输入 ["U001","U005"] → {"U001": 3, "U005": 0}
         """
         if not user_codes:
-            return {}
-        self._reconnect_if_needed()
+            return {}                                         # 空列表直接返回空 dict，省一次数据库往返
+        self._reconnect_if_needed()                           # 读前探活
         # 【筛选意图】ANY(%s) 一次匹配整批用户；archived = 0 只数未归档（还活着）的会话
         self._cur.execute(
             """SELECT user_id, COUNT(*) FROM chat_session
                WHERE user_id = ANY(%s) AND archived = 0 GROUP BY user_id""",
-            (list(user_codes),),
+            (list(user_codes),),                              # ANY 需要数组参数，list() 兜底防传入生成器
         )
-        return {r[0]: r[1] for r in self._cur.fetchall()}
+        return {r[0]: r[1] for r in self._cur.fetchall()}     # 组装 {用户号: 会话数}；没会话的用户不在结果里
 
     # 【什么】把指定用户的会话标记为已归档（离职处置第一步）
     # 【作用】只打标不删数据；异常返回 0，调用方据此知道没标成
+    # 【为什么】先打标后删除的两段式设计：打标可逆、立即可做，删除等保留期到了再执行，防误删
     @handle_exception(default=0, log_msg="会话归档异常")
     def archive_user_sessions(self, user_codes: list) -> int:
         """把指定用户的会话标记为归档（离职处置第一步，只打标不删数据）。
@@ -1192,39 +1217,41 @@ class PGManager:
         输入 user_codes=["U001","U005"] → 返回被标记的会话行数（已归档的不重复计）。
         """
         if not user_codes:
-            return 0
-        self._reconnect_if_needed()
+            return 0                                          # 空列表直接返回 0，省一次数据库往返
+        self._reconnect_if_needed()                           # 写前探活
         # 【筛选意图】archived = 0 保证已归档的不重复计；updated_at 同步刷新，作为保留期起算点
         self._cur.execute(
             """UPDATE chat_session
                SET archived = 1, updated_at = CURRENT_TIMESTAMP
                WHERE user_id = ANY(%s) AND archived = 0""",
-            (list(user_codes),),
+            (list(user_codes),),                              # ANY 数组参数：一批用户号一次 UPDATE 完
         )
-        n = self._cur.rowcount
-        self._conn.commit()
+        n = self._cur.rowcount                                # 实际打标的行数
+        self._conn.commit()                                   # 显式提交，归档标记落库
         if n:
-            _logger.info(f"会话归档: users={len(user_codes)} sessions={n}")
-        return n
+            _logger.info(f"会话归档: users={len(user_codes)} sessions={n}")  # 有实际变更才打日志
+        return n                                              # 返回打标行数；0 = 没有可归档的会话
 
     # 【什么】列出已归档用户及其会话数
     # 【作用】保留期清理前的对账视图；异常返回 []，不阻断清理流程
+    # 【为什么】清理任务看到的是"空清单"就该跳过本次清理，而不是因查询失败让整条流水线停摆
     @handle_exception(default=[], log_msg="归档用户查询异常")
     def list_archived_users(self, limit: int = 100) -> list:
         """列出已被归档的用户及其会话数（保留期清理前的对账视图）。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         # 【筛选意图】archived = 1 只统计已归档用户；按最后更新时间倒序，最近处置的排前面
         self._cur.execute(
             """SELECT user_id, COUNT(*) AS sessions, MAX(updated_at) AS archived_at
                FROM chat_session WHERE archived = 1
                GROUP BY user_id ORDER BY archived_at DESC LIMIT %s""",
-            (limit,),
+            (limit,),                                         # 单占位符：条数上限（默认 100）
         )
-        rows = self._cur.fetchall()
-        return [{"user_id": r[0], "sessions": r[1], "archived_at": str(r[2])} for r in rows]
+        rows = self._cur.fetchall()                           # 取回聚合结果行
+        return [{"user_id": r[0], "sessions": r[1], "archived_at": str(r[2])} for r in rows]  # 时间转字符串便于 JSON 序列化
 
     # 【什么】删除已归档且超保留期的会话数据（离职处置第二步）
     # 【作用】真正落删；先删工具流水再删会话，异常返回 None 由调用方判断
+    # 【为什么】返回 None 而非 0 区分"没删成"与"没有可删的"：清理任务需要对失败单独告警
     @handle_exception(default=None, log_msg="过期数据清理异常")
     def purge_archived_data(self, retention_days: int) -> dict:
         """删除归档且超过保留期的会话数据（离职处置第二步，真正落删）。
@@ -1232,7 +1259,7 @@ class PGManager:
         chat_history 外键带 ON DELETE CASCADE，删 session 会连带删除对话页；
         tool_call_log 无外键，需单独删。review_queue 属治理证据，保留不删。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 写前探活
         # 【筛选意图】只删"已归档 且 更新时间早于 now - 保留天数"的会话；tool_call_log 无外键，先单独删
         self._cur.execute(
             "DELETE FROM tool_call_log WHERE session_id IN "
@@ -1245,17 +1272,18 @@ class PGManager:
         self._cur.execute(
             "DELETE FROM chat_session WHERE archived = 1 "
             " AND updated_at < CURRENT_TIMESTAMP - make_interval(days => %s)",
-            (int(retention_days),),
+            (int(retention_days),),                           # 同一保留期参数再绑一次
         )
         session_rows = self._cur.rowcount                 # 本次删掉的会话行数（不含级联的对话页）
-        self._conn.commit()
+        self._conn.commit()                                   # 两条 DELETE 同一事务提交：要么都删要么都不删
         if session_rows:
-            _logger.info(f"过期数据清理: sessions={session_rows} tool_logs={tool_rows}")
+            _logger.info(f"过期数据清理: sessions={session_rows} tool_logs={tool_rows}")  # 有实际删除才打日志
         return {"retention_days": retention_days, "sessions_deleted": session_rows,
                 "tool_logs_deleted": tool_rows}           # 两个计数均取自 rowcount
 
     # 【什么】取最近 N 小时写入的 task_id（两张表的并集）
     # 【作用】跨库对账用：拿它与 MySQL 审计流水比对找单边缺失；异常返回 []
+    # 【为什么】对账比对的是"有号"的记录；老数据没号是已知债务，参与比对只会制造噪音
     @handle_exception(default=[], log_msg="task_id 列表查询异常")
     def list_task_ids_since(self, hours: int = 24, limit: int = 5000) -> list:
         """取最近 N 小时写入的 task_id（chat_history ∪ tool_call_log），供跨库对账。
@@ -1263,7 +1291,7 @@ class PGManager:
         输入 hours=24 → ["T-20260920-3f9c1a2b", "T-20260920-91ad44e0"]
         空 task_id 的行不参与（对账只比有号的，老数据没有号是已知的债）。
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         # 【筛选意图】task_id <> '' 排掉老数据（无号是已知债务）；UNION 自动去重，两表同一号只算一次
         self._cur.execute(
             "SELECT task_id FROM chat_history "
@@ -1272,75 +1300,93 @@ class PGManager:
             "SELECT task_id FROM tool_call_log "
             "WHERE task_id <> '' AND created_at >= CURRENT_TIMESTAMP - make_interval(hours => %s) "
             "LIMIT %s",
-            (int(hours), int(hours), int(limit)),
+            (int(hours), int(hours), int(limit)),             # 3 个 %s：上半段小时数 → 下半段小时数 → 条数上限
         )
-        return [r[0] for r in self._cur.fetchall() if r[0]]
+        return [r[0] for r in self._cur.fetchall() if r[0]]   # 拍平成字符串列表；if r[0] 再兜一层空串
 
+    # 【什么】列出已归档且超保留期的 session_id
+    # 【作用】冷热分离/清理前的目标清单；异常返回 []，清理方按"无可清理"处理
+    # 【为什么】清单查询失败时按空清单跳过本次清理最安全——绝不能因查询异常而误删
     @handle_exception(default=[], log_msg="待归档会话查询异常")
     def list_archived_session_ids(self, retention_days: int, limit: int = 500) -> list:
         """列出已归档且超保留期的 session_id（冷热分离/清理前的目标清单）。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
             "SELECT session_id FROM chat_session WHERE archived = 1 "
             "AND updated_at < CURRENT_TIMESTAMP - make_interval(days => %s) LIMIT %s",
-            (int(retention_days), int(limit)),
+            (int(retention_days), int(limit)),                # %s 顺序：保留天数 → 条数上限（防一次取太多）
         )
-        return [r[0] for r in self._cur.fetchall()]
+        return [r[0] for r in self._cur.fetchall()]           # 拍平成 session_id 字符串列表
 
+    # 【什么】列出超过热数据保留期的 session_id（不看归档标记）
+    # 【作用】冷热分离用：老会话不管有没有归档标记都要搬走；异常返回 []
+    # 【为什么】与 list_archived_session_ids 的区别：那条管"离职归档"，这条管"自然过期"，两条线独立
     @handle_exception(default=[], log_msg="过期会话查询异常")
     def list_expired_session_ids(self, retention_days: int, limit: int = 500) -> list:
         """列出超过热数据保留期的 session_id（冷热分离用，不看 archived 标记）。
 
         输入 retention_days=90 → ["s-1", "s-2"]（90 天内有更新的会话不在此列）
         """
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         self._cur.execute(
             "SELECT session_id FROM chat_session "
             "WHERE updated_at < CURRENT_TIMESTAMP - make_interval(days => %s) LIMIT %s",
-            (int(retention_days), int(limit)),
+            (int(retention_days), int(limit)),                # %s 顺序：保留天数 → 条数上限
         )
-        return [r[0] for r in self._cur.fetchall()]
+        return [r[0] for r in self._cur.fetchall()]           # 拍平成 session_id 字符串列表
 
+    # 【什么】导出一个会话的全部对话页
+    # 【作用】归档用：把热库数据完整读出写到冷存储；只读不删
+    # 【为什么】导出与删除分离：先确保冷存储落盘成功，才轮到 delete_sessions 删热库，防数据丢失
     @handle_exception(default=[], log_msg="会话历史导出异常")
     def fetch_history_by_session(self, session_id: str) -> list:
         """导出一个会话的全部对话页（归档用，不删数据）。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         cols = ["id", "session_id", "user_id", "task_id", "user_query", "llm_full_answer",
-                "llm_summary", "tool_call_log", "rag_sources", "created_at"]
+                "llm_summary", "tool_call_log", "rag_sources", "created_at"]  # 导出列清单：全业务字段但不含向量（向量体积大、冷存储不需要）
         self._cur.execute(
-            f"SELECT {', '.join(cols)} FROM chat_history WHERE session_id = %s ORDER BY id",
-            (session_id,),
+            f"SELECT {', '.join(cols)} FROM chat_history WHERE session_id = %s ORDER BY id",  # 按主键升序导出，保持写入顺序
+            (session_id,),                                    # 单占位符：会话号
         )
-        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]  # 每行 tuple 配列名转 dict，便于 JSON 序列化归档
 
+    # 【什么】导出一个会话的全部工具流水
+    # 【作用】归档用：与对话页一起搬到冷存储，保证审计链完整
+    # 【为什么】tool_call_log 无外键级联，删除时也是单独删——导出同样要单独导，不能漏
     @handle_exception(default=[], log_msg="工具日志导出异常")
     def fetch_tool_logs_by_session(self, session_id: str) -> list:
         """导出一个会话的全部工具流水（归档用）。"""
-        self._reconnect_if_needed()
+        self._reconnect_if_needed()                           # 读前探活
         cols = ["id", "session_id", "user_id", "task_id", "tool_name", "tool_type",
-                "tool_input", "tool_output", "status", "duration_ms", "created_at"]
+                "tool_input", "tool_output", "status", "duration_ms", "created_at"]  # 导出列清单：流水全字段
         self._cur.execute(
-            f"SELECT {', '.join(cols)} FROM tool_call_log WHERE session_id = %s ORDER BY id",
-            (session_id,),
+            f"SELECT {', '.join(cols)} FROM tool_call_log WHERE session_id = %s ORDER BY id",  # 按主键升序导出
+            (session_id,),                                    # 单占位符：会话号
         )
-        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]  # 每行 tuple 配列名转 dict
 
+    # 【什么】按 session_id 批量删除会话及其关联数据
+    # 【作用】冷热分离的最后一步：冷存储已落盘后才调它删热库；对话页靠外键级联删除
+    # 【为什么】先删无外键的 tool_call_log 再删 chat_session：顺序反了会留下孤儿工具流水
     @handle_exception(default=0, log_msg="会话删除异常")
     def delete_sessions(self, session_ids: list) -> int:
         """按 session_id 批量删除（工具流水 + 会话，对话页靠外键级联删除）。"""
         if not session_ids:
-            return 0
-        self._reconnect_if_needed()
+            return 0                                          # 空列表直接返回 0，防 ANY(空数组) 的边界行为
+        self._reconnect_if_needed()                           # 写前探活
         self._cur.execute(
-            "DELETE FROM tool_call_log WHERE session_id = ANY(%s)", (list(session_ids),)
+            "DELETE FROM tool_call_log WHERE session_id = ANY(%s)", (list(session_ids),)  # 先删无外键的工具流水
         )
         self._cur.execute(
-            "DELETE FROM chat_session WHERE session_id = ANY(%s)", (list(session_ids),)
+            "DELETE FROM chat_session WHERE session_id = ANY(%s)", (list(session_ids),)   # 再删会话；对话页级联删除
         )
-        n = self._cur.rowcount
-        self._conn.commit()
-        return n
+        n = self._cur.rowcount                                # 删掉的会话行数（取自第二条 DELETE）
+        self._conn.commit()                                   # 两条 DELETE 同一事务提交
+        return n                                              # 返回删除行数；0 = 没有匹配的会话
 
+    # 【什么】关闭游标与连接（进程退出前的收尾）
+    # 【作用】释放服务端连接资源；hasattr 守卫保证"连没连上都敢调"
+    # 【为什么】建连失败时对象上没有 _cur/_conn，裸调 close 会用 AttributeError 盖掉真正的连接错误
     def close(self):
         """关闭连接（合上笔记本、锁门）。
 
@@ -1355,8 +1401,8 @@ class PGManager:
             加这层判断，保证「连没连上都敢调 close()」。
             类比 JS：if (this.db) this.db.end()
         """
-        if hasattr(self, "_cur"):
-            self._cur.close()
-        if hasattr(self, "_conn"):
-            self._conn.close()
-        _logger.info("PG连接已关闭")
+        if hasattr(self, "_cur"):                             # 游标存在才关：建连失败时对象上没有这个属性
+            self._cur.close()                                 # 关闭游标，释放结果集等资源
+        if hasattr(self, "_conn"):                            # 连接存在才关，理由同上
+            self._conn.close()                                # 关闭连接，释放服务端会话
+        _logger.info("PG连接已关闭")                          # 收尾日志：进程生命周期事件

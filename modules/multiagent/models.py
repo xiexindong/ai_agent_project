@@ -16,12 +16,12 @@
     3. 序列化 —— RunResult.model_dump() 直接能进 API 响应和 trace 落库
     4. 默认与边界 —— 步数、超时、并行度的下限由 Field(ge=1) 这类约束守住
 """
-import time
-import uuid
-from enum import Enum
-from typing import Any, Literal, Optional
+import time                                                                     # 取毫秒时间戳用
+import uuid                                                                     # 生成短 ID 用
+from enum import Enum                                                           # 角色/状态等枚举的基类
+from typing import Any, Literal, Optional                                       # 类型注解：任意值/字面量集合/可空
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator         # 数据契约四件套：模型/字段/字段校验/整模校验
 
 
 # 【什么】生成带前缀的短 ID
@@ -34,7 +34,7 @@ def new_id(prefix: str) -> str:
 # 【什么】当前时间的毫秒时间戳
 # 【作用】给 TraceEvent.ts 等字段兜底，统一成毫秒避免与秒混用出错
 def now_ms() -> int:
-    return int(time.time() * 1000)
+    return int(time.time() * 1000)                                              # 秒级时间戳乘 1000 取整，得到毫秒
 
 
 # 【什么】Agent 角色枚举
@@ -42,11 +42,11 @@ def now_ms() -> int:
 class AgentRole(str, Enum):
     """Agent 角色。supervisor 是调度者，其余是执行者。"""
 
-    SUPERVISOR = "supervisor"
-    RESEARCHER = "researcher"
-    ANALYST = "analyst"
-    REVIEWER = "reviewer"
-    GENERAL = "general"
+    SUPERVISOR = "supervisor"    # 调度者：拆任务、派活、汇总
+    RESEARCHER = "researcher"    # 研究员：查资料、找事实
+    ANALYST = "analyst"          # 分析师：做计算、对比、归因
+    REVIEWER = "reviewer"        # 审核员：终审草稿质量
+    GENERAL = "general"          # 通用角色：兜底问答
 
 
 # 【什么】一个 Agent 的静态定义
@@ -78,9 +78,9 @@ class AgentSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def _name_not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("Agent 名称不能为空")
-        return v.strip()
+        if not v.strip():                                       # 全空白视为空名
+            raise ValueError("Agent 名称不能为空")               # 入口拦截，不让它进花名册
+        return v.strip()                                        # 去掉首尾空白后入库，避免 " a " 和 "a" 被当成两个人
 
 
 # 【什么】主管拆出来的一个子任务
@@ -119,25 +119,25 @@ class PlanResult(BaseModel):
     # 【作用】防止模型两边都返回空，导致 harness 派 0 个任务还得等汇总
     @model_validator(mode="after")
     def _must_have_plan_or_answer(self) -> "PlanResult":
-        if not self.subtasks and not self.direct_answer.strip():
-            raise ValueError("PlanResult 必须给出 subtasks 或 direct_answer 之一")
-        return self
+        if not self.subtasks and not self.direct_answer.strip():    # 两边都空 = 模型没给可用计划
+            raise ValueError("PlanResult 必须给出 subtasks 或 direct_answer 之一")  # 当场报错，不让静默失败往下流
+        return self                                                  # 校验通过，返回自身（pydantic 约定）
 
     # 【什么】校验子任务 id 不重复
     # 【作用】id 是 ctx.upstream 的字典键，重复会互相覆盖导致上游产出丢失
     @field_validator("subtasks")
     @classmethod
     def _unique_ids(cls, v: list[SubTask]) -> list[SubTask]:
-        ids = [t.id for t in v]
-        if len(ids) != len(set(ids)):
-            raise ValueError(f"子任务 id 重复: {ids}")
-        return v
+        ids = [t.id for t in v]                                 # 把所有子任务 id 抽成一个列表
+        if len(ids) != len(set(ids)):                           # 列表长度 ≠ 集合长度 ⇒ 有重复
+            raise ValueError(f"子任务 id 重复: {ids}")           # 带上完整 id 列表，方便排查是谁撞了
+        return v                                                 # 无重复则原样返回
 
     # 【什么】是否走「直接答」分支
     # 【作用】harness 据此跳过派活，直接把 direct_answer 原样返回
     @property
     def is_direct(self) -> bool:
-        return not self.subtasks
+        return not self.subtasks                                  # 子任务列表为空 ⇒ 走直接答分支
 
 
 # 【什么】单个 Agent 一次执行的产出
@@ -146,15 +146,15 @@ class AgentOutput(BaseModel):
     """单个 Agent 一次执行的产出。失败也用这个结构表达，success=False + error。"""
 
     agent: str = Field(description="执行的 Agent 名称")
-    role: AgentRole = Field(default=AgentRole.GENERAL)
+    role: AgentRole = Field(default=AgentRole.GENERAL)                         # 默认兜底为通用角色
     task_id: str = Field(default="", description="对应 SubTask.id；supervisor 步骤为空")
     content: str = Field(default="", description="产出正文")
-    success: bool = Field(default=True)
-    error: str = Field(default="")
-    steps: int = Field(default=1, description="实际推理步数")
-    tool_calls: list[dict] = Field(default_factory=list)
-    duration_ms: int = Field(default=0)
-    multimodal: bool = Field(default=False, description="本次是否处理了多模态输入")
+    success: bool = Field(default=True)                                        # 默认 True：正常流程产出成功，失败时显式置 False
+    error: str = Field(default="")                                             # 失败原因；成功时留空
+    steps: int = Field(default=1, description="实际推理步数")                   # 至少算 1 步（纯文本回答也算一步）
+    tool_calls: list[dict] = Field(default_factory=list)                       # 本次执行调用的工具清单
+    duration_ms: int = Field(default=0)                                        # 本次执行耗时（毫秒）
+    multimodal: bool = Field(default=False, description="本次是否处理了多模态输入")  # 默认无多模态
     # 【委派痕迹】本次执行中"我转出去的活"与"我是被谁转来的"
     #   单独存而不混进 content：content 是给模型看的正文，
     #   委派链是给人看的账——谁把什么转给了谁、成没成，排查协作链路时靠它
@@ -188,7 +188,7 @@ class AgentOutput(BaseModel):
 class DelegationRecord(BaseModel):
     """一条委派记录（进台账、进 RunResult.delegations、进 trace）。"""
 
-    id: str = Field(default_factory=lambda: new_id("dlg"))
+    id: str = Field(default_factory=lambda: new_id("dlg"))                    # 自动生成 dlg_xxxxxxxx 形式的短 ID
     from_agent: str = Field(description="委派方 Agent 名")
     to_agent: str = Field(description="受托方 Agent 名")
     instruction: str = Field(default="", description="转出去的具体指令")
@@ -196,11 +196,11 @@ class DelegationRecord(BaseModel):
     parent_task_id: str = Field(default="", description="委派方当时在做的 SubTask.id")
     depth: int = Field(default=0, ge=0, description="委派层级：主管派的活是 0，转一次 +1")
     chain: list[str] = Field(default_factory=list, description="委派链（含委派方），用于防环")
-    success: bool = Field(default=False)
+    success: bool = Field(default=False)                                       # 默认 False：执行成功后才被显式置 True
     content: str = Field(default="", description="受托方产出")
     error: str = Field(default="", description="失败原因")
-    duration_ms: int = Field(default=0)
-    ts: int = Field(default_factory=now_ms)
+    duration_ms: int = Field(default=0)                                        # 本次委派耗时（毫秒）
+    ts: int = Field(default_factory=now_ms)                                    # 记录创建时刻（毫秒时间戳）
 
     # 【什么】人类可读的一条委派
     # 【作用】日志与 trace 里一眼看到"A 把活转给了 B，成没成"
@@ -229,20 +229,20 @@ class DelegationDecision(BaseModel):
     # 【作用】模型漏字段时不抛异常、不派空任务，主流程照常往下走
     @model_validator(mode="after")
     def _downgrade_incomplete(self) -> "DelegationDecision":
-        if self.should_delegate and (not self.to_agent.strip() or not self.instruction.strip()):
-            self.should_delegate = False
-        return self
+        if self.should_delegate and (not self.to_agent.strip() or not self.instruction.strip()):  # 想委派但缺受托方或指令
+            self.should_delegate = False                         # 降级成"不委派"，主流程不受影响
+        return self                                               # 返回（可能已降级的）决策本身
 
 
 # 【什么】trace 事件类型字面量集合
 # 【作用】TraceEvent.kind 与 harness/crewai 的 _emit(kind=...) 共用同一套取值，
 #        写错字符串在类型检查阶段就暴露，不用等运行时才发现 trace 里混进未知类型
 TraceKind = Literal[
-    "plan", "dispatch", "agent_start", "agent_end",
-    "synthesize", "review", "done", "error",
+    "plan", "dispatch", "agent_start", "agent_end",          # 基本编排事件：规划/派活/起止
+    "synthesize", "review", "done", "error",                  # 汇总/审核/完成/异常
     # 下面四个是协调与人工介入环节的事件，和上面同一套取值空间，
     # 写错字符串同样在类型检查阶段暴露
-    "consensus", "arbitration", "hitl", "replan",
+    "consensus", "arbitration", "hitl", "replan",             # 一致性/仲裁/人工/重规划
     # delegate：委派（把活转给别人）与派活分开记——排查"这个产出为什么不是原定的人做的"时，
     # 这两种来源必须能区分开
     "delegate",
@@ -264,7 +264,7 @@ class TraceEvent(BaseModel):
 # 【什么】一次团队运行的状态枚举
 # 【作用】区分「成功 / 部分成功 / 失败 / 超时」四种结局，给监控与评测用
 class RunStatus(str, Enum):
-    SUCCESS = "success"
+    SUCCESS = "success"      # 全部按计划走完且有最终答案
     PARTIAL = "partial"      # 有 worker 失败，但仍有汇总答案
     FAILED = "failed"        # 没有任何可用产出
     TIMEOUT = "timeout"      # 撞上总 deadline，任务未跑完
@@ -275,13 +275,13 @@ class RunStatus(str, Enum):
 class RunResult(BaseModel):
     """一次团队运行的完整结果（可直接作为 API 响应体）。"""
 
-    run_id: str = Field(default_factory=lambda: new_id("run"))
-    query: str = Field(default="")
-    status: RunStatus = Field(default=RunStatus.SUCCESS)
-    plan: Optional[PlanResult] = None
-    outputs: list[AgentOutput] = Field(default_factory=list)
-    final_answer: str = Field(default="")
-    review: Optional[AgentOutput] = None
+    run_id: str = Field(default_factory=lambda: new_id("run"))                 # 自动生成 run_xxxxxxxx 短 ID
+    query: str = Field(default="")                                              # 用户的原始提问，trace 排查时对照用
+    status: RunStatus = Field(default=RunStatus.SUCCESS)                       # 默认成功，异常时降级为 PARTIAL/FAILED/TIMEOUT
+    plan: Optional[PlanResult] = None                                          # 主管的规划结果；None 表示还没规划或已销毁
+    outputs: list[AgentOutput] = Field(default_factory=list)                   # 所有执行者的产出（含失败）
+    final_answer: str = Field(default="")                                      # 汇总后的最终答案
+    review: Optional[AgentOutput] = None                                       # 审核结论；未开启审核时为 None
     # 【什么】协调环节的三个结果
     # 【作用】与 outputs 分开存：outputs 是"执行者干了什么"，
     #        这三项是"团队如何收敛"——排查"为什么选了这个答案"时看它们
@@ -310,13 +310,13 @@ class RunResult(BaseModel):
     # 【作用】SUCCESS 与 PARTIAL 都算通过；FAILED/TIMEOUT 不算
     @property
     def ok(self) -> bool:
-        return self.status in (RunStatus.SUCCESS, RunStatus.PARTIAL)
+        return self.status in (RunStatus.SUCCESS, RunStatus.PARTIAL)  # 成功或部分成功都算可用答案
 
     # 【什么】列出执行失败的 Agent 名
     # 【作用】用于最终状态的降级判断与评测里的「完成率」计算
     @property
     def failed_agents(self) -> list[str]:
-        return [o.agent for o in self.outputs if not o.success]
+        return [o.agent for o in self.outputs if not o.success]      # 筛出 success=False 的产出，取其 agent 名
 
 
 # 【什么】团队运行参数配置
@@ -393,13 +393,13 @@ class TeamConfig(BaseModel):
     # 【作用】保证 Agent 名不重名、且至少有一个启用状态的 supervisor
     @model_validator(mode="after")
     def _check_team(self) -> "TeamConfig":
-        names = [a.name for a in self.agents if a.enabled]
-        if len(names) != len(set(names)):
-            raise ValueError(f"Agent 名称重复: {names}")
-        if self.agents and not any(a.role == AgentRole.SUPERVISOR for a in self.agents if a.enabled):
-            raise ValueError("团队必须包含且仅包含一个 enabled 的 supervisor")
-        known = {a.name for a in self.agents}
-        return self
+        names = [a.name for a in self.agents if a.enabled]       # 只校验启用状态的 Agent，停用的不纳入花名册
+        if len(names) != len(set(names)):                        # 名称长度与集合长度不一致 ⇒ 有重名
+            raise ValueError(f"Agent 名称重复: {names}")          # 抛错阻止重复注册，避免派活时指代不清
+        if self.agents and not any(a.role == AgentRole.SUPERVISOR for a in self.agents if a.enabled):  # 团队非空时查 supervisor
+            raise ValueError("团队必须包含且仅包含一个 enabled 的 supervisor")  # 没主管就没人收口，派活链路断掉
+        known = {a.name for a in self.agents}                     # 构建名字集合（方便后续校验 delegate_to 是否在花名册中）
+        return self                                               # 校验通过
 
 
 # 【什么】一个评测用例
@@ -407,11 +407,11 @@ class TeamConfig(BaseModel):
 class EvalCase(BaseModel):
     """一个评测用例。关键词命中 = 最朴素也最实用的回归测试。"""
 
-    name: str
-    query: str
+    name: str                                                                  # 用例名（如"查营收"），评测报告里展示
+    query: str                                                                 # 发给团队的问题
     expected_keywords: list[str] = Field(default_factory=list, description="答案里应出现的关键词")
     max_duration_ms: int = Field(default=20000, description="超时即判不通过")   # 默认 20 秒
-    require_all_agents: bool = Field(default=False, description="是否要求所有 Agent 都成功")
+    require_all_agents: bool = Field(default=False, description="是否要求所有 Agent 都成功")  # 默认允许部分成功
 
 
 # 【什么】单条用例的评测结果
@@ -441,7 +441,7 @@ class EvalReport(BaseModel):
     # 【作用】返回「通过数/总数」字符串，便于直接打印和写入日志
     @property
     def pass_rate(self) -> str:
-        return f"{self.passed}/{self.total}"
+        return f"{self.passed}/{self.total}"                      # 返回「通过数/总数」字符串，日志里一眼看出比例
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +492,7 @@ class AgentMessage(BaseModel):
     # 【什么】判断某 Agent 是否能看到这条消息
     # 【作用】广播（receiver="*"）对所有人可见，点对点消息只给指定接收者
     def visible_to(self, name: str) -> bool:
-        return self.receiver == "*" or self.receiver == name
+        return self.receiver == "*" or self.receiver == name      # 广播消息全员可见；否则仅匹配指定接收者
 
 
 # 【什么】多个产出之间的一致性判定结果
@@ -548,32 +548,32 @@ def json_schema_hint(model: type[BaseModel]) -> str:
     #   Python dict 的字符串表示是单引号（{'a': 'b'}），不是合法 JSON。
     #   直接塞进 prompt 会让模型学到一个错误示范：它可能照抄单引号，
     #   而 json.loads 只认双引号 —— 于是解析失败，还得再花一轮重试。
-    import json
-    return json.dumps(_simplify(model.model_json_schema(), model.model_json_schema()),
-                      ensure_ascii=False)
+    import json                                                  # 延迟导入：仅在此函数被调时才加载 json 模块
+    return json.dumps(_simplify(model.model_json_schema(), model.model_json_schema()),  # 先取原始 schema 再递归压缩
+                      ensure_ascii=False)                        # ensure_ascii=False：中文字段描述不被转义成 \uXXXX，直接可读
 
 
 # 【什么】递归压缩 JSON Schema 的内部实现
 # 【作用】逐层把 object/array/enum 变成「字段名→类型」，并处理 $ref 解引用
 def _simplify(node: dict, root: dict) -> Any:
     """递归把 JSON Schema 压成"字段名→类型"的紧凑结构（带 $ref 解引用）。"""
-    if "$ref" in node:
-        ref = node["$ref"].split("/")[-1]   # "#/$defs/SubTask" → "SubTask"
-        return _simplify(root.get("$defs", {}).get(ref, {}), root)
-    t = node.get("type")
-    if t == "object" or "properties" in node:
-        props = node.get("properties", {})
-        return {k: _simplify(v, root) for k, v in props.items()}
-    if t == "array":
-        items = node.get("items", {})
-        return [_simplify(items, root)] if items else ["any"]
-    if isinstance(t, list):
-        return t[0]
-    if t:
-        return t
-    if "enum" in node:
-        return "enum"
-    return "any"
+    if "$ref" in node:                                            # 遇到引用节点，说明真正的定义在 root["$defs"] 里
+        ref = node["$ref"].split("/")[-1]                         # "#/$defs/SubTask" → "SubTask"
+        return _simplify(root.get("$defs", {}).get(ref, {}), root)  # 从根 schema 里找到定义并递归
+    t = node.get("type")                                          # 取当前节点的 type 字段（object / array / string / …）
+    if t == "object" or "properties" in node:                     # 对象类型：逐字段递归
+        props = node.get("properties", {})                        # 拿到字段名 → 子 schema 的字典
+        return {k: _simplify(v, root) for k, v in props.items()}  # 每个字段递归压缩，再组装成 {字段名: 类型}
+    if t == "array":                                              # 数组类型：压成单元素列表表示
+        items = node.get("items", {})                             # 取元素 schema
+        return [_simplify(items, root)] if items else ["any"]     # 有元素定义则递归，没有就用 "any" 占位
+    if isinstance(t, list):                                       # type 为列表（如 ["string","null"]）表示可空联合
+        return t[0]                                               # 取第一个主类型作为提示（"null" 通常放第二位）
+    if t:                                                         # 基础标量类型（string / integer / boolean / …）
+        return t                                                  # 直接返回类型名
+    if "enum" in node:                                            # 枚举类型没有 type，只有 enum 列表
+        return "enum"                                             # 统一压成 "enum" 字样，避免把整段枚举值塞进 prompt
+    return "any"                                                  # 兜底：识别不了就当 any，避免阻塞主流程
 
 
 # ---------------------------------------------------------------------------

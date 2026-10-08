@@ -6,16 +6,17 @@
 """
 # 【什么】标准库与项目内依赖
 # 【作用】handle_exception 统一兜异常、count_tokens 判长短、get_registry 取提示词模板
-from modules.common.logger import get_logger
-from modules.common.exceptions import LLMException, handle_exception
-from modules.common.token_counter import count_tokens
-from modules.prompt import get_registry
+from modules.common.logger import get_logger                  # 统一日志工厂，产出带 "summary" 前缀的 logger
+from modules.common.exceptions import LLMException, handle_exception  # LLM 层异常类型（本文件未直接用）+ 统一兜底装饰器
+from modules.common.token_counter import count_tokens         # token 计数：判断答案长短，决定是否省掉 LLM 调用
+from modules.prompt import get_registry                       # 提示词注册表：取 summary / merge 两个模板
 
 _logger = get_logger("summary")                     # 模块级日志器，前缀 summary
 
 
 # 【什么】调用 LLM 生成 / 合并摘要的生成器
 # 【作用】把长对话压成一句话，是向量入库与上下文投喂的输入源
+# 【为什么】摘要是长期记忆的"检索标题"——向量库里存的是摘要的向量，摘要质量直接决定召回质量
 class SummaryGenerator:
     """LLM 摘要生成器。
 
@@ -28,14 +29,16 @@ class SummaryGenerator:
 
     # 【什么】持有 LLM 客户端，未传就自建
     # 【作用】函数内延迟导入避开循环依赖；测试时可注入假 client 替换真实 LLM
+    # 【为什么】依赖注入让单测不用真的调 LLM；延迟导入让"只导入本模块"不触发 agent 层的加载
     def __init__(self, llm_client=None):
-        if llm_client is None:
-            from modules.agent.llm import LLMClient
-            llm_client = LLMClient()
+        if llm_client is None:                                # 外部没注入客户端才自建（正常生产路径）
+            from modules.agent.llm import LLMClient           # 延迟导入：避免与 agent 层产生模块级循环依赖
+            llm_client = LLMClient()                          # 自建真实 LLM 客户端
         self._llm = llm_client                      # 实际发请求的对象，两个方法都只用它 invoke
 
     # 【什么】为单轮对话生成一句话摘要
     # 【作用】短答案直接截断省掉 LLM 调用，长答案才拼提示词交给 LLM 压成一句
+    # 【为什么】短答案本身就是一句话，再调 LLM 压缩是纯浪费钱与延迟——100 token 是成本分水岭
     # ------------------------------------------------------------------
     # 【这个装饰器在干什么】handle_exception 是本项目自研的「异常统一处理」装饰器
     #   （实现在 modules/common/exceptions.py），一次干三件事：
@@ -89,28 +92,32 @@ class SummaryGenerator:
     @handle_exception(default=None, log_msg="摘要生成异常", reraise=True)
     def generate_summary(self, query: str, answer: str) -> str:
         """为一轮对话生成精简摘要。"""
-        if not answer:
+        if not answer:                                        # 答案为空（None/空串）时没法摘要
             return query[:50]                       # 没有回答时，用提问的前 50 字当摘要
         if count_tokens(answer) < 100:              # 100 token 以内算短答案，不再调 LLM
             return answer[:50].replace("\n", " ").strip()    # 取前 50 字，去掉换行与首尾空白
+        # 【设计意图】超长输入先截断再入模板：提问截 500 字、回答截 2000 字，
+        #   既给 LLM 足够语境，又防止整篇长文灌进 prompt 推高费用与延迟
         prompt = get_registry().render(
             "summary", query=query[:500], answer=answer[:2000]   # 提问截 500 字、回答截 2000 字再入模板
         )
-        summary = self._llm.invoke(prompt)
+        summary = self._llm.invoke(prompt)                    # 调 LLM 生成摘要（内部自带重试）
         #"***Hello***" text = "   Hello World!   " text = "\n\t Hello World! \n" ==> hello
-        summary = summary.strip().strip('"').strip("'")
-        _logger.debug(f"摘要生成: query='{query[:30]}...' -> summary='{summary[:50]}...'")
-        return summary
+        summary = summary.strip().strip('"').strip("'")       # 三段清洗：去首尾空白 → 去外层双引号 → 去外层单引号（LLM 爱给输出加引号）
+        _logger.debug(f"摘要生成: query='{query[:30]}...' -> summary='{summary[:50]}...'")  # debug 级留痕，各截 30/50 字防爆日志
+        return summary                                        # 返回一句话摘要，供入库与上下文投喂
 
     # 【什么】把多条久远摘要合并成一条全局摘要
     # 【作用】上下文超阈值时的压缩手段，一条换多条以省 token；失败返回 None 由上层判断
+    # 【为什么】压缩失败返回 None 而非抛异常：上层用 `if not merged:` 接住后原样保留多条，
+    #           宁可上下文超 token 也不丢历史内容——这是非关键路径的容错风格
     @handle_exception(default=None, log_msg="历史摘要合并异常")
     def merge_summaries(self, summaries: list[str]) -> str:
         """合并多个久远摘要为全局摘要（上下文压缩用）。"""
-        if not summaries:
-            return ""
-        if len(summaries) == 1:
-            return summaries[0]
+        if not summaries:                                     # 空列表无可合并
+            return ""                                         # 返回空串，上层 `if not merged:` 判为失败走兜底
+        if len(summaries) == 1:                               # 只有一条时无需合并
+            return summaries[0]                               # 原样返回，省一次 LLM 调用
         # 给每条摘要加上「序号. 」前缀，再用换行拼成一整段，填进 merge 模板的 {summaries}。
         #
         #   处理前  summaries = ['用户问了 3*5 等于多少', '用户问了今天天气', '用户问了股票走势']
@@ -132,8 +139,8 @@ class SummaryGenerator:
         #
         # 边界：本行只处理 2 条及以上 —— 空列表在第 105-106 行 return ""，
         #       单条在第 107-108 行 return summaries[0]，都走不到这里。
-        joined: str = "\n".join(f"{i+1}. {s}" for i, s in enumerate(summaries))
-        
-        prompt = get_registry().render("merge", summaries=joined)
-        merged = self._llm.invoke(prompt)
-        return merged.strip()
+        joined: str = "\n".join(f"{i+1}. {s}" for i, s in enumerate(summaries))  # 加序号前缀并换行拼接，编号让 LLM 分清时间先后
+
+        prompt = get_registry().render("merge", summaries=joined)  # 把编号后的摘要列表填进 merge 模板
+        merged = self._llm.invoke(prompt)                     # 调 LLM 合成一条全局摘要（内部自带重试）
+        return merged.strip()                                 # 去首尾空白后返回；失败时装饰器兜成 None 交上层判断

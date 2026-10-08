@@ -13,18 +13,19 @@ JS 类比：相当于项目里统一封装第三方接口的 axios service 模�
 """
 # 【什么】标准库与项目内依赖
 # 【作用】time 控批次间隔、tenacity 提供重试装饰器、LLMException 抛向量错误、get_settings 读模型与维度
-import time
-from typing import List
-from tenacity import retry, stop_after_attempt, wait_exponential
-from modules.common.logger import get_logger
-from modules.common.exceptions import LLMException, handle_exception
-from config import get_settings
+import time                                                   # 批间停顿用：sleep(0.3) 避免打满智谱 QPS 被限流
+from typing import List                                       # 类型标注：文本列表 / 向量列表
+from tenacity import retry, stop_after_attempt, wait_exponential  # 重试三件套：装饰器 + 停止条件 + 指数退避间隔
+from modules.common.logger import get_logger                  # 统一日志工厂，产出带 "embedding" 前缀的 logger
+from modules.common.exceptions import LLMException, handle_exception  # LLM 层异常类型 + 统一兜底装饰器（本文件只用前者）
+from config import get_settings                               # 全局配置：API Key / 模型名 / 向量维度都从它读
 
 _logger = get_logger("embedding")                   # 模块级日志器，前缀 embedding
 
 
 # 【什么】智谱 embedding-2 的向量生成服务（单例）
 # 【作用】全项目唯一的文字转向量出口，RAG 入库与记忆召回共用同一份客户端
+# 【为什么】SDK 客户端与 API Key 是进程级资源，单例避免每个调用方各建一份连接与配置
 class EmbeddingService:
     """智谱 embedding-2 向量生成服务（1024维）。"""
 
@@ -33,27 +34,30 @@ class EmbeddingService:
 
     # 【什么】控制实例只创建一次
     # 【作用】反复调用 EmbeddingService() 拿到同一个对象，避免重复建客户端
+    # 【为什么】单例的"唯一性"在 __new__ 层保证：对象只分配一次，后续调用直接返回旧实例
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        if cls._instance is None:                             # 还没建过实例才走创建分支
+            cls._instance = super().__new__(cls)              # 调父类 object.__new__ 真正分配对象
+        return cls._instance                                  # 已建过则直接返回旧实例，保证全局唯一
 
     # 【什么】初始化 SDK 客户端并固化模型名与维度
     # 【作用】_client 已存在就跳过，保证单例下连接只建一次；失败即抛，不做降级
+    # 【为什么】没有 API Key 或 SDK 缺失时装出"能用"的样子，会在首次调用时才爆雷——启动期失败更易定位
     def __init__(self):
-        if self._client is None:
-            s = get_settings()
+        if self._client is None:                              # 客户端已建过就整段跳过（单例下 __init__ 会反复跑）
+            s = get_settings()                                # 读全局配置：API Key / 模型名 / 维度
             try:
-                from zhipuai import ZhipuAI
+                from zhipuai import ZhipuAI                   # 延迟导入 SDK：不用向量功能时不付加载代价
                 self._client = ZhipuAI(api_key=s.zhipu_api_key)     # zhipuai SDK 客户端
                 self._model = s.embedding_model                     # 模型名，默认 embedding-2
                 self._dim = s.embedding_dimension                   # 向量维度，默认 1024
-                _logger.info(f"Embedding服务初始化: model={self._model}, dim={self._dim}")
+                _logger.info(f"Embedding服务初始化: model={self._model}, dim={self._dim}")  # 启动日志：用的哪个模型多少维
             except Exception as e:
-                raise LLMException("Embedding服务初始化失败", str(e))
+                raise LLMException("Embedding服务初始化失败", str(e))  # 包装成 LLM 层异常向上抛，启动即失败
 
     # 【什么】唯一真正发网络请求算向量的一层
     # 【作用】单一出口：重试、日志、异常处理只在这处做，上层的 embed / embed_batch 只整理参数
+    # 【为什么】所有网络调用收敛到一处：换供应商、改重试策略、加监控都只改这一个函数
     # ------------------------------------------------------------------
     # 【这个装饰器在干什么】给下面的 API 调用自动套一层「失败重试」
     #   被装饰后，_embed_batch() 调用失败不会立刻抛错，tenacity 会自动再调几次。
@@ -117,7 +121,7 @@ class EmbeddingService:
                 智谱 embedding-2 API
             好处是「单一出口」：重试、日志、异常处理只需在这一处做，改一处全局生效。
         """
-        s = get_settings()
+        s = get_settings()                                    # 读全局配置（当前函数体未直接用，保留统一取数习惯）
 
         # 【举个最简单的例子，一眼看懂这个函数在干什么】
         #   输入 texts（3 条文本）：
@@ -140,10 +144,11 @@ class EmbeddingService:
         # 注意「单次最多 64 条」是智谱 API 的硬限制，本函数只写进了文档、
         # 没有代码校验，所以切分责任实际落在上层 embed_batch() 身上。
         #
-     
+
+        # 【设计意图】整批一次请求而非逐条循环：把网络往返从 N 次降到 1 次，吞吐量主导因素从延迟变成带宽
         resp = self._client.embeddings.create(
             model=self._model,   # 智谱 embedding-2
-            input=texts,
+            input=texts,                                    # 整批文本列表，与返回向量按顺序一一对应
         )
         # 拆包：SDK 返回的是一串对象，每项形如
         #   {"object": "embedding", "index": 0, "embedding": [0.023, -0.011, ... 共1024个]}
@@ -158,54 +163,58 @@ class EmbeddingService:
         #      严谨写法：sorted(resp.data, key=lambda x: x.index)
         # 向量检索里「顺序即语义」，错位等于数据损坏却不抛异常，
         # 属于「静默全失败」的同类问题。
-        return [item.embedding for item in resp.data]
+        return [item.embedding for item in resp.data]         # 剥掉 SDK 对象壳，只留 1024 维数值列表
 
     # 【什么】单条文本转向量
     # 【作用】记忆系统存取一条记忆向量时用；空文本直接返回全零向量，省一次 API 调用
+    # 【为什么】空文本调 API 是浪费钱且结果无意义；全零向量与任何向量的相似度都低，天然被阈值滤掉
     def embed(self, text: str) -> List[float]:
         """生成单条文本的向量。"""
-        if not text or not text.strip():
+        if not text or not text.strip():                      # None / 空串 / 纯空白三种情况都按空文本处理
             # 意思是：把 [0.0] 这个列表，重复 5 次
             #result = [0.0] * 5
             # 运行结果：[0.0, 0.0, 0.0, 0.0, 0.0]
-            
+
             return [0.0] * self._dim    # 全零向量，长度 = _dim（默认 1024）；不调 API
         try:
-            vectors = self._embed_batch([text.strip()])
-            return vectors[0]
+            vectors = self._embed_batch([text.strip()])       # 去首尾空白后包成单元素列表，复用批量通道
+            return vectors[0]                                 # 批量返回里取第 0 条，还原成单向量
         except Exception as e:
-            _logger.error(f"向量生成失败: {e}")
-            raise LLMException("向量生成失败", str(e))
+            _logger.error(f"向量生成失败: {e}")               # 先落错误日志，保留原始异常信息
+            raise LLMException("向量生成失败", str(e))        # 包装成 LLM 层异常向上抛，由调用方决定降级策略
 
     # 【什么】批量文本转向量，自动按 64 条切批
     # 【作用】RAG 文档入库用；单批失败只把该批填成全零向量，不拖垮其它批次
+    # 【为什么】大批入库时某一批网络故障不该让整个任务重来——坏批填零向量占位，好批照常入库
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """批量生成向量，自动分批（智谱单次限制64条）。"""
-        results = []
+        results = []                                          # 收集所有批次的向量，顺序与输入 texts 一一对应
         batch_size = 64                 # 智谱 API 单批硬上限 64 条；这里是切批步长
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+        for i in range(0, len(texts), batch_size):            # 按 64 条为步长切片：0-63、64-127、...
+            batch = texts[i:i + batch_size]                   # 取出当前批（最后一批可能不足 64 条）
             try:
-                vectors = self._embed_batch(batch)
-                results.extend(vectors)
-                _logger.debug(f"批量向量生成: batch {i//batch_size+1}, size={len(batch)}")
+                vectors = self._embed_batch(batch)            # 调唯一网络出口（自带 3 次重试）
+                results.extend(vectors)                       # 成功批次的向量按序并入结果
+                _logger.debug(f"批量向量生成: batch {i//batch_size+1}, size={len(batch)}")  # debug 级进度，常规不刷屏
             except Exception as e:
-                _logger.error(f"批次{i//batch_size+1}生成失败: {e}")
-                results.extend([[0.0] * self._dim] * len(batch))
+                _logger.error(f"批次{i//batch_size+1}生成失败: {e}")  # error 级：哪一批坏了要能被监控看见
+                results.extend([[0.0] * self._dim] * len(batch))   # 坏批填等长全零向量，保证结果条数与输入对齐
             # 批间停顿 0.3 秒：仅当还有下一批时才睡，避免打满智谱 QPS 被限流
-            if i + batch_size < len(texts):
-                time.sleep(0.3)
-        return results
+            if i + batch_size < len(texts):                   # 当前批不是最后一批才需要停顿
+                time.sleep(0.3)                               # 限流保护：0.3 秒间隔把 QPS 压在安全线内
+        return results                                        # 返回全部向量；坏批位置是全零向量，会被相似度阈值天然滤掉
 
     # 【什么】对外暴露向量维度
     # 【作用】建表定 vector(1024)、造全零向量都读它，避免维度被写死在多处
+    # 【为什么】维度是跨模块契约（PG 建表、记忆管理、本服务三处共用），单一出口改一处全局生效
     @property
     def dimension(self) -> int:
-        return self._dim
+        return self._dim                                      # 只读属性：外部不能改，防止维度被运行期篡改
 
 
 # 【什么】获取向量服务的全局单例
 # 【作用】统一入口，调用方不必自己 new，全进程共用一个客户端
+# 【为什么】把"是单例"这个事实从调用方代码里抹掉——调用方只关心"拿到服务"，不关心实例管理
 def get_embedding_service() -> EmbeddingService:
     """获取 Embedding 服务单例。"""
-    return EmbeddingService()
+    return EmbeddingService()                                 # 触发 __new__ 单例逻辑：首次建、后续返回同一对象

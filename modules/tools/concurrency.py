@@ -71,19 +71,19 @@
            这正是 ToolInstancePool 可行的底层原因：每个实例开自己的游标，天然不串。
            （本项目 pg_manager.py 单线程模型，全类共用 self._cur；多线程场景需池化。）
 """
-import threading
-import time
-from typing import Any, Callable, Dict, Optional
+import threading  # 线程模块：Semaphore/Lock/Condition 都来自这里
+import time  # 时间模块：算 deadline 用 time.time()
+from typing import Any, Callable, Dict, Optional  # 类型注解：任意/可调用/字典/可选
 
-from modules.common.logger import get_logger
-from config import get_settings
+from modules.common.logger import get_logger  # 统一日志工厂
+from config import get_settings  # 全局配置：读 tool_max_concurrent 默认值
 
-_logger = get_logger("tool.concurrency")
+_logger = get_logger("tool.concurrency")  # 模块级 logger：本文件日志统一带 "tool.concurrency" 前缀
 
 
 # 【什么】同名工具的并发闸门（信号量 + 在途统计）
 # 【作用】限制"同名工具同时执行中的请求数"，超出的阻塞排队，不拒绝
-class ToolConcurrencyGuard:
+class ToolConcurrencyGuard:  # 并发闸门类：同名工具一把 Semaphore，限制同时在跑的请求数
     """按工具名限流的并发闸门：每名一把 Semaphore，全局一张统计账。
 
     【输入输出对照】max_concurrent=2，4 个线程同时调同一个工具：
@@ -115,11 +115,11 @@ class ToolConcurrencyGuard:
         对屋里谁在写 self 一无所知——所以它认为一切正常。
     """
 
-    def __init__(self, max_concurrent: Optional[int] = None):
-        s = get_settings()
+    def __init__(self, max_concurrent: Optional[int] = None):  # 构造：None 时从全局配置读默认值
+        s = get_settings()  # 拿全局配置对象
         # 默认 4 来自 config.TOOL_MAX_CONCURRENT；max(1,...) 保底：传 0 会变成全程串行
-        self._default_limit = max(1, int(max_concurrent if max_concurrent is not None
-                                          else getattr(s, "tool_max_concurrent", 4)))
+        self._default_limit = max(1, int(max_concurrent if max_concurrent is not None  # 显式传了就用传入值
+                                          else getattr(s, "tool_max_concurrent", 4)))  # 否则读配置；兜底默认 4；max(1,...) 防负数或 0
         self._sems: Dict[str, threading.Semaphore] = {}    # 工具名 → 信号量
         self._in_flight: Dict[str, int] = {}               # 工具名 → 正在执行中的请求数（观测用）
         self._max_seen: Dict[str, int] = {}                # 工具名 → 历史同时在执行峰值
@@ -127,39 +127,39 @@ class ToolConcurrencyGuard:
 
     # 【什么】取（必要时新建）某工具的信号量
     # 【作用】懒创建：没被并发调过的工具不占资源；上限沿用创建时的默认值
-    def _semaphore(self, name: str) -> threading.Semaphore:
+    def _semaphore(self, name: str) -> threading.Semaphore:  # 取该工具的 Semaphore，没有就现造一把
         with self._lock:                       # 拿锁查表：防止两个线程同时给同一工具造第二把闸门
-            if name not in self._sems:
+            if name not in self._sems:  # 该工具还没造过闸门
                 self._sems[name] = threading.Semaphore(self._default_limit)   # 首次用到才造（懒创建）；Semaphore = 计数器闸门，初始值即上限：acquire 减 1（减不动排队），release 加 1（放行一个排队者）
-            return self._sems[name]
+            return self._sems[name]  # 返回该工具的 Semaphore 实例
 
     # 【什么】带闸门执行一次工具调用
     # 【作用】acquire → 记账 → 执行 → release，函数本身不吞异常（异常也保证 release）
-    def execute(self, name: str, fn: Callable[[], Any]) -> Any:
+    def execute(self, name: str, fn: Callable[[], Any]) -> Any:  # 包一层执行：name=工具名，fn=真正干活的调用
         sem = self._semaphore(name)            # 拿这把工具的闸门（第一次用则现造）
         acquired = sem.acquire(timeout=30)     # 最多等 30 秒；排队超时说明下游已严重堆积
-        if not acquired:
-            raise TimeoutError(f"工具 {name} 并发排队超时(30s)，当前在途 {self.in_flight(name)}")
-        try:
+        if not acquired:  # 30 秒还没等到名额
+            raise TimeoutError(f"工具 {name} 并发排队超时(30s)，当前在途 {self.in_flight(name)}")  # 抛超时让上层感知
+        try:  # 拿到名额后的主路径
             with self._lock:                   # 在途数 +1（拿锁记一笔账，纯观测用，不拦人）
-                cur = self._in_flight.get(name, 0) + 1
-                self._in_flight[name] = cur
-                self._max_seen[name] = max(self._max_seen.get(name, 0), cur)
+                cur = self._in_flight.get(name, 0) + 1  # 当前在途 +1
+                self._in_flight[name] = cur  # 写回账本
+                self._max_seen[name] = max(self._max_seen.get(name, 0), cur)  # 更新历史峰值
             return fn()                        # 真正执行工具调用（成功或抛异常都算"这一趟结束"）
-        finally:
+        finally:  # 无论成功失败都要走这里
             with self._lock:                   # 在途数 -1，无论 fn 成功/失败都执行（账实相符）
-                self._in_flight[name] = self._in_flight.get(name, 1) - 1
+                self._in_flight[name] = self._in_flight.get(name, 1) - 1  # 在途 -1，get(name,1) 兜底防减穿
             sem.release()                      # 还名额：排在后面的线程立刻顶上
 
     # 【什么】查某工具当前在途/历史峰值
     # 【作用】观测与压测用：峰值长期等于上限 = 排队常发生，该加实例或加名额了
-    def in_flight(self, name: str) -> int:
-        with self._lock:
-            return self._in_flight.get(name, 0)
+    def in_flight(self, name: str) -> int:  # 查当前在途数
+        with self._lock:  # 拿锁读账本
+            return self._in_flight.get(name, 0)  # 没在跑就返回 0
 
-    def max_seen(self, name: str) -> int:
-        with self._lock:
-            return self._max_seen.get(name, 0)
+    def max_seen(self, name: str) -> int:  # 查历史峰值
+        with self._lock:  # 拿锁读账本
+            return self._max_seen.get(name, 0)  # 没记录就返回 0
 
 
 # 【什么】有状态工具的实例池（借出-归还）

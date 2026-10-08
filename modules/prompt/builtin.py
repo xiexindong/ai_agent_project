@@ -18,36 +18,36 @@
     merge          summaries
     classify.intent query / labels
 """
-from modules.prompt.templates import PromptRegistry, PromptTemplate
+from modules.prompt.templates import PromptRegistry, PromptTemplate   # 从 templates 模块导入注册表和模板类，供后续注册使用
 
 # ----------------------------------------------------------------------
 # react.system v1：与迁移前写在 react_agent.py 类里的 SYSTEM_PROMPT 正文逐字一致
 # ----------------------------------------------------------------------
-_REACT_SYSTEM_V1 = (
-    "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"
-    "## 工作流程（ReAct）\n"
-    "1. Reason：分析用户问题，判断是否需要调用工具\n"
-    "2. Action：如需工具，调用对应工具获取信息\n"
-    "3. Observation：观察工具返回结果，决定是否继续调用或给出答案\n\n"
-    "## 核心规则\n"
-    "- 仅基于知识库和工具返回的事实回答，禁止编造\n"
-    "- 知识库无相关内容时，如实告知并尝试工具补充\n"
-    "- 工具调用需确认参数正确性\n"
-    " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"
-    "## 回答要求\n"
-    "- 提供完整详细的答案（包含推理依据、数据来源）\n"
-    "- 末尾附【摘要】标签，用一句话总结本轮对话核心"
-)
+_REACT_SYSTEM_V1 = (   # ReAct 系统提示词 v1 版本，与旧代码逐字一致，用于回归比对
+    "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"   # 角色定义：声明企业级AI助手的能力范围
+    "## 工作流程（ReAct）\n"   # 标记 ReAct 工作流程节的开始，引导模型按流程执行
+    "1. Reason：分析用户问题，判断是否需要调用工具\n"   # ReAct 第一步：推理判断，决定是否需要工具
+    "2. Action：如需工具，调用对应工具获取信息\n"   # ReAct 第二步：执行动作，发起工具调用
+    "3. Observation：观察工具返回结果，决定是否继续调用或给出答案\n\n"   # ReAct 第三步：观察结果并决策
+    "## 核心规则\n"   # 标记核心规则节的开始，列出硬性约束
+    "- 仅基于知识库和工具返回的事实回答，禁止编造\n"   # 规则一：禁止编造，必须基于事实回答
+    "- 知识库无相关内容时，如实告知并尝试工具补充\n"   # 规则二：知识库不足时可用工具补充
+    "- 工具调用需确认参数正确性\n"   # 规则三：调用工具前必须确认参数正确
+    " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"   # 规则四：循环上限控制，防止无限循环
+    "## 回答要求\n"   # 标记回答要求节的开始，列出输出规范
+    "- 提供完整详细的答案（包含推理依据、数据来源）\n"   # 要求一：答案要完整且附带推理依据和数据来源
+    "- 末尾附【摘要】标签，用一句话总结本轮对话核心"   # 要求二：结尾必须附摘要，方便快速回顾
+)   # 多行字符串结束，_REACT_SYSTEM_V1 定义完成
 
 # v2：在 v1 基础上追加两条约束，用于演示「改提示词 = 改一个版本」
 #   追加内容对应两个真实问题：
 #     1. 模型把工具结果复述一遍却不给结论（加"必须给出明确结论"）
 #     2. 知识库为空时模型仍自行发挥（加"必须声明依据不足"）
-_REACT_SYSTEM_V2 = _REACT_SYSTEM_V1 + (
-    "\n\n## 补充约束\n"
-    "- 工具已返回数据时，必须给出明确结论，不能只复述观察结果\n"
-    "- 依据不足时，先说'当前资料不足以确定'，再说明还缺什么"
-)
+_REACT_SYSTEM_V2 = _REACT_SYSTEM_V1 + (   # v2 在 v1 基础上追加约束，演示版本管理的能力
+    "\n\n## 补充约束\n"   # 标记补充约束节的开始，追加额外约束
+    "- 工具已返回数据时，必须给出明确结论，不能只复述观察结果\n"   # 约束一：避免模型只复述工具结果而不给结论
+    "- 依据不足时，先说'当前资料不足以确定'，再说明还缺什么"   # 约束二：依据不足时必须明确声明，不能自行发挥
+)   # 追加的多行字符串结束，_REACT_SYSTEM_V2 定义完成
 
 # ----------------------------------------------------------------------
 # react.role：react.system v1 去掉「## 工作流程（ReAct）」那一节
@@ -63,68 +63,68 @@ _REACT_SYSTEM_V2 = _REACT_SYSTEM_V1 + (
 #     它仍是改造前的原文（与 react_agent.py 旧 SYSTEM_PROMPT 逐字一致），
 #     用于回归比对（demo 第六幕）与「想回到旧文案」的场景。
 # ----------------------------------------------------------------------
-_REACT_ROLE = (
-    "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"
-    "## 核心规则\n"
-    "- 仅基于知识库和工具返回的事实回答，禁止编造\n"
-    "- 知识库无相关内容时，如实告知并尝试工具补充\n"
-    "- 工具调用需确认参数正确性\n"
-    " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"
-    "## 回答要求\n"
-    "- 提供完整详细的答案（包含推理依据、数据来源）\n"
-    "- 末尾附【摘要】标签，用一句话总结本轮对话核心"
-)
+_REACT_ROLE = (   # ReAct 角色模板：只保留角色和规则，流程段拆给策略层，实现策略与模板解耦
+    "你是一个企业级智能AI助手，具备知识库问答、历史记忆、工具调用能力。\n\n"   # 角色定义：声明助手能力
+    "## 核心规则\n"   # 标记核心规则节
+    "- 仅基于知识库和工具返回的事实回答，禁止编造\n"   # 规则一：禁止编造
+    "- 知识库无相关内容时，如实告知并尝试工具补充\n"   # 规则二：知识库不足时可用工具补充
+    "- 工具调用需确认参数正确性\n"   # 规则三：确认参数正确性
+    " - 最多循环{max_iter}次，超过后直接给出当前最佳答案\n\n"   # 规则四：循环上限，防无限循环
+    "## 回答要求\n"   # 标记回答要求节
+    "- 提供完整详细的答案（包含推理依据、数据来源）\n"   # 要求一：完整详细
+    "- 末尾附【摘要】标签，用一句话总结本轮对话核心"   # 要求二：附摘要
+)   # 多行字符串结束，_REACT_ROLE 定义完成
 
 # ----------------------------------------------------------------------
 # react.reason：与迁移前写在 react_agent.py 类里的 REASON_PROMPT 正文逐字一致
 # ----------------------------------------------------------------------
-_REACT_REASON = (
-    "## 用户提问\n{query}\n\n"
-    "## 激活技能（SOP作业流程）\n{skill_context}\n\n"
-    "## 权限边界（硬性约束，越界即违规）\n{permission_context}\n\n"
-    "## 知识库参考\n{rag_context}\n\n"
-    "## 历史记忆\n{memory_context}\n\n"
-    "## 历史工具调用\n{tool_history}\n\n"
-    "## 工具观察结果\n{observation}\n\n"
-    "## 可用工具（Function Calling）\n{tools_desc}\n\n"
-    "请分析当前情况，决定下一步行动：\n"
-    "- 如果已激活技能，优先遵循该技能的作业流程(SOP)，并优先使用其推荐工具\n"
-    "- 如果已有足够信息回答，直接给出最终答案\n"
-    "- 如果需要更多信息，选择合适的工具调用\n"
-    "- 严格使用 Function Calling 格式输出工具调用"
-)
+_REACT_REASON = (   # ReAct 推理提示词：与旧代码 REASON_PROMPT 逐字一致，确保迁移后行为不变
+    "## 用户提问\n{query}\n\n"   # 用户问题插位：query 变量替换为实际用户问题
+    "## 激活技能（SOP作业流程）\n{skill_context}\n\n"   # 技能上下文插位：替换为已激活技能的 SOP 流程
+    "## 权限边界（硬性约束，越界即违规）\n{permission_context}\n\n"   # 权限上下文插位：替换为权限约束说明
+    "## 知识库参考\n{rag_context}\n\n"   # 知识库参考插位：替换为检索到的知识库内容
+    "## 历史记忆\n{memory_context}\n\n"   # 历史记忆插位：替换为历史对话记忆
+    "## 历史工具调用\n{tool_history}\n\n"   # 工具历史插位：替换为历史工具调用记录
+    "## 工具观察结果\n{observation}\n\n"   # 观察结果插位：替换为最新工具观察结果
+    "## 可用工具（Function Calling）\n{tools_desc}\n\n"   # 工具描述插位：替换为可用工具清单
+    "请分析当前情况，决定下一步行动：\n"   # 指令开头：要求模型分析当前情况并决策
+    "- 如果已激活技能，优先遵循该技能的作业流程(SOP)，并优先使用其推荐工具\n"   # 决策分支一：有技能时优先走 SOP 流程
+    "- 如果已有足够信息回答，直接给出最终答案\n"   # 决策分支二：信息足够时直接给出最终答案
+    "- 如果需要更多信息，选择合适的工具调用\n"   # 决策分支三：信息不足时选择合适的工具
+    "- 严格使用 Function Calling 格式输出工具调用"   # 格式要求：工具调用必须用 Function Calling 格式
+)   # 多行字符串结束，_REACT_REASON 定义完成
 
 # ----------------------------------------------------------------------
 # qa.grounded：知识库问答（PromptBuilder 的默认模板）
 #   与 react.reason 的区别：不含工具相关变量，多一个 strategy_block 插位，
 #   供四种策略自由替换（"怎么问"这一段由 strategies.py 生成）。
 # ----------------------------------------------------------------------
-_QA_GROUNDED = (
-    "## 回答策略\n{strategy_block}\n\n"
-    "## 用户提问\n{query}\n\n"
-    "## 权限边界\n{permission_context}\n\n"
-    "## 知识库参考\n{rag_context}\n\n"
-    "## 历史记忆\n{memory_context}\n\n"
-    "请按上面的回答策略作答。"
-)
+_QA_GROUNDED = (   # 知识库问答模板：PromptBuilder 默认模板，不含工具变量，策略可自由替换
+    "## 回答策略\n{strategy_block}\n\n"   # 策略块插位：由 strategies.py 动态生成，支持四种策略切换
+    "## 用户提问\n{query}\n\n"   # 用户问题插位：替换为实际用户问题
+    "## 权限边界\n{permission_context}\n\n"   # 权限上下文插位：替换为权限约束
+    "## 知识库参考\n{rag_context}\n\n"   # 知识库参考插位：替换为检索到的知识库内容
+    "## 历史记忆\n{memory_context}\n\n"   # 历史记忆插位：替换为历史对话记忆
+    "请按上面的回答策略作答。"   # 统一指令：要求模型按照上述策略回答问题
+)   # 多行字符串结束，_QA_GROUNDED 定义完成
 
 # ----------------------------------------------------------------------
 # summary / merge：与 summary_generator.py:17、25 正文一致
 # ----------------------------------------------------------------------
-_SUMMARY = (
-    "请将以下用户提问与AI回答，提炼为一句话精简摘要（不超过50字）。"
-    "摘要需保留核心信息（问题主题+关键结论），用于后续语义检索匹配。\n\n"
-    "用户提问: {query}\n"
-    "AI回答: {answer}\n\n"
-    "精简摘要:"
-)
+_SUMMARY = (   # 单轮摘要模板：与 summary_generator.py 第 17 行逐字一致，确保行为不变
+    "请将以下用户提问与AI回答，提炼为一句话精简摘要（不超过50字）。"   # 任务说明：要求提炼为 50 字内的一句话摘要
+    "摘要需保留核心信息（问题主题+关键结论），用于后续语义检索匹配。\n\n"   # 要求保留主题和结论，便于后续语义检索匹配
+    "用户提问: {query}\n"   # 用户问题插位：替换为实际用户问题
+    "AI回答: {answer}\n\n"   # AI 回答插位：替换为实际 AI 回答
+    "精简摘要:"   # 输出引导：提示模型在此处输出精简摘要
+)   # 多行字符串结束，_SUMMARY 定义完成
 
-_MERGE = (
-    "请将以下多轮对话摘要合并为一个全局摘要（不超过100字），"
-    "保留时间顺序与关键信息，去除冗余细节，用于压缩上下文历史。\n\n"
-    "历史摘要列表:\n{summaries}\n\n"
-    "合并摘要:"
-)
+_MERGE = (   # 多轮摘要合并模板：与 summary_generator.py 第 25 行逐字一致
+    "请将以下多轮对话摘要合并为一个全局摘要（不超过100字），"   # 任务说明：要求合并为 100 字内全局摘要
+    "保留时间顺序与关键信息，去除冗余细节，用于压缩上下文历史。\n\n"   # 要求保留时序和关键信息，去除冗余以压缩历史
+    "历史摘要列表:\n{summaries}\n\n"   # 历史摘要列表插位：替换为多轮摘要列表
+    "合并摘要:"   # 输出引导：提示模型输出合并后的全局摘要
+)   # 多行字符串结束，_MERGE 定义完成
 
 # ----------------------------------------------------------------------
 # classify.intent：演示「JSON 输出约束」与花括号转义
@@ -132,57 +132,60 @@ _MERGE = (
 #   写成单花括号会被当成变量，渲染时抛 KeyError 或静默错位。
 #   下面 {{"intent": "报销咨询"}} 渲染后正是 {"intent": "报销咨询"}。
 # ----------------------------------------------------------------------
-_CLASSIFY_INTENT = (
-    "请判断用户提问属于下列哪一类意图，只输出一个 JSON 对象。\n\n"
-    "候选意图: {labels}\n"
-    "用户提问: {query}\n\n"
-    "输出格式（严格照此，不要多余文字）:\n"
-    '{{"intent": "意图名", "confidence": 0.9, "reason": "一句话理由"}}\n\n'
-    "JSON:"
-)
+_CLASSIFY_INTENT = (   # 意图分类模板：演示 JSON 输出约束与花括号转义技巧
+    "请判断用户提问属于下列哪一类意图，只输出一个 JSON 对象。\n\n"   # 任务说明：要求分类并只输出 JSON 对象
+    "候选意图: {labels}\n"   # 候选意图列表插位：替换为可选意图标签
+    "用户提问: {query}\n\n"   # 用户问题插位：替换为实际用户问题
+    "输出格式（严格照此，不要多余文字）:\n"   # 格式要求引导：提示模型严格按格式输出
+    '{{"intent": "意图名", "confidence": 0.9, "reason": "一句话理由"}}\n\n'   # JSON 示例：{{ }} 转义后渲染为单花括号，避免被识别为变量
+    "JSON:"   # 最终输出引导：要求模型只输出 JSON 内容
+)   # 多行字符串结束，_CLASSIFY_INTENT 定义完成
 
-_BUILTINS = [
-    PromptTemplate("react.role", _REACT_ROLE, "v1", "react", "ReAct 角色与规则（流程段交给 react 策略块）"),
-    PromptTemplate("react.system", _REACT_SYSTEM_V1, "v1", "react", "ReAct 系统提示词（与现有代码一致）"),
-    PromptTemplate("react.system", _REACT_SYSTEM_V2, "v2", "react", "ReAct 系统提示词（补充结论与依据约束）"),
-    PromptTemplate("react.reason", _REACT_REASON, "v1", "react", "ReAct 推理步骤提示词"),
-    PromptTemplate("qa.grounded", _QA_GROUNDED, "v1", "zero_shot", "知识库问答通用模板（builder 默认）"),
-    PromptTemplate("summary", _SUMMARY, "v1", "zero_shot", "单轮对话摘要"),
-    PromptTemplate("merge", _MERGE, "v1", "zero_shot", "多轮摘要合并"),
-    PromptTemplate("classify.intent", _CLASSIFY_INTENT, "v1", "zero_shot", "意图分类（JSON 输出）"),
-]
+_BUILTINS = [   # 内置模板列表：8 个模板一次性定义，方便批量注册到注册表
+    PromptTemplate("react.role", _REACT_ROLE, "v1", "react", "ReAct 角色与规则（流程段交给 react 策略块）"),   # 角色模板 v1：只含角色和规则，流程由策略层提供
+    PromptTemplate("react.system", _REACT_SYSTEM_V1, "v1", "react", "ReAct 系统提示词（与现有代码一致）"),   # 系统提示词 v1：与旧代码逐字一致，用于回归比对
+    PromptTemplate("react.system", _REACT_SYSTEM_V2, "v2", "react", "ReAct 系统提示词（补充结论与依据约束）"),   # 系统提示词 v2：追加两条约束，用于 A/B 对比
+    PromptTemplate("react.reason", _REACT_REASON, "v1", "react", "ReAct 推理步骤提示词"),   # 推理模板 v1：含全部上下文变量，用于 ReAct 推理
+    PromptTemplate("qa.grounded", _QA_GROUNDED, "v1", "zero_shot", "知识库问答通用模板（builder 默认）"),   # QA 模板 v1：PromptBuilder 默认模板，支持策略替换
+    PromptTemplate("summary", _SUMMARY, "v1", "zero_shot", "单轮对话摘要"),   # 摘要模板 v1：单轮对话摘要生成
+    PromptTemplate("merge", _MERGE, "v1", "zero_shot", "多轮摘要合并"),   # 合并模板 v1：多轮摘要合并为全局摘要
+    PromptTemplate("classify.intent", _CLASSIFY_INTENT, "v1", "zero_shot", "意图分类（JSON 输出）"),   # 分类模板 v1：意图分类并输出 JSON
+]   # 内置模板列表结束，_BUILTINS 定义完成
 
-_registry: PromptRegistry | None = None   # 全局注册表单例；None 表示尚未创建过
+_registry: PromptRegistry | None = None   # 全局注册表单例；None 表示尚未创建过，首次调用 get_registry() 时懒加载初始化
 
 
 # 【什么】把 8 个内置模板注册进给定注册表
 # 【作用】让新建的注册表也有全套内置模板，返回它便于链式调用
-def register_builtin(registry: PromptRegistry) -> PromptRegistry:
-    """把内置模板注册进一个（通常是新建的）注册表。"""
-    for tpl in _BUILTINS:
-        registry.register(tpl)
-    return registry
+# 【为什么】拆成独立函数而非在 get_registry 里硬编码，方便测试时注入空注册表或自定义注册表
+def register_builtin(registry: PromptRegistry) -> PromptRegistry:   # 注册内置模板函数：给传入的注册表注入 8 个内置模板
+    """把内置模板注册进一个（通常是新建的）注册表。"""   # 文档字符串：说明函数用途是向注册表注册内置模板
+    for tpl in _BUILTINS:   # 遍历内置模板列表，逐个处理每个模板对象
+        registry.register(tpl)   # 调用注册表的 register 方法将当前模板注册进去
+    return registry   # 返回注册表本身，支持链式调用（如 register_builtin(PromptRegistry())）
 
 
 # 【什么】懒加载的全局注册表单例
 # 【作用】全进程共用一份模板表，避免「A 注册的模板 B 看不到」
-def get_registry() -> PromptRegistry:
+# 【为什么】与 LLMClient 同理：注册表是只读共享资源，各建各的会导致模块间隔离和重复注册
+def get_registry() -> PromptRegistry:   # 获取全局注册表单例：首次调用时懒加载创建并注册内置模板
     """全局注册表单例：首次调用时创建并注册内置模板。
 
     【为什么是单例】
         与 LLMClient 同样的理由：注册表是只读的共享资源，
         每个模块各建一个会导致「A 模块注册的模板 B 模块看不到」。
-    """
-    global _registry
-    if _registry is None:
-        _registry = register_builtin(PromptRegistry())
-    return _registry
+    """   # 文档字符串：说明单例设计原因，防止模块间模板不可见
+    global _registry   # 声明使用全局变量 _registry，以便修改其值
+    if _registry is None:   # 判断单例是否已创建：None 表示首次调用，需要初始化
+        _registry = register_builtin(PromptRegistry())   # 新建空注册表并注入内置模板，赋值给全局变量缓存
+    return _registry   # 返回全局单例，供全进程各模块共享使用
 
 
 # 【什么】重建全局注册表单例
 # 【作用】测试之间互相隔离用，返回新注册表以免用例互相污染
-def reset_registry() -> PromptRegistry:
-    """清空单例并重建（测试用，避免用例之间互相污染）。"""
-    global _registry
-    _registry = register_builtin(PromptRegistry())
-    return _registry
+# 【为什么】测试用例可能修改注册表状态（如覆盖模板），reset 保证每个测试从干净状态开始
+def reset_registry() -> PromptRegistry:   # 重置全局注册表：清空并重建，用于测试隔离避免状态污染
+    """清空单例并重建（测试用，避免用例之间互相污染）。"""   # 文档字符串：说明测试隔离用途
+    global _registry   # 声明使用全局变量 _registry，以便强制重建
+    _registry = register_builtin(PromptRegistry())   # 强制新建注册表并注入内置模板，覆盖旧单例
+    return _registry   # 返回全新注册表，保证测试用例之间的隔离性

@@ -44,36 +44,37 @@
               out   {"success": false, "result": null, "error": "ModuleNotFoundError: ...", ...}
     GET  /health →  {"status":"ok","mode":"remote-mock","worker":"modules.harness.sandbox_worker"}
 """
-from __future__ import annotations
+from __future__ import annotations           # 允许类型注解里用未导入的名字（Python 3.7+ 兼容写法）
 
-import json
-import os
-import subprocess
-from pathlib import Path
-from typing import Any, Dict, Optional
+import json                                  # 标准库 JSON：payload 打包与结果解析
+import os                                    # 标准库 OS：读环境变量（令牌/超时/端口）
+import subprocess                            # 标准库子进程：起 sandbox_worker
+from pathlib import Path                     # 路径对象：定位项目根目录
+from typing import Any, Dict, Optional       # 标准库类型：Any 任意 / Dict 字典 / Optional 可空
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException  # FastAPI 框架：应用 / 请求头取参 / HTTP 异常
+from pydantic import BaseModel, Field        # pydantic：请求体模型与字段定义
 
-from modules.harness.sandbox import SubprocessRunner
+from modules.harness.sandbox import SubprocessRunner  # 复用子进程执行器（解释器路径 + 环境白名单）
 
 # 【什么】项目根目录（绝对路径）
 # 【作用】worker 子进程必须在项目根下起，否则 import 不到 modules.tools.* 这些工具类；
 #   本文件位于 <root>/modules/harness/ 下，所以上两级就是项目根
-PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+PROJECT_ROOT = str(Path(__file__).resolve().parents[2])  # 本文件上两级 = 项目根，转字符串备用
 
 
 # 【什么】/run 的请求体
 # 【作用】与子进程沙箱的 payload 完全同构：module + class + params
 #   【为什么字段名叫 class_name】class 是 Python 关键字，不能直接当属性名，
 #   所以属性用 class_name，对外 JSON 仍叫 "class"（靠 alias="class" 对上）
+# 【为什么】请求体建模后 FastAPI 自动做类型校验与文档生成，手写解析全省了
 class RunRequest(BaseModel):
-    module: str = Field(default="", description="工具所在模块，如 modules.tools.calculator")
-    class_name: str = Field(default="", alias="class", description="工具类名，如 CalculatorTool")
-    params: Dict[str, Any] = Field(default_factory=dict, description="工具入参")
+    module: str = Field(default="", description="工具所在模块，如 modules.tools.calculator")  # 模块路径
+    class_name: str = Field(default="", alias="class", description="工具类名，如 CalculatorTool")  # 类名（alias 对上 JSON 的 "class"）
+    params: Dict[str, Any] = Field(default_factory=dict, description="工具入参")  # 实参，默认空 dict
 
 
-app = FastAPI(title="远程沙箱服务（模拟）", version="1.0")
+app = FastAPI(title="远程沙箱服务（模拟）", version="1.0")  # FastAPI 应用实例；uvicorn 加载的就是它
 
 
 # 【什么】健康检查
@@ -81,43 +82,46 @@ app = FastAPI(title="远程沙箱服务（模拟）", version="1.0")
 #         也是"服务到底起没起来"最快的确认方式：curl /health 有回包就是活的
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "mode": "remote-mock", "worker": "modules.harness.sandbox_worker"}
+    return {"status": "ok", "mode": "remote-mock", "worker": "modules.harness.sandbox_worker"}  # 固定回包：状态/模式/worker 入口
 
 
 # 【什么】执行一个工具（远端真正的入口）
 # 【作用】收类坐标 → 起 worker 子进程 → 回结果 JSON；工具业务性失败也回 200
+# 【为什么】200 = 服务受理；工具业务失败放 success/error 字段，客户端据此区分"要不要降级"
 @app.post("/run")
 def run(req: RunRequest,
         x_sandbox_token: Optional[str] = Header(default=None, alias="X-Sandbox-Token")) -> dict:
     # 【什么是 Header(default=None)】令牌不是必填：FastAPI 会去 HTTP 头里取 X-Sandbox-Token，
     #   客户端没带就是 None，交给 _check_token 决定要不要拒绝
-    _check_token(x_sandbox_token)
+    _check_token(x_sandbox_token)                          # 先鉴权：令牌不对直接 401
 
     # 【为什么这里只拦 400 的字段缺失】module/class 缺了是调用方用错协议，属于请求不合法，
     #   让它早失败比让 worker 报 ModuleNotFoundError 更好排查
-    if not req.module or not req.class_name:
-        raise HTTPException(status_code=400, detail="缺少 module / class 字段")
+    if not req.module or not req.class_name:               # 缺模块路径或类名
+        raise HTTPException(status_code=400, detail="缺少 module / class 字段")  # 400：协议用错
 
-    return execute_payload({
-        "module": req.module,
-        "class": req.class_name,
-        "params": dict(req.params or {}),
+    return execute_payload({                               # 组装 payload 并交给执行出口
+        "module": req.module,                              # 模块路径
+        "class": req.class_name,                           # 类名（转回对外协议的 "class" 键）
+        "params": dict(req.params or {}),                  # 实参副本；None 兜底空 dict
     })
 
 
 # 【什么】可选的令牌校验
 # 【作用】没设 REMOTE_SANDBOX_TOKEN 就不鉴权（本地调试省事）；设了就必须带 X-Sandbox-Token
+# 【为什么】令牌来自环境变量而非配置文件：密钥不落盘，换环境不用改代码
 def _check_token(token: Optional[str]) -> None:
-    expected = str(os.getenv("REMOTE_SANDBOX_TOKEN", "") or "").strip()
-    if expected and token != expected:
-        raise HTTPException(status_code=401, detail="沙箱令牌无效")
+    expected = str(os.getenv("REMOTE_SANDBOX_TOKEN", "") or "").strip()  # 读期望令牌；空串 = 不启用鉴权
+    if expected and token != expected:                     # 启用了鉴权且令牌不匹配
+        raise HTTPException(status_code=401, detail="沙箱令牌无效")  # 401：鉴权失败
 
 
 # 【什么】单次执行的超时（秒）
 # 【作用】服务启动前可用 REMOTE_SANDBOX_TIMEOUT_SECONDS 调；
 #   max(1.0, ...) 是因为 0 或负数会让 subprocess.run 立刻超时——那不是"不限时"，是"必挂"
+# 【为什么】每次调用现读环境变量：改超时不用重启服务进程（调试期友好）
 def _timeout_seconds() -> float:
-    return max(1.0, float(os.getenv("REMOTE_SANDBOX_TIMEOUT_SECONDS", "30") or 30))
+    return max(1.0, float(os.getenv("REMOTE_SANDBOX_TIMEOUT_SECONDS", "30") or 30))  # 环境变量读超时；默认 30s，保底 1s
 
 
 # 【什么】真正执行 payload，返回可直接 JSON 化的结果字典
@@ -133,8 +137,8 @@ def execute_payload(payload: Dict[str, Any]) -> dict:
     #   【为什么复用 SubprocessRunner】不是为了跑工具，而是为了复用它两样东西：
     #     runner.python       当前解释器路径（虚拟环境里写死 "python" 会指错解释器）
     #     runner._clean_env() 环境变量白名单清洗（同包内复用，避免把宿主口令带进 worker）
-    runner = SubprocessRunner(project_root=PROJECT_ROOT, timeout_seconds=_timeout_seconds())
-    cmd = [runner.python, "-m", "modules.harness.sandbox_worker"]
+    runner = SubprocessRunner(project_root=PROJECT_ROOT, timeout_seconds=_timeout_seconds())  # 建一个子进程执行器借用其配置
+    cmd = [runner.python, "-m", "modules.harness.sandbox_worker"]  # 以模块方式启动 worker
 
     try:
         # 【六个参数各自的硬性理由 / 不这么写会怎样】
@@ -146,41 +150,43 @@ def execute_payload(payload: Dict[str, Any]) -> dict:
         #   cwd=项目根             worker 要 import 本项目模块，工作目录不对就 ModuleNotFoundError
         #   env=白名单             只留必要环境变量，别把数据库口令等宿主秘密带进沙箱
         proc = subprocess.run(
-            cmd, input=json.dumps(payload, ensure_ascii=False),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=runner.timeout_seconds, cwd=str(runner.project_root),
-            env=runner._clean_env(),
+            cmd, input=json.dumps(payload, ensure_ascii=False),  # stdin 喂 payload（中文不转义）
+            capture_output=True, text=True, encoding="utf-8", errors="replace",  # 收双管道 + utf-8 解码 + 坏字节替换
+            timeout=runner.timeout_seconds, cwd=str(runner.project_root),  # 超时即杀 + 项目根工作目录
+            env=runner._clean_env(),                           # 白名单环境变量
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired:                        # worker 超时被杀
         return {"success": False, "result": None,
-                "error": f"沙箱执行超时({runner.timeout_seconds:g}s)", "duration_ms": 0}
-    except Exception as e:
+                "error": f"沙箱执行超时({runner.timeout_seconds:g}s)", "duration_ms": 0}  # 固定结构回包：超时
+    except Exception as e:                                   # worker 压根没起起来
         return {"success": False, "result": None,
-                "error": f"沙箱启动失败: {type(e).__name__}: {e}", "duration_ms": 0}
-    return _last_json_line(proc)
+                "error": f"沙箱启动失败: {type(e).__name__}: {e}", "duration_ms": 0}      # 固定结构回包：启动失败
+    return _last_json_line(proc)                             # 从 stdout 捞结果行回给调用方
 
 
 # 【什么】从 worker 的 stdout 里取最后一行合法 JSON
 # 【作用】工具自己 print 的调试信息不会污染结果行（与子进程沙箱同一个约定：以 { 开头才算结果行）
+# 【为什么】从后往前扫：worker 契约是"结果写在最后一行"，命中即返回最省事
 def _last_json_line(proc) -> dict:
-    for line in reversed((proc.stdout or "").splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
+    for line in reversed((proc.stdout or "").splitlines()):  # 从最后一行往前扫；stdout 为 None 兜底空串
+        line = line.strip()                                  # 去首尾空白：缩进过的 JSON 也能认
+        if not line.startswith("{"):                         # 预筛：不以 { 开头的不是结果行
+            continue                                         # 跳过 print/日志行
         try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
+            return json.loads(line)                          # 解析成功即返回（命中结果行）
+        except json.JSONDecodeError:                         # 以 { 开头但不是合法 JSON
+            continue                                         # 继续往前找
     # 【走到这里说明什么】worker 一行 JSON 都没吐出来：被强杀 / import 就炸 / 输出被 stderr 吃了
     #   把 stderr 尾巴带上，调用方才知道是"工具的问题"还是"服务的问题"
-    detail = (proc.stderr or proc.stdout or "").strip()[-300:]
-    return {"success": False, "result": None, "error": f"worker 无有效输出: {detail}", "duration_ms": 0}
+    detail = (proc.stderr or proc.stdout or "").strip()[-300:]  # 诊断信息：stderr 优先，末尾 300 字
+    return {"success": False, "result": None, "error": f"worker 无有效输出: {detail}", "duration_ms": 0}  # 固定结构回包：无输出
 
 
 # 【什么】脚本入口
 # 【作用】直接 `python -m modules.harness.remote_sandbox_server` 时把服务跑起来；
 #   uvicorn 延迟导入（放函数里），不跑服务就不引入这个依赖
+# 【为什么】端口走环境变量：与命令行拉起的两种方式（main.py / uvicorn CLI）都能对上台账
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn                                       # 延迟导入 ASGI 服务器
 
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("REMOTE_SANDBOX_PORT", "8899") or 8899))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("REMOTE_SANDBOX_PORT", "8899") or 8899))  # 起服务；端口默认 8899

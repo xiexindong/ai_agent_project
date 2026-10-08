@@ -21,22 +21,22 @@ Tool-RAG 模块
     embedding 服务无 key / 超时 / 报错，自动降级为关键词召回（2-gram 匹配），
     keyword 命中的分数按 0.6 折算 —— 弱证据不能盖过真实的语义命中。
 """
-import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+import re  # 正则模块：_fragments 里切英文词与中文字符用
+from dataclasses import dataclass  # 数据类装饰器：ToolHit 用它自动生成 __init__ 等样板代码
+from typing import Dict, List, Optional  # 类型注解：字典/列表/可选
 
-from modules.common.logger import get_logger
+from modules.common.logger import get_logger  # 统一日志工厂
 
-_logger = get_logger("tool_rag")
+_logger = get_logger("tool_rag")  # 模块级 logger：本文件日志统一带 "tool_rag" 前缀
 
 # 关键词证据的折算系数：命中同样多的词，语义相似度的可信度更高
-_KEYWORD_SCALE = 0.6
+_KEYWORD_SCALE = 0.6  # 关键词命中分 ×0.6：弱证据打折，避免盖过真实的语义命中
 
 
 # 【什么】一次工具召回的结果记录
 # 【作用】带名字与分数返回给路由层，由它决定是否把工具放进 prompt
-@dataclass
-class ToolHit:
+@dataclass  # 数据类装饰器：按下方字段声明自动生成 __init__/__repr__/__eq__
+class ToolHit:  # 一次召回结果：名字 + 分数 + 召回通道
     """一次召回结果。
 
     Attributes:
@@ -51,7 +51,7 @@ class ToolHit:
 
 # 【什么】工具的语义检索索引
 # 【作用】建索引 + 按提问召回 top-k 工具，让 prompt 里只有少量候选
-class ToolRAGIndex:
+class ToolRAGIndex:  # 工具语义索引类：负责建索引与按提问召回
     """工具语义索引：index_tools() 建索引，recall() 按提问召回。
 
     【三张内部表】
@@ -60,7 +60,7 @@ class ToolRAGIndex:
         _metas   工具名 → 原始元信息（来源 server / 描述，排查时用）
     """
 
-    def __init__(self, top_k: int = 5, min_score: float = 0.25, enabled: bool = True):
+    def __init__(self, top_k: int = 5, min_score: float = 0.25, enabled: bool = True):  # 构造：召回数量/分数门槛/总开关
         self._top_k = max(1, int(top_k))                  # 单次最多召回几个工具，默认 5，下限 1
         self._min_score = float(min_score)                # 召回分数门槛，默认 0.25，低于它一律不要
         self._enabled = enabled                           # 总开关：False 时 recall() 直接返回空列表
@@ -86,35 +86,35 @@ class ToolRAGIndex:
     # ------------------------------------------------------------------
     # 【什么】给工具建索引，返回新编码的工具数
     # 【作用】文本没变且已编码的工具跳过，避免重复调 embedding
-    def index_tools(self, tools: list) -> int:
+    def index_tools(self, tools: list) -> int:  # 建/更新索引：返回本轮新编码的工具数
         # pending = 本轮真正需要编码的工具 [(名字, 画像文本), ...]；攒完再批量编码，
         #           一次 embed_batch 搞定，避免每个工具各调一次 embedding（省调用、省钱）
-        pending: List[tuple] = []
-        for tool in tools or []:
+        pending: List[tuple] = []  # 待编码队列：[(工具名, 画像文本), ...]
+        for tool in tools or []:  # 遍历传入工具（None 视为空列表，防崩）
             # 【归一化】BaseTool 实例与网关目录 dict 两种来源统一成 (name, desc, schema, meta)
             #   → _normalize() 见本文件 326 行
-            name, desc, schema, meta = self._normalize(tool)
+            name, desc, schema, meta = self._normalize(tool)  # 统一取出四元组
             if not name:                                    # 没有名字的工具无法召回（召回结果靠名字取实例），直接跳过
-                continue
+                continue  # 跳过无名工具
             # 【用途画像】"名字。描述 可填参数: a、b" —— 只描述"干什么"，不含 JSON Schema 细节，
             #   否则参数噪声会干扰相似度 → _routing_text() 见本文件 318 行
-            text = self._routing_text(name, desc, schema)
+            text = self._routing_text(name, desc, schema)  # 拼出该工具的用途画像文本
             # 【是否已编码过】向量不可用时恒为 True（没有向量可比对，只靠文本判断）；
             #   向量可用时要求 _vectors 里已有它，否则补一次编码
-            already_indexed = not self._vector_available or name in self._vectors
-            if self._texts.get(name) == text and already_indexed:
+            already_indexed = not self._vector_available or name in self._vectors  # 判定是否已建过索引
+            if self._texts.get(name) == text and already_indexed:  # 画像文本没变且已编码
                 continue                                    # 文本没变且已编码 → 跳过，网关 refresh 重喂同一批工具时不重复花钱
             self._texts[name] = text                        # 文本表：向量与关键词召回共用
             self._metas[name] = meta                        # 元信息表：记录来源 server，排查"这工具哪来的"用
             pending.append((name, text))                    # 文本变了或还没编码 → 加入待编码队列
 
-        if not pending:
-            return 0
-        if self._vector_available:
-            try:
-                from modules.memory.embedding_service import get_embedding_service
+        if not pending:  # 本轮没有需要新编码的工具
+            return 0  # 直接返回 0，不调 embedding
+        if self._vector_available:  # 向量通道还可用：尝试批量编码
+            try:  # embedding 调用可能失败（无 key/超时），用 try 包住走降级
+                from modules.memory.embedding_service import get_embedding_service  # 延迟 import：避免模块级依赖 embedding 服务
                 # 一句话：把所有待编码的工具画像文本一次性批量转成向量，按入参顺序等长返回。
-                vectors = get_embedding_service().embed_batch([t for _, t in pending])
+                vectors = get_embedding_service().embed_batch([t for _, t in pending])  # 批量编码：列表推导只取文本部分
                 # ------------------------------------------------------------------
                 # 【什么】zip(pending, vectors)：把两个等长序列像拉链一样一对一咬合
                 #   每次循环吐出一对 (pending[i], vectors[i])，i 从 0 走到末尾：
@@ -143,15 +143,15 @@ class ToolRAGIndex:
                 #   异常会被下面的 except 接住，表现是"向量不可用，降级为关键词召回"——
                 #   看日志像是 embedding 服务挂了，实际是这一行写法的问题。
                 # ------------------------------------------------------------------
-                for (name, _), vec in zip(pending, vectors):
-                    self._vectors[name] = vec
-                _logger.info(f"Tool-RAG 已编码 {len(pending)} 个工具向量 | 索引总数={len(self._texts)}")
-            except Exception as e:
+                for (name, _), vec in zip(pending, vectors):  # 拉链配对：第 i 个工具对应第 i 个向量
+                    self._vectors[name] = vec  # 把向量按工具名存进向量表
+                _logger.info(f"Tool-RAG 已编码 {len(pending)} 个工具向量 | 索引总数={len(self._texts)}")  # 记编码成果日志
+            except Exception as e:  # 捕获一切 embedding 异常（网络/鉴权/超时等）
                 # 【降级而不是失败】向量只是召回手段之一，关键词照样能选出工具；
                 #   这里若向上抛，整条对话就挂了 —— 召回不该成为可用性瓶颈。
-                self._vector_available = False
-                _logger.warning(f"Tool-RAG 向量不可用，降级为关键词召回: {e}")
-        return len(pending)
+                self._vector_available = False  # 永久关掉向量开关：后续轮次直接走关键词
+                _logger.warning(f"Tool-RAG 向量不可用，降级为关键词召回: {e}")  # 记 warning 说明降级原因
+        return len(pending)  # 返回本轮新编码的工具数（即便编码失败，文本/元信息也已入账）
 
     # ------------------------------------------------------------------
     # 【召回】返回按分数降序的 top-k
@@ -169,7 +169,7 @@ class ToolRAGIndex:
     # ------------------------------------------------------------------
     # 【什么】按提问召回最相关的若干工具
     # 【作用】向量优先、关键词兜底；无命中返回空列表交由路由层回退默认工具
-    def recall(self, query: str, top_k: Optional[int] = None) -> List[ToolHit]:
+    def recall(self, query: str, top_k: Optional[int] = None) -> List[ToolHit]:  # 按提问召回 top-k 工具，返回 ToolHit 列表
         # ------------------------------------------------------------------
         # 【前置短路：三种"没法召回"的情况直接给空】
         #   not self._enabled  总开关关了（配置关闭 Tool-RAG）
@@ -177,37 +177,37 @@ class ToolRAGIndex:
         #   not self._texts    索引里一个工具都没有：无候选可返回
         #   返回 [] 不是异常，上层路由层会回退默认工具（router.py:260）。
         # ------------------------------------------------------------------
-        if not self._enabled or not query or not self._texts:
-            return []
+        if not self._enabled or not query or not self._texts:  # 任一前置不满足
+            return []  # 返回空列表（约定信号，上层据此回退默认工具）
         # ------------------------------------------------------------------
         # 【定本轮配额 k】显式传了 top_k 就用传入的，否则用索引默认值（5）。
         #   max(1, ...) 双保险：外部传 0/负数时至少召回 1 个，不会切成空名单。
         #   int() 兜底：配置可能被读成字符串（如 "5"）。
         # ------------------------------------------------------------------
-        k = max(1, int(top_k or self._top_k))
+        k = max(1, int(top_k or self._top_k))  # 本轮召回数量下限 1
 
         # ------------------------------------------------------------------
         # 【主策略：向量优先，关键词兜底】
         #   能走向量时先尝试语义召回——余弦相似度是强证据，比 2-gram 关键词准。
         # ------------------------------------------------------------------
-        if self._vector_available:
-            hits = self._recall_vector(query, k)
+        if self._vector_available:  # 向量通道开着：优先语义召回
+            hits = self._recall_vector(query, k)  # 走向量召回
             # 语义召回到了 → 标记来源并直接返回，不再走关键词（避免弱证据混入）
-            if hits:
+            if hits:  # 语义有命中
                 self._last_source = "vector"    # 记录实际生效通道，stats() 观测用
-                return hits
+                return hits  # 直接返回语义结果
             # 语义通道跑通了但一个都没过门槛（hits 为 []）→ 降级关键词再试一次，
             #   而不是空手而归：库里也许只是向量相似度普遍偏低，关键词还能捞到。
-            self._last_source = "keyword"
-            return self._recall_keyword(query, k)
+            self._last_source = "keyword"  # 标记本次走了关键词通道
+            return self._recall_keyword(query, k)  # 关键词兜底召回
         # 向量开关早已关闭（此前 embedding 失败过）→ 直接走关键词，不再尝试向量，
         #   省掉注定失败的 embedding 调用。
-        self._last_source = "keyword"
-        return self._recall_keyword(query, k)
+        self._last_source = "keyword"  # 标记本次走了关键词通道
+        return self._recall_keyword(query, k)  # 直接关键词召回
 
     # 【什么】语义召回：编码 query 后与全部工具向量算余弦
     # 【作用】主力召回路径；编码失败就关掉开关交给关键词兜底
-    def _recall_vector(self, query: str, k: int) -> List[ToolHit]:
+    def _recall_vector(self, query: str, k: int) -> List[ToolHit]:  # 语义召回内部实现：向量编码 + 余弦打分 + 过滤
         # ------------------------------------------------------------------
         # 【第 1 步：把提问变成向量】
         #   文本和文本没法直接算"像不像"，先调 embedding 把 query 编码成
@@ -219,12 +219,12 @@ class ToolRAGIndex:
         #   _recall_keyword。同时把 _vector_available 永久置 False：
         #   embedding 服务通常不是"抖一下"，而是无 key/配置错，再试只会重复失败。
         # ------------------------------------------------------------------
-        try:
-            from modules.memory.embedding_service import get_embedding_service
+        try:  # embedding 调用可能失败，用 try 包住走降级
+            from modules.memory.embedding_service import get_embedding_service  # 延迟 import：避免模块级依赖 embedding
             qv = get_embedding_service().embed(query)                  # qv = query vector，如 [0.021, -0.04, ...]（智谱 embedding 为 1024 维）
-        except Exception as e:
+        except Exception as e:  # 编码失败：embedding 服务不可用
             self._vector_available = False                             # 关掉向量开关：本次后续轮次直接走关键词，不再反复撞 embedding
-            _logger.warning(f"Tool-RAG 查询向量失败，降级关键词: {e}")
+            _logger.warning(f"Tool-RAG 查询向量失败，降级关键词: {e}")  # 记 warning 说明降级原因
             return []                                                  # 空列表是约定信号，不是"没召回到工具"——上层据此切关键词通道
         # ------------------------------------------------------------------
         # 【第 2 步：给每个工具打分】
@@ -239,23 +239,23 @@ class ToolRAGIndex:
         #             ToolHit("calculator", 0.0318, "vector")]
         #   → 此时顺序还是字典序，分数高低还没排
         # ------------------------------------------------------------------
-        scored = [
-            ToolHit(name, round(_cosine(qv, vec), 4), "vector")
-            for name, vec in self._vectors.items()
+        scored = [  # 列表推导：给每个工具算相似度并包成 ToolHit
+            ToolHit(name, round(_cosine(qv, vec), 4), "vector")  # 算余弦并保留 4 位小数，来源标记为 vector
+            for name, vec in self._vectors.items()  # 遍历向量表里全部工具向量
         ]
         # ------------------------------------------------------------------
         # 【第 3 步：按分数降序】h.score 越大说明用途画像和提问越像，
         #   reverse=True 让最相关的排最前；同分时保持原相对顺序（排序稳定）。
         # ------------------------------------------------------------------
-        scored.sort(key=lambda h: h.score, reverse=True)
+        scored.sort(key=lambda h: h.score, reverse=True)  # 按 score 降序排列（reverse=True 代表降序）
         # ------------------------------------------------------------------
         # 【第 4 步：先过门槛、再取前 k】两步顺序不能反：
         #   先 min_score 过滤 —— 工具库里没有相关工具时，前 k 个只是"最不
         #   差的 k 个无关工具"，宁缺毋滥（理由见 159-162 行总述）；
         #   再切片 [:k] —— 达标的可能不止 k 个，只带本轮配额内的数量。
         # ------------------------------------------------------------------
-        hits = [h for h in scored if h.score >= self._min_score][:k]
-        _logger.debug(
+        hits = [h for h in scored if h.score >= self._min_score][:k]  # 先过滤低分，再切前 k
+        _logger.debug(  # 记 debug 日志：只看前 5 名，防刷屏
             "Tool-RAG 语义召回: "
             + ", ".join(f"{h.name}={h.score}" for h in scored[:5])     # 只打印前 5 名：工具再多日志也不刷屏，够看排序对不对
             + f" | 命中={len(hits)}"                                   # "命中"= 过门槛且在 k 内的个数，0 时上层会切关键词
@@ -264,20 +264,20 @@ class ToolRAGIndex:
 
     # 【什么】关键词降级召回：按 2-gram 片段重合打分
     # 【作用】embedding 不可用时仍能选出工具；分数乘 _KEYWORD_SCALE=0.6 折算
-    def _recall_keyword(self, query: str, k: int) -> List[ToolHit]:
-        q_frags = self._fragments(query)
-        if not q_frags:
-            return []
-        hits: List[ToolHit] = []
-        for name, text in self._texts.items():
-            t_frags = set(self._fragments(text))
-            hit = sum(1 for f in q_frags if f in t_frags)
-            if not hit:
-                continue
-            raw = min(1.0, hit / len(q_frags))
-            hits.append(ToolHit(name, round(raw * _KEYWORD_SCALE, 4), "keyword"))
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return [h for h in hits if h.score >= self._min_score][:k]
+    def _recall_keyword(self, query: str, k: int) -> List[ToolHit]:  # 关键词降级召回：2-gram 片段重合打分
+        q_frags = self._fragments(query)  # 把提问切成片段（中文 2-gram + 英文词）
+        if not q_frags:  # 提问切不出片段（比如全是标点）
+            return []  # 直接返回空，没东西可比
+        hits: List[ToolHit] = []  # 收集打分结果
+        for name, text in self._texts.items():  # 遍历全部工具的画像文本
+            t_frags = set(self._fragments(text))  # 工具画像也切成片段并去重成 set（O(1) 查找）
+            hit = sum(1 for f in q_frags if f in t_frags)  # 数提问片段有几个命中工具片段
+            if not hit:  # 一个片段都没中
+                continue  # 跳过，不给分
+            raw = min(1.0, hit / len(q_frags))  # 原始分 = 命中比例，封顶 1.0
+            hits.append(ToolHit(name, round(raw * _KEYWORD_SCALE, 4), "keyword"))  # ×0.6 折算后包成 ToolHit
+        hits.sort(key=lambda h: h.score, reverse=True)  # 按分数降序
+        return [h for h in hits if h.score >= self._min_score][:k]  # 过门槛后切前 k
 
     # ------------------------------------------------------------------
     # 【分词】中文按 2-gram 切，英文/数字按词切
@@ -297,13 +297,13 @@ class ToolRAGIndex:
     # ------------------------------------------------------------------
     # 【什么】把文本切成可比对片段
     # 【作用】中文走 2-gram、英文数字走词，供关键词召回做重合统计
-    @staticmethod
-    def _fragments(text: str) -> List[str]:
-        lower = (text or "").lower()
-        frags = [w for w in re.findall(r"[a-z0-9_]{2,}", lower)]
-        chinese = "".join(re.findall(r"[\u4e00-\u9fff]", lower))
-        frags.extend(chinese[i:i + 2] for i in range(max(0, len(chinese) - 1)))
-        return frags
+    @staticmethod  # 静态方法：不依赖实例状态
+    def _fragments(text: str) -> List[str]:  # 文本切片器：产出可比对的小片段列表
+        lower = (text or "").lower()  # 统一小写 + 防空（None 变空串）
+        frags = [w for w in re.findall(r"[a-z0-9_]{2,}", lower)]  # 英文/数字片段：连续 ≥2 位的词
+        chinese = "".join(re.findall(r"[\u4e00-\u9fff]", lower))  # 抽出全部中文字符连成串
+        frags.extend(chinese[i:i + 2] for i in range(max(0, len(chinese) - 1)))  # 中文按 2-gram 滑动窗口切片
+        return frags  # 返回混合片段列表（英文词 + 中文双字片）
 
     # ------------------------------------------------------------------
     # 【用途画像】只取参数名，不取完整 schema
@@ -314,60 +314,60 @@ class ToolRAGIndex:
     # ------------------------------------------------------------------
     # 【什么】拼出工具的用途画像文本
     # 【作用】只取参数名（最多前 6 个），不把完整 schema 塞进索引
-    @staticmethod
-    def _routing_text(name: str, description: str, schema: dict) -> str:
-        props = (schema or {}).get("properties", {}) or {}
-        params = "、".join(list(props.keys())[:6]) or "无参数"
-        return f"{name}。{description} 可填参数: {params}"
+    @staticmethod  # 静态方法：纯拼接逻辑，不依赖实例
+    def _routing_text(name: str, description: str, schema: dict) -> str:  # 生成用途画像文本
+        props = (schema or {}).get("properties", {}) or {}  # 取 JSON Schema 的 properties 字段（三层防空）
+        params = "、".join(list(props.keys())[:6]) or "无参数"  # 最多取前 6 个参数名顿号拼接，无参数时显示"无参数"
+        return f"{name}。{description} 可填参数: {params}"  # 拼成 "名字。描述 可填参数: a、b" 的画像文本
 
-    @staticmethod
+    @staticmethod  # 静态方法：纯字段提取，不依赖实例
     # 【什么】把 dict 形态与 BaseTool 形态的工具归一化
     # 【作用】索引与网关目录两套来源共用一套取字段逻辑
-    def _normalize(tool) -> tuple:
+    def _normalize(tool) -> tuple:  # 归一化：两种工具来源统一成 (name, desc, schema, meta) 四元组
         """把 BaseTool 实例或网关目录 dict 统一成 (name, description, schema, meta)。"""
-        if isinstance(tool, dict):
-            return (
-                str(tool.get("name", "")),
-                str(tool.get("description", "")),
-                tool.get("inputSchema") or {},
-                {"server": tool.get("server", "")},
+        if isinstance(tool, dict):  # 网关目录形态：dict
+            return (  # 按 dict 的 key 取字段
+                str(tool.get("name", "")),  # 工具名，缺省空串
+                str(tool.get("description", "")),  # 工具描述，缺省空串
+                tool.get("inputSchema") or {},  # 输入 schema，缺省空 dict
+                {"server": tool.get("server", "")},  # meta 记录来源 server
             )
         # BaseTool 家族：MCPToolAdapter 用 parameters_schema，本地工具用 parameters
-        name = getattr(tool, "name", "")
-        desc = getattr(tool, "description", "")
-        schema = getattr(tool, "parameters_schema", None) or getattr(tool, "parameters", None) or {}
-        return str(name), str(desc), schema, {"server": getattr(tool, "tool_type", "")}
+        name = getattr(tool, "name", "")  # 实例形态：取 .name 属性
+        desc = getattr(tool, "description", "")  # 取 .description 属性
+        schema = getattr(tool, "parameters_schema", None) or getattr(tool, "parameters", None) or {}  # 兼容两种 schema 属性名
+        return str(name), str(desc), schema, {"server": getattr(tool, "tool_type", "")}  # meta 里 server 记 tool_type
 
     # 【什么】输出索引运行态观测数据
     # 【作用】排查召回效果时看是否降级、当前 top_k 与 min_score 是多少
-    def stats(self) -> dict:
+    def stats(self) -> dict:  # 返回索引运行态的快照字典
         """索引观测：总数、向量可用与否、上次召回方式。"""
-        return {
-            "indexed": len(self._texts),
-            "vectorized": len(self._vectors),
-            "vector_available": self._vector_available,
-            "last_source": self._last_source,
-            "top_k": self._top_k,
-            "min_score": self._min_score,
+        return {  # 拼一个观测 dict
+            "indexed": len(self._texts),  # 已建索引的工具总数
+            "vectorized": len(self._vectors),  # 已有向量的工具数（与 indexed 不相等说明有工具未编码）
+            "vector_available": self._vector_available,  # 向量通道是否可用
+            "last_source": self._last_source,  # 上次召回走的通道
+            "top_k": self._top_k,  # 当前 top_k 配置
+            "min_score": self._min_score,  # 当前分数门槛
         }
 
     # 【什么】清空三张内部表
     # 【作用】重建索引前调用；不清会残留旧工具的画像与向量
-    def clear(self) -> None:
-        self._texts.clear()
-        self._vectors.clear()
-        self._metas.clear()
+    def clear(self) -> None:  # 清空全部内部状态
+        self._texts.clear()  # 清文本表
+        self._vectors.clear()  # 清向量表
+        self._metas.clear()  # 清元信息表
 
 
 # 【什么】计算两个向量的余弦相似度
 # 【作用】语义召回的打分函数；长度不等或零向量返回 0.0
-def _cosine(a: List[float], b: List[float]) -> float:
+def _cosine(a: List[float], b: List[float]) -> float:  # 模块级工具函数：算 a、b 两向量的余弦
     """余弦相似度（0~1 区间由调用方按 min_score 把关）。"""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+    if not a or not b or len(a) != len(b):  # 空向量或维度不等
+        return 0.0  # 无法计算，返回 0
+    dot = sum(x * y for x, y in zip(a, b))  # 点积：Σ(x·y)
+    na = sum(x * x for x in a) ** 0.5  # a 的 L2 模长：√Σ(x²)
+    nb = sum(y * y for y in b) ** 0.5  # b 的 L2 模长：√Σ(y²)
+    if na == 0 or nb == 0:  # 任一向量为零向量（除零保护）
+        return 0.0  # 零向量无方向，余弦无意义，返回 0
+    return dot / (na * nb)  # 余弦公式：dot / (|a|·|b|)

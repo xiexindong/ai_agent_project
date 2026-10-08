@@ -29,14 +29,14 @@
         → 结果处理 after_call    ≈ Interceptor 后置（裁剪脱敏 + token 记账 + 审计）
     未装配 harness 时整条管线全部跳过，行为与改造前完全一致。
 """
-from typing import Any, Dict, List, Optional
-from collections import defaultdict
-from modules.common.logger import get_logger
-from modules.common.exceptions import ToolException
-from modules.harness.models import ToolCallRequest
-from modules.tools.base_tool import BaseTool, ToolResult
+from typing import Any, Dict, List, Optional  # 类型注解工具：任意类型/字典/列表/可选
+from collections import defaultdict  # 默认字典：访问不存在的 key 时自动建默认值，省去判空
+from modules.common.logger import get_logger  # 统一日志工厂：按名字拿 logger 实例
+from modules.common.exceptions import ToolException  # 工具异常基类（本文件预留，统一异常体系用）
+from modules.harness.models import ToolCallRequest  # 工具调用请求模型：打包一次调用的全部上下文
+from modules.tools.base_tool import BaseTool, ToolResult  # 工具基类与统一结果对象：注册表只管这两类
 
-_logger = get_logger("registry")
+_logger = get_logger("registry")  # 模块级 logger：本文件所有日志都带 "registry" 前缀，方便检索
 
 
 # 【什么】工具注册与调度中心（本地 + MCP 双模式）
@@ -51,7 +51,7 @@ class ToolRegistry:
         _result_cache  缓存账  会话ID → {去重键: 上次成功的 ToolResult}
     """
 
-    def __init__(self, harness=None):
+    def __init__(self, harness=None):  # 构造函数：harness 为可选的治理框架，不传则退化为基础版
         # ------------------------------------------------------------------
         # 【harness 是什么】工具运行时框架（modules.harness.ToolHarness）
         #   负责能力登记、调用前校验、人工审批、沙箱执行、结果过滤与审计。
@@ -103,30 +103,30 @@ class ToolRegistry:
             同名工具重复注册时后者覆盖前者，仅记 warning 不报错，
             保证启动装配阶段重复注册不会中断流程。
         """
-        if tool.name in self._tools:
-            _logger.warning(f"工具重复注册，覆盖: {tool.name}")
-        self._tools[tool.name] = tool
+        if tool.name in self._tools:  # 检查注册表里是否已有同名工具
+            _logger.warning(f"工具重复注册，覆盖: {tool.name}")  # 有同名则记警告日志（不报错、不中断）
+        self._tools[tool.name] = tool  # 以工具名为 key 存入注册表（同名时后者覆盖前者）
         # ① 能力登记：风险等级/副作用/沙箱/权限在这里被 Harness 记成台账，
         #   调用时直接查表，不用每次重新解析工具声明
-        cap = self.harness.register(tool) if self.harness else None
-        _logger.info(f"工具注册: {tool.name} ({tool.tool_type})"
-                     + (f" | 风险={cap.risk.value}" if cap else ""))
+        cap = self.harness.register(tool) if self.harness else None  # 装了 harness 就登记能力表并拿回 cap，没装则为 None
+        _logger.info(f"工具注册: {tool.name} ({tool.tool_type})"  # 记注册成功日志：工具名 + 类型（local/mcp）
+                     + (f" | 风险={cap.risk.value}" if cap else ""))  # 有能力表时追加风险等级，没有就不追加
 
     # 【什么】批量注册工具
     # 【作用】启动阶段一次性装配，逐个走 register()，重名策略与单个注册一致
-    def register_batch(self, tools: List[BaseTool]):
+    def register_batch(self, tools: List[BaseTool]):  # 批量注册入口：接收工具实例列表
         """
         批量注册工具。
 
         Args:
             tools: 工具实例列表，逐个调用 register()，重名策略与单个注册一致。
         """
-        for tool in tools:
-            self.register(tool)
+        for tool in tools:  # 遍历传入的每个工具实例
+            self.register(tool)  # 逐个走单个注册流程（复用重名覆盖与能力登记逻辑）
 
     # 【什么】按名称取工具实例
     # 【作用】执行前的存在性检查入口；取不到返回 None，由上层转成错误 ToolResult
-    def get_tool(self, name: str) -> Optional[BaseTool]:
+    def get_tool(self, name: str) -> Optional[BaseTool]:  # 按名字查工具：命中返回实例，未命中返回 None
         """
         按名称获取工具实例。
 
@@ -136,23 +136,23 @@ class ToolRegistry:
         Returns:
             工具实例；不存在时返回 None，由调用方决定如何提示 LLM。
         """
-        return self._tools.get(name)
+        return self._tools.get(name)  # dict.get 未命中返回 None，避免 KeyError 打断流程
 
     # 【什么】列出全部已注册工具
     # 【作用】给全量调用或管理接口遍历用，顺序即注册顺序
-    def list_tools(self) -> List[BaseTool]:
+    def list_tools(self) -> List[BaseTool]:  # 返回全部已注册工具的实例列表
         """
         列出所有已注册工具。
 
         Returns:
             工具实例列表（基于 dict.values()，注册顺序即遍历顺序）。
         """
-        return list[BaseTool](self._tools.values())
+        return list[BaseTool](self._tools.values())  # 把注册表的 value 视图转成列表返回（Python 3.7+ dict 保序）
 
     # 【什么】生成发给模型的工具 schema 列表
     # 【作用】权限的"源头过滤"：模型看不到的工具就调不到（allowed 优先于 user_level）
     #        类比路由守卫：不是"进了接口再拦"，而是压根不把入口暴露出去
-    def get_openai_tools_schema(self, user_level: str = "normal", allowed: Optional[list] = None) -> list:
+    def get_openai_tools_schema(self, user_level: str = "normal", allowed: Optional[list] = None) -> list:  # 生成发给 LLM 的工具说明书；allowed 白名单优先，没有则按用户等级过滤
         """
         生成 OpenAI Function Calling 格式的工具说明书（JSON Schema 列表）。
 
@@ -178,27 +178,27 @@ class ToolRegistry:
         """
         # 归一化成名字集合：[<CalculatorTool>, 'data_query'] → {'calculator', 'data_query'}
         # （统一成名字比较，实例和字符串两种白名单写法都能用）
-        allowed_names = None
-        if allowed is not None:
-            allowed_names = {t if isinstance(t, str) else getattr(t, "name", "") for t in allowed}
-        schemas = []
-        for tool in self._tools.values():
-            if allowed_names is not None:
-                if tool.name not in allowed_names:
-                    _logger.debug(f"工具未授权，不暴露给模型: {tool.name}")
-                    continue
+        allowed_names = None  # 先置 None 表示"未传白名单"，走 user_level 兜底过滤
+        if allowed is not None:  # 调用方显式给了白名单（空列表也算给了，语义=全屏蔽）
+            allowed_names = {t if isinstance(t, str) else getattr(t, "name", "") for t in allowed}  # 集合推导归一化：字符串直接用，实例取 .name
+        schemas = []  # 收集最终要发给模型的 schema
+        for tool in self._tools.values():  # 遍历注册表里的每个工具
+            if allowed_names is not None:  # 有白名单：白名单是唯一准绳
+                if tool.name not in allowed_names:  # 工具名不在白名单里
+                    _logger.debug(f"工具未授权，不暴露给模型: {tool.name}")  # 记 debug 日志说明该工具被过滤
+                    continue  # 跳过，不放进 schema
             elif user_level == "normal" and tool.tool_type == "mcp":
                 continue                     # 兜底规则：普通用户默认见不到 MCP 远程工具
-            schemas.append(tool.to_openai_format())
-        return schemas
+            schemas.append(tool.to_openai_format())  # 通过过滤：转成 OpenAI 格式 schema 收进列表
+        return schemas  # 返回最终 schema 列表（可能为空，表示本轮无可用工具）
 
     # 【什么】单工具调用次数上限
     # 【作用】装配 Harness 时用它的预算配置，否则沿用本文件的默认值 5
-    def _tool_call_limit(self) -> int:
-        if self.harness is not None:
-            spec = getattr(self.harness.budgets, "spec", None)
-            return int(getattr(spec, "max_calls_per_tool", 0) or self._max_calls_per_tool)
-        return self._max_calls_per_tool
+    def _tool_call_limit(self) -> int:  # 取单工具限次值：优先 harness 预算配置，兜底用默认 5
+        if self.harness is not None:  # 装了 harness：去读它的预算配置
+            spec = getattr(self.harness.budgets, "spec", None)  # 防御性取 spec 对象，没有则为 None
+            return int(getattr(spec, "max_calls_per_tool", 0) or self._max_calls_per_tool)  # spec 没配或为 0 时回退默认值 5
+        return self._max_calls_per_tool  # 没装 harness：直接用本类默认值
 
     # ==================================================================
     # 【什么】工具调度的核心流水线（本文件的"main 函数"）
@@ -223,16 +223,16 @@ class ToolRegistry:
     #   harness  的 RunBudget 管"这一轮总共能花多少"（次数 / token / 墙钟）
     #   都过才放行，互不替代。
     # ==================================================================
-    def execute_tool(
-        self,
-        name: str,
-        params: dict,
-        session_id: str = "",
-        context: Optional[dict] = None,
-        principal: Any = None,
-        user_id: str = "",
-        iteration: int = 0,
-    ) -> ToolResult:
+    def execute_tool(  # 工具调度核心入口：接收 LLM 的工具调用请求并全程管控
+        self,  # 实例自身
+        name: str,  # LLM Function Calling 回的工具名（字符串）
+        params: dict,  # LLM 生成的调用参数（已解析成 dict）
+        session_id: str = "",  # 会话ID：去重与缓存隔离的 key，空串表示不做会话级隔离
+        context: Optional[dict] = None,  # 服务端私有参数（_data_scope/_dept_code 等），可覆盖模型参数
+        principal: Any = None,  # 权限载体（登录身份对象），供 harness 做权限与审计
+        user_id: str = "",  # 用户ID：审计与限流用
+        iteration: int = 0,  # 当前 ReAct 轮次：审计用
+    ) -> ToolResult:  # 返回统一结果对象（success/result/error/duration_ms/meta），全程不抛异常
         """
         执行工具调用（工具调度的核心入口）。不通过时返回失败的 ToolResult，不向上抛异常。
 
@@ -287,9 +287,9 @@ class ToolRegistry:
         #   "calc"                      → 模型幻觉出的名字，下一行直接拦掉
         #   get_tool("calculator") → <CalculatorTool object>（有 .name / .run() / .capability）
         #   get_tool("calc")       → None
-        tool: BaseTool | None = self.get_tool(name)
-        if not tool:
-            return ToolResult(success=False, error=f"工具不存在: {name}")
+        tool: BaseTool | None = self.get_tool(name)  # 按名字查注册表，拿到工具实例或 None
+        if not tool:  # 没查到（模型幻觉出的名字）
+            return ToolResult(success=False, error=f"工具不存在: {name}")  # 直接回失败结果，把错误名告诉模型
 
         # ② 能力声明：cap = 该工具的"体检表"（取值三级：工具自声明 → 配置覆盖 →
         #   策略兜底，这里拿到的已是最终值）。字段速查：
@@ -314,35 +314,35 @@ class ToolRegistry:
         #                  sandbox='none', requires_approval=False, permissions=(), data_scopes=(),
         #                  max_result_chars=0, timeout_seconds=0.0, description='只读计算，无外部副作用')
         #   harness 未装配 → cap=None，③ 治理段整段跳过（改造前的原行为）
-        cap = self.harness.capability_of(tool) if self.harness is not None else None
+        cap = self.harness.capability_of(tool) if self.harness is not None else None  # 取工具能力表；未装 harness 则为 None（治理段跳过）
         # req = 本次调用的"档案袋"：工具名、参数、会话/用户、能力表打包给 Harness
         # 工具调用
-        req = ToolCallRequest(
-            tool_name=name, arguments=dict[str, Any](params or {}), session_id=session_id, user_id=user_id,
-            principal=principal, capability=cap, iteration=iteration, context=dict(context or {}),
+        req = ToolCallRequest(  # 组装调用请求对象，供治理裁决与审计使用
+            tool_name=name, arguments=dict[str, Any](params or {}), session_id=session_id, user_id=user_id,  # 工具名/参数副本（防空）/会话ID/用户ID
+            principal=principal, capability=cap, iteration=iteration, context=dict(context or {}),  # 权限载体/能力表/ReAct 轮次/私有参数副本
         )
         # ③ 治理裁决（Harness 未装配时整段跳过）：
         #   before_call = Guard（策略）+ Pipe（参数）+ 中间件 + 人工审批 的总入口。
         #   【为什么拦截也要审计】越权尝试正是安全审计最该看到的东西
-        if self.harness is not None:
+        if self.harness is not None:  # 只有装了 harness 才走治理管线
             # 调用之前 权限 参数 校验
-            verdict = self.harness.before_call(req)
-            if not verdict.allowed:
+            verdict = self.harness.before_call(req)  # 调用前裁决：策略/中间件/审批，返回放行与否的裁决对象
+            if not verdict.allowed:  # 裁决为禁止（策略禁止/审批未过/参数越界等）
                 # 记录拦截事件
-                self.harness.record_intercepted(req, cap, verdict.reason, verdict.code)
-                return ToolResult(
-                    success=False, error=verdict.reason,
-                    meta={"code": verdict.code, "risk": cap.risk.value if cap else ""},
+                self.harness.record_intercepted(req, cap, verdict.reason, verdict.code)  # 把拦截原因与代码写入审计台账
+                return ToolResult(  # 返回失败结果，把中文原因回给模型
+                    success=False, error=verdict.reason,  # success 置 False，error 装裁决给出的中文原因
+                    meta={"code": verdict.code, "risk": cap.risk.value if cap else ""},  # meta 带拦截码与风险等级，供上层排查
                 )
             params = verdict.arguments          # 人工批准时可能改过参数（modify）
 
         # ④-1 单工具限次（闸门2）：累计超上限后不再执行，
         #   回失败结果让模型看到"此路不通"，主动换思路收尾
-        limit = self._tool_call_limit()
-        if self._call_counts[name] >= limit:
-            return ToolResult(
-                success=False,
-                error=f"工具 {name} 调用次数超限({limit})，疑似死循环，已拦截",
+        limit = self._tool_call_limit()  # 取当前生效的单工具限次值（harness 配置或默认 5）
+        if self._call_counts[name] >= limit:  # 该工具累计真跑次数已达上限
+            return ToolResult(  # 回失败结果，不再执行
+                success=False,  # 标记失败
+                error=f"工具 {name} 调用次数超限({limit})，疑似死循环，已拦截",  # 告诉模型超限原因
             )
 
         # ④-2 同参去重（闸门3）：去重键 = "工具名:参数指纹"
@@ -350,55 +350,55 @@ class ToolRegistry:
         #   【为什么回传而不是报错】报错会让模型以为"工具坏了"继续重试；
         #   把答案原样返回，模型才有依据收尾 —— 既省一轮 LLM，也省 10 倍 token。
         #   命中但上次失败 → 拒绝重复执行，让模型换参数再试。
-        param_key = self._hash_params(params)
-        dedup_key = f"{name}:{param_key}"
-        if dedup_key in self._call_records.get(session_id, set()):
-            cached = self._result_cache.get(session_id, {}).get(dedup_key)
-            if cached is not None and cached.success:
-                _logger.info(f"工具重复调用命中缓存，直接回传上次结果: {dedup_key}")
-                return ToolResult(success=True, result=cached.result, duration_ms=0)
-            _logger.warning(f"工具重复调用拦截: {dedup_key} session={session_id}")
-            return ToolResult(
-                success=False,
-                error=f"工具 {name} 已用相同参数调用过，拒绝重复执行（防死循环）",
+        param_key = self._hash_params(params)  # 把参数 dict 转成与 key 顺序无关的指纹字符串
+        dedup_key = f"{name}:{param_key}"  # 拼出去重键：工具名 + 冒号 + 参数指纹
+        if dedup_key in self._call_records.get(session_id, set()):  # 本会话账本里已有这个键 → 同参重复调用
+            cached = self._result_cache.get(session_id, {}).get(dedup_key)  # 去缓存账里找上次的结果
+            if cached is not None and cached.success:  # 有缓存且上次是成功结果
+                _logger.info(f"工具重复调用命中缓存，直接回传上次结果: {dedup_key}")  # 记 info 日志：命中缓存
+                return ToolResult(success=True, result=cached.result, duration_ms=0)  # 原样回传上次答案，耗时记 0
+            _logger.warning(f"工具重复调用拦截: {dedup_key} session={session_id}")  # 无缓存或上次失败：记 warning 拦截日志
+            return ToolResult(  # 回失败结果，让模型换参数再试
+                success=False,  # 标记失败
+                error=f"工具 {name} 已用相同参数调用过，拒绝重复执行（防死循环）",  # 说明拒绝原因
             )
 
         # ⑤ 组装实参：context 是服务端注入的私有参数（_data_scope/_dept_code 等），
         #   后写入所以能盖住模型给的值 —— 模型伪造不了数据范围
-        call_params = dict(params or {})
-        if context:
+        call_params = dict(params or {})  # 先拷贝模型给的参数（params 为 None 时用空 dict）
+        if context:  # 有服务端私有参数要注入
             call_params.update(context)         # 私有参数后写入，模型给的参数盖不住它
 
         # ⑥ 执行：Harness 按 cap.sandbox 选工位（进程内/子进程/容器）；
         #   未装配 harness 时就是原来的 tool.run()
-        if self.harness is not None:
-            result = self.harness.execute(tool, call_params, cap)
-        else:
-            result = tool.run(call_params)
+        if self.harness is not None:  # 装了 harness：走沙箱执行管线
+            result = self.harness.execute(tool, call_params, cap)  # 由 harness 按能力表选执行环境并跑
+        else:  # 没装 harness：退回最朴素的直跑
+            result = tool.run(call_params)  # 直接在进程内调用工具的 run() 方法
 
         # ⑦ 记账：只在真正发起执行后才计数 —— 被拦截/去重的调用不占配额
         self._call_counts[name] += 1   # 只在真正发起执行后计数：失败调用不占配额
-        if session_id:
-            self._call_records[session_id].add(dedup_key)
+        if session_id:  # 有会话ID才记去重账（空会话不隔离去重）
+            self._call_records[session_id].add(dedup_key)  # 把去重键写入本会话账本
 
         # ⑧ 结果过滤（裁剪 + 脱敏）与审计；过滤后再缓存，
         #   保证重复调用回传的是同一份文本（模型前后看到的一致）
-        if self.harness is not None:
-            result = self.harness.after_call(result, req, cap)
-        if session_id and result.success:
+        if self.harness is not None:  # 装了 harness：走后置处理
+            result = self.harness.after_call(result, req, cap)  # 裁剪脱敏 + token 记账 + 审计落盘
+        if session_id and result.success:  # 有会话且执行成功才进缓存
             # 【为什么只缓存成功的】失败结果被回传会让模型误以为"答案就是这样"，
             #   失败必须让它看到错误，才有机会改参数重试。
-            self._result_cache[session_id][dedup_key] = result
+            self._result_cache[session_id][dedup_key] = result  # 把成功结果按去重键写进缓存账
 
-        return result
+        return result  # 把最终 ToolResult 返回给上层（ReActAgent）
 
     # 【什么】生成参数指纹
     # 【作用】排序后序列化，保证传参顺序不同也能判定为同一次调用
     #   类比 JS 手写 memoize：缓存键常用 JSON.stringify(args)，但 stringify
     #   依赖 key 顺序（{"a":1,"b":2} 与 {"b":2,"a":1} 串不同）；
     #   这里先 sorted() 再 str()，与顺序无关，指纹稳定。
-    @staticmethod
-    def _hash_params(params: dict) -> str:
+    @staticmethod  # 静态方法：不依赖实例状态，纯工具函数
+    def _hash_params(params: dict) -> str:  # 参数指纹生成器：把 dict 转成稳定字符串
         """
         生成参数指纹（用于去重时判断两次调用的参数是否完全一致）。
 
@@ -410,16 +410,16 @@ class ToolRegistry:
             {"a":1,"b":2} 与 {"b":2,"a":1} 得到相同指纹（与传参顺序无关）。
             params 为空时返回空字符串。
         """
-        if not params:
-            return ""
-        return str(sorted(params.items()))
+        if not params:  # 参数为空或为 None
+            return ""  # 空参数返回空串，保证指纹一致性
+        return str(sorted(params.items()))  # 先按 key 排序再序列化成字符串，顺序无关
 
     # 【什么】清空某会话的去重账本与结果缓存，并重置全局调用计数
     # 【作用】新一轮提问前调用。不清的后果：
     #   去重账不清 → 这一轮调相同参数会被上一轮的记录误判成"重复"
     #   缓存不清   → 这一轮拿到的是上一轮的旧答案
     #   计数不清   → 上一轮的配额被带到这一轮，明明没调几次就被拦
-    def reset_session(self, session_id: str):
+    def reset_session(self, session_id: str):  # 会话级重置：新提问前调用，隔离轮次
         """
         重置调用记录（每轮新提问或开启新会话前调用）。
 
@@ -429,19 +429,19 @@ class ToolRegistry:
         Args:
             session_id: 要清除去重记录的会话ID。
         """
-        if session_id in self._call_records:
-            del self._call_records[session_id]
+        if session_id in self._call_records:  # 该会话存在去重账本
+            del self._call_records[session_id]  # 删去重集合：允许本轮重新调相同参数
         # 结果缓存必须与去重账本一起清，否则新一轮拿到的是上一轮的旧答案
-        if session_id in self._result_cache:
-            del self._result_cache[session_id]
-        self._call_counts.clear()
+        if session_id in self._result_cache:  # 该会话有结果缓存
+            del self._result_cache[session_id]  # 删缓存：防止把上一轮答案回放给本轮
+        self._call_counts.clear()  # 全局计数清零：单工具限次配额重置
         # 新一轮提问 = 新预算：把上一轮的预算账本一并销掉，避免配额被上轮吃掉
-        if self.harness is not None:
-            self.harness.end_run(session_id)
+        if self.harness is not None:  # 装了 harness：也清 harness 侧的预算/审计账
+            self.harness.end_run(session_id)  # 通知 harness 结束本轮，销掉预算账
 
     # 【什么】返回两个内置本地工具的新实例
     # 【作用】函数内延迟 import 兜住循环依赖，装配默认工具集时直接调用
-    def get_default_tools(self) -> List[BaseTool]:
+    def get_default_tools(self) -> List[BaseTool]:  # 返回内置默认工具列表（每次调用生成新实例）
         """
         获取内置默认工具集（进程内本地工具）。
 
@@ -452,6 +452,6 @@ class ToolRegistry:
             CalculatorTool 安全计算器（AST 白名单求值）、
             DataQueryTool 模拟业务数据查询（用户/订单/库存）。
         """
-        from modules.tools.calculator import CalculatorTool
-        from modules.tools.data_query import DataQueryTool
-        return [CalculatorTool(), DataQueryTool()]
+        from modules.tools.calculator import CalculatorTool  # 延迟 import：避免模块级循环依赖
+        from modules.tools.data_query import DataQueryTool  # 延迟 import：避免模块级循环依赖
+        return [CalculatorTool(), DataQueryTool()]  # 每次返回新实例，避免共享状态污染
