@@ -105,15 +105,17 @@ class TeamState(TypedDict):
 
 ### 3.2 依赖管理
 
-**手写版本**（[harness.py:836-851](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L851)）：
+**手写版本**（[harness.py:836-848](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L848)）：
 
 ```python
-# 拓扑分批 + 线程池并行
-with ThreadPoolExecutor(max_workers=4) as pool:
-    futures = {pool.submit(self._execute, task, ctx): task for task in batch}
-    for future in as_completed(futures):
-        output = future.result()
-        ctx.upstream[output.task_id] = output  # ← 写进"成果袋"
+# ① 线程池并行：提交本批全部任务，逐个等齐（按提交顺序，不是完成顺序）
+with ThreadPoolExecutor(max_workers=min(self.config.max_workers, len(batch))) as pool:
+    futures = {pool.submit(_one, t): t for t in batch}
+    for future, task in futures.items():
+        outputs.append(future.result(timeout=wait))  # 带超时等待
+
+# ② 等齐后，主循环统一写进"成果袋"（harness.py:512）
+ctx.upstream[out.task_id] = out  # 下游任务由此拿到上游结果
 ```
 
 **LangGraph 版本**（[langgraph_multiagent.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/langgraph_multiagent.py)）：

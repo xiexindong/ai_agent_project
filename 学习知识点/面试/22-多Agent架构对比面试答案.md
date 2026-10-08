@@ -176,15 +176,27 @@ messages = [
 # ← 每次执行新建 messages，不继承主对话历史
 ```
 
-**依赖等待**（[harness.py:836-851](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L851)）：
+**依赖等待**（[harness.py:836-848](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L848)，逐字源码）：
 
 ```python
-with ThreadPoolExecutor(max_workers=4) as pool:
-    futures = {pool.submit(self._execute, task, ctx): task for task in batch}
-    for future in as_completed(futures):  # ← 谁先完成谁先返回
-        task = futures[future]
-        output = future.result()
-        ctx.upstream[output.task_id] = output  # ← 结果写进"成果袋"
+with ThreadPoolExecutor(max_workers=min(self.config.max_workers, len(batch))) as pool:  # 线程数 = 配置上限与本批任务数取小
+    futures = {pool.submit(_one, t): t for t in batch}  # 全部提交：future → 任务 映射（_one 是方法内局部闭包）
+    for future, task in futures.items():  # 按提交顺序收结果（注：不是完成顺序）
+        wait = max(deadline - time.time(), 1.0)  # 剩余时间不足 1 秒也至少等 1 秒
+        try:
+            outputs.append(future.result(timeout=wait))  # 带超时等待
+        except FutureTimeout:  # 等待超时（任务还在跑）
+            outputs.append(AgentOutput.failed(task.assignee, task.id, "任务执行超时"))
+        except Exception as e:  # 任务内部抛异常
+            outputs.append(AgentOutput.failed(task.assignee, task.id, f"{type(e).__name__}: {e}"))
+```
+
+**成果袋写入**——批次全部等齐后，由主循环统一登记（[harness.py:506-512](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L506-L512)）：
+
+```python
+for out in batch_outputs:  # 处理本批每个产出
+    result.outputs.append(out)  # 写进对外账单
+    ctx.upstream[out.task_id] = out  # 挂到上游产出表，下游任务可见
 ```
 
 ### 3.3 模式 B（LangGraph）的代码实现
@@ -257,11 +269,12 @@ class GroupChat:
 
 **Q3：主管怎么知道 Worker 都完成了？**
 
-> `as_completed` + `ctx.upstream` 字典（[harness.py:836-851](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L851)）：
-> - `as_completed` 保证"谁先完成谁先写进字典"
+> 批内等齐 + 批间串行（[harness.py:836-848](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L836-L848)）：
+> - 线程池提交本批全部任务后，逐个 `future.result(timeout=剩余时间)` **等齐**才返回（按提交顺序收，不是 as_completed）
+> - 全部收齐后，主循环把产出逐条写进 `ctx.upstream`（[harness.py:506-512](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L506-L512)）
 > - `ctx.upstream` 是一个字典，key 是 `task_id`，value 是 `AgentOutput`
 > - 下游任务通过 `ctx.upstream` 拿到所有上游结果
-> - **批间串行**：第 2 批必须等第 1 批全部完成才启动
+> - **批间串行**：第 2 批必须等第 1 批全部完成才启动（拓扑分批的天然保证）
 
 **Q4：消息总线和发布订阅区别？**
 
