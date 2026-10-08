@@ -5,75 +5,75 @@ FastAPI 后端服务模块
 所有接口统一鉴权、限流、多用户隔离。
 """
 # ---- 标准库：文件/系统/序列化/唯一号/时间/异步/线程 ----
-import os
-import sys
-import json
-import uuid
-import time
-import asyncio
-import threading
-from pathlib import Path
-from typing import Any, Optional, Union, TYPE_CHECKING
-from contextlib import asynccontextmanager
+import os  # 操作系统接口：环境变量、路径拼接等
+import sys  # 解释器接口：取 sys.executable 作为 MCP 子进程启动命令
+import json  # 序列化：SSE 事件帧的 data 字段要 dumps 成 JSON 字符串
+import uuid  # 唯一号生成：新会话 session_id、团队会话号
+import time  # 时间函数：后台对账线程的 sleep
+import asyncio  # 异步运行时：to_thread 跑同步 Agent、sleep 控制打字机节奏
+import threading  # 线程：对账循环跑在 daemon 线程里
+from pathlib import Path  # 面向对象路径：定位 static 目录
+from typing import Any, Optional, Union, TYPE_CHECKING  # 类型标注：可选/联合/仅类型检查期导入
+from contextlib import asynccontextmanager  # 异步上下文管理器：定义 lifespan 启动/停止钩子
 # ---- FastAPI 全家桶：应用/依赖注入/异常/上传表单/跨域/静态文件/响应类型 ----
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form  # 框架核心件
+from fastapi.middleware.cors import CORSMiddleware  # 跨域中间件：浏览器前端直连必备
+from fastapi.staticfiles import StaticFiles  # 静态文件子应用：托管 /static 下的前端资源
+from fastapi.responses import FileResponse, StreamingResponse  # 文件响应与 SSE 流式响应
 # ---- Pydantic：请求/响应体基类，以及上传图片校验失败时拿到的异常类型 ----
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError  # 请求体模型基类 + 校验异常（图片 data URL 校验）
 # ---- 项目内公共件：日志器、业务流水号与请求上下文 ----
-from modules.common.logger import get_logger
-from modules.common.context import new_task_id, set_request_context
+from modules.common.logger import get_logger  # 统一日志器工厂
+from modules.common.context import new_task_id, set_request_context  # 业务流水号生成与请求上下文写入
 # ---- 统一鉴权：依赖注入函数、权限/等级要求、会话归属校验 ----
 from modules.api.auth import (
-    get_current_user,
-    RequirePermission,
-    RequirePerm,
-    UserLevel,
-    AuthManager,
+    get_current_user,  # 依赖注入：解析 token 得到当前用户
+    RequirePermission,  # 依赖注入：要求指定用户等级
+    RequirePerm,  # 依赖注入：要求指定权限码
+    UserLevel,  # 用户等级枚举（ADMIN/ADVANCED/...）
+    AuthManager,  # 鉴权管理器：会话归属校验等静态方法
 )
 # ---- Agent：LangGraph 编排外壳、ReAct 业务引擎、大模型客户端 ----
-from modules.agent.graph import AgentGraph
-from modules.agent.react_agent import ReActAgent
-from modules.agent.llm import LLMClient
+from modules.agent.graph import AgentGraph  # LangGraph 编排外壳：路由实际调用的入口
+from modules.agent.react_agent import ReActAgent  # ReAct 推理引擎：思考-行动-观察循环
+from modules.agent.llm import LLMClient  # 大模型客户端：统一封装模型调用与用量落库
 # ---- 工具注册、双层记忆与 PG ----
-from modules.tools.tool_registry import ToolRegistry
-from modules.memory.memory_manager import MemoryManager
-from modules.memory.pg_manager import PGManager
+from modules.tools.tool_registry import ToolRegistry  # 工具注册表：注册/去重/限次/治理
+from modules.memory.memory_manager import MemoryManager  # 双层记忆：短期历史 + 长期摘要
+from modules.memory.pg_manager import PGManager  # Postgres 管理器：会话/历史/审核/标准答案
 # ---- 多模态（团队接口的图片输入）、多 Agent 编排与数据模型 ----
-from modules.multimodal.media import MultiModalInput, ImagePart
-from modules.multiagent.harness import build_harness
-from modules.multiagent.models import EvalCase, RunResult
+from modules.multimodal.media import MultiModalInput, ImagePart  # 多模态输入模型与图片部件
+from modules.multiagent.harness import build_harness  # 多 Agent 运行时工厂
+from modules.multiagent.models import EvalCase, RunResult  # 评测用例与运行结果模型
 # ---- 全局配置单例 ----
-from config import get_settings
+from config import get_settings  # 配置单例工厂：全模块共享同一份 Settings
 
 # 【什么】只在类型检查阶段执行的导入（TYPE_CHECKING 恒为 False，运行时不导入）
 # 【作用】给 AppContext 字段标注真实类型，避免退化成 object 导致调用方法被判错；
 #        运行时不导入，防止拉起 pymilvus / crewai 等重型可选依赖，也避免循环导入
 if TYPE_CHECKING:
-    from modules.rag.rag_chain import RAGChain
-    from modules.rag.llamaindex_adapter import LlamaIndexRAG
-    from modules.skills.skill_registry import SkillRegistry
-    from modules.multiagent.harness import AgentHarness
-    from modules.multiagent.crewai_backend import CrewAIBackend
-    from modules.mcp.gateway import MCPGateway
-    from modules.mcp.mcp_client import MCPClient
+    from modules.rag.rag_chain import RAGChain  # 自研 RAG 链路（仅类型标注用）
+    from modules.rag.llamaindex_adapter import LlamaIndexRAG  # LlamaIndex 适配 RAG 链路
+    from modules.skills.skill_registry import SkillRegistry  # 技能注册表
+    from modules.multiagent.harness import AgentHarness  # 多 Agent 运行时
+    from modules.multiagent.crewai_backend import CrewAIBackend  # CrewAI 编排后端
+    from modules.mcp.gateway import MCPGateway  # MCP 技能网关
+    from modules.mcp.mcp_client import MCPClient  # MCP 直连客户端（旧字段兼容）
 
 # 本模块统一日志器：名 "api"，日志前缀据此显示，也可按模块名做日志过滤
-_logger = get_logger("api")
+_logger = get_logger("api")  # 模块级日志器单例
 
 
 # 【什么】POST /chat 的请求体
 # 【作用】带 session_id 表示续聊，不带则由服务端新开一个会话
-class ChatRequest(BaseModel):
+class ChatRequest(BaseModel):  # Pydantic 请求体模型
     session_id: Optional[str] = None   # 已有会话号；不传 = 新会话
     query: str                         # 用户这一轮的输入
 
 
 # 【什么】对话结果的响应体
 # 【作用】把一轮对话的产出字段固定下来，前端按名字取值
-class ChatResponse(BaseModel):
+class ChatResponse(BaseModel):  # Pydantic 响应体模型
     session_id: str           # 会话号
     answer: str               # 最终答案
     summary: str              # 本轮摘要，供长期记忆使用
@@ -84,7 +84,7 @@ class ChatResponse(BaseModel):
 
 # 【什么】POST /agent/team/run 的请求体
 # 【作用】描述要交给团队完成的任务、可选图片与编排后端
-class TeamRunRequest(BaseModel):
+class TeamRunRequest(BaseModel):  # 团队运行请求体
     """多 Agent 团队运行请求。images 传 data URL 或 http(s) 图片链接。"""
 
     query: str                         # 交给团队的任务
@@ -95,15 +95,14 @@ class TeamRunRequest(BaseModel):
 
 # 【什么】POST /agent/eval 的请求体
 # 【作用】cases 为空时只跑内置连通性用例，验链路不验质量
-class AgentEvalRequest(BaseModel):
+class AgentEvalRequest(BaseModel):  # 评测请求体
     """多 Agent 评测请求。cases 为空时用内置默认用例跑一次连通性。"""
-
     cases: list[dict] = []   # 评测用例；空列表 = 只跑内置默认用例
 
 
 # 【什么】会话信息的响应体
 # 【作用】新建会话后回给前端会话号、归属用户与创建时间
-class SessionResponse(BaseModel):
+class SessionResponse(BaseModel):  # 会话信息响应体
     session_id: str   # 会话号
     user_id: str      # 归属用户工号
     created_at: str   # 创建时间
@@ -111,7 +110,7 @@ class SessionResponse(BaseModel):
 
 # 【什么】POST /reviews/{review_id}/review 的请求体
 # 【作用】承载审核动作；通过时可用标准答案反哺标准答案库
-class ReviewRequest(BaseModel):
+class ReviewRequest(BaseModel):  # 人工审核请求体
     action: str                 # 审核动作：approved / rejected
     question: str = ""          # 对应问题；与标准答案一起入库
     standard_answer: str = ""   # 人工标准答案，作为 Few-shot 来源
@@ -148,16 +147,16 @@ def _reconcile_loop(interval_hours: int):
     warning 不抛），没人主动查就永远发现不了。定时对账是唯一的兜底。
     大厂用 MQ + 独立对账服务，阶段1 先用一个 daemon 线程顶上。
     """
-    while True:
-        time.sleep(interval_hours * 3600)
+    while True:  # 无限循环：daemon 线程随主进程退出而终止
+        time.sleep(interval_hours * 3600)  # 睡够一个对账周期（小时转秒）
         try:
-            from modules.enterprise.reconcile import reconcile
+            from modules.enterprise.reconcile import reconcile  # 延迟导入：避免模块加载时的循环依赖
 
-            result = reconcile(hours=max(interval_hours * 2, 24))
-            if not result.get("ok") or result.get("pg_only") or result.get("mysql_only"):
-                _logger.warning(f"定时对账发现不一致: {result}")
+            result = reconcile(hours=max(interval_hours * 2, 24))  # 对账窗口至少 24 小时，覆盖可能的延迟
+            if not result.get("ok") or result.get("pg_only") or result.get("mysql_only"):  # 任一侧有单边数据即异常
+                _logger.warning(f"定时对账发现不一致: {result}")  # 告警但不中断：对账是监控手段不是阻断器
         except Exception as e:
-            _logger.warning(f"定时对账异常: {e}")
+            _logger.warning(f"定时对账异常: {e}")  # 吞掉异常保循环：对账线程挂了主服务也不能停
 
 
 # 【什么】FastAPI 生命周期钩子：启动时拉起对账线程
@@ -165,18 +164,18 @@ def _reconcile_loop(interval_hours: int):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """服务启动/停止钩子：拉起后台对账线程（RECONCILE_INTERVAL_HOURS=0 关闭）。"""
-    interval = int(get_settings().reconcile_interval_hours)
-    if interval > 0:
-        threading.Thread(target=_reconcile_loop, args=(interval,), daemon=True).start()
-        _logger.info(f"跨库对账后台任务已启动: 每 {interval} 小时一次")
-    yield
+    interval = int(get_settings().reconcile_interval_hours)  # 从配置读对账间隔（小时）
+    if interval > 0:  # 0 表示关闭对账，不启线程
+        threading.Thread(target=_reconcile_loop, args=(interval,), daemon=True).start()  # daemon 线程：主进程退出时自动回收
+        _logger.info(f"跨库对账后台任务已启动: 每 {interval} 小时一次")  # 启动日志确认对账线程就位
+    yield  # yield 之后是停止钩子（当前无清理逻辑）
 
 
 # 【什么】创建 FastAPI 应用实例
 # 【作用】配好 CORS 与静态目录挂载，并挂上 lifespan 钩子；路由由 APIServer 注册
-def create_app() -> FastAPI:
+def create_app() -> FastAPI:  # 应用工厂函数
     """创建 FastAPI 应用实例。"""
-    app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="企业级 AI Agent 智能助手", version="1.0.0", lifespan=lifespan)  # 建实例并挂生命周期钩子
 
     # 配置里按逗号写允许的前端来源，这里逐个去空白；空串项丢掉，避免匹配到非法来源
     origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]

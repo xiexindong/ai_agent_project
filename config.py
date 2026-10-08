@@ -6,12 +6,12 @@
 """
 # 【什么】配置加载依赖
 # 【作用】lru_cache 做单例缓存、pydantic-settings 按 alias 读环境变量、dotenv 负责读 .env
-import os
-from pathlib import Path
-from functools import lru_cache
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from dotenv import load_dotenv
+import os  # 操作系统接口：操作环境变量
+from pathlib import Path  # 面向对象路径：定位 .env 文件
+from functools import lru_cache  # 缓存装饰器：配置单例只初始化一次
+from pydantic import Field, field_validator  # 配置字段与校验器
+from pydantic_settings import BaseSettings, SettingsConfigDict  # 配置基类与模型配置
+from dotenv import load_dotenv  # 加载 .env 文件到环境变量
 
 
 _PROJECT_DIR = Path(__file__).resolve().parent   # 本项目根目录（config.py 所在目录）
@@ -19,11 +19,11 @@ _PARENT_DIR = _PROJECT_DIR.parent                # 父目录，用于找多项�
 
 # 【什么】按优先级加载 .env
 # 【作用】把 .env 键值注入 os.environ，Settings 才能按 alias 读到；三级兜底保证总有加载动作
-if (_PROJECT_DIR / ".env").exists():
+if (_PROJECT_DIR / ".env").exists():  # 优先查项目根目录
     load_dotenv(_PROJECT_DIR / ".env")      # 优先：本项目自己的 .env
-elif (_PARENT_DIR / ".env").exists():
+elif (_PARENT_DIR / ".env").exists():  # 次之查父目录
     load_dotenv(_PARENT_DIR / ".env")       # 次之：父目录里的共用 .env
-else:
+else:  # 都没找到：让 dotenv 自己向上查找
     load_dotenv()                           # 兜底：交给 dotenv 自己向上查找
 
 
@@ -47,14 +47,14 @@ class Settings(BaseSettings):
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")                           # 联网搜索工具密钥
 
     # ---- PostgreSQL：记忆库 + 业务表（pgvector 存记忆向量）----
-    pg_host: str = Field(default="localhost", alias="PG_HOST")
+    pg_host: str = Field(default="localhost", alias="PG_HOST")                                # PG 主机地址
     pg_port: int = Field(default=5432, alias="PG_PORT")                                       # PG 默认端口
-    pg_user: str = Field(default="postgres", alias="PG_USER")
-    pg_password: str = Field(default="postgres", alias="PG_PASSWORD")
+    pg_user: str = Field(default="postgres", alias="PG_USER")                                 # PG 用户名
+    pg_password: str = Field(default="postgres", alias="PG_PASSWORD")                         # PG 密码
     pg_database: str = Field(default="ai_agent", alias="PG_DATABASE")                          # 库名
 
     # ---- Milvus：知识库向量 ----
-    milvus_host: str = Field(default="localhost", alias="MILVUS_HOST")
+    milvus_host: str = Field(default="localhost", alias="MILVUS_HOST")                        # Milvus 主机地址
     milvus_port: int = Field(default=19530, alias="MILVUS_PORT")                              # Milvus 默认端口
     milvus_collection: str = Field(default="knowledge_base", alias="MILVUS_COLLECTION")       # 单集合模式下的集合名
 
@@ -66,10 +66,10 @@ class Settings(BaseSettings):
     milvus_default_kb: str = Field(default="public", alias="MILVUS_DEFAULT_KB")               # 未指定知识库时的默认 kb_code
 
     # ---- MySQL：企业权限库（用户 / 角色 / 权限 / 知识库授权）----
-    mysql_host: str = Field(default="localhost", alias="MYSQL_HOST")
+    mysql_host: str = Field(default="localhost", alias="MYSQL_HOST")                          # MySQL 主机地址
     mysql_port: int = Field(default=3306, alias="MYSQL_PORT")                                 # MySQL 默认端口
-    mysql_user: str = Field(default="root", alias="MYSQL_USER")
-    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")
+    mysql_user: str = Field(default="root", alias="MYSQL_USER")                               # MySQL 用户名
+    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")                           # MySQL 密码
     mysql_database: str = Field(default="ai_agent_enterprise", alias="MYSQL_DATABASE")        # 权限库名
     rbac_enabled: bool = Field(default=True, alias="RBAC_ENABLED")                            # 权限总开关：False 时全部请求走内存 Key
     rbac_cache_ttl: int = Field(default=60, alias="RBAC_CACHE_TTL")                           # 权限缓存秒数，改权限最多延迟这么久生效
@@ -327,28 +327,28 @@ class Settings(BaseSettings):
     def pg_dsn(self) -> str:
         # 【什么】拼接 PostgreSQL 连接串
         # 【作用】 PGManager 等组件统一用它建连，避免各处手拼、漏改一处就连不上
-        return (
-            f"postgresql://{self.pg_user}:{self.pg_password}"
-            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
+        return (  # 返回标准 PostgreSQL DSN 格式
+            f"postgresql://{self.pg_user}:{self.pg_password}"  # 用户名密码段
+            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"  # 主机端口库名段
         )
 
-    @field_validator("deepseek_api_key", "zhipu_api_key")
+    @field_validator("deepseek_api_key", "zhipu_api_key")  # 对两个密钥字段做校验
     @classmethod
     def _check_key_not_empty(cls, v: str, info) -> str:
         # 【什么】校验两个模型密钥是否为空
         # 【作用】 为空只打告警不抛错，保证本机没配 Key 也能跑 ingest/stats 这类命令
-        if not v:
-            import logging
-            logging.warning(f"配置项 {info.field_name} 为空，请检查 .env 文件")
-        return v
+        if not v:  # 字段值为空字符串
+            import logging  # 延迟导入：避免模块加载时就初始化日志
+            logging.warning(f"配置项 {info.field_name} 为空，请检查 .env 文件")  # 告警提示哪个字段为空
+        return v  # 原样返回（不阻断启动）
 
 
 # 【什么】全局配置单例（lru_cache 只缓存 1 份）
 # 【作用】 .env 只解析一次，任何地方 get_settings() 拿到的都是同一个对象
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
+@lru_cache(maxsize=1)  # 缓存最多 1 个实例：全局唯一
+def get_settings() -> Settings:  # 配置单例工厂
     """获取全局配置单例（带缓存，避免重复解析 .env）。"""
-    return Settings()
+    return Settings()  # 首次调用时实例化，后续直接返回缓存
 
 
 # 【什么】开启 LangSmith 追踪（往 os.environ 写 8 个变量）
@@ -408,16 +408,16 @@ def setup_langsmith():
 
     返回值：无（仅通过修改 os.environ 产生副作用）。
     """
-    s = get_settings()
-    if not s.langsmith_api_key:
-        return
+    s = get_settings()  # 取配置单例
+    if not s.langsmith_api_key:  # 没配 Key：静默跳过
+        return  # 直接返回，不写任何环境变量
     # ---- 新名（官方文档现行写法，langsmith SDK 优先读这一套）----
-    os.environ["LANGSMITH_TRACING"] = "true"
-    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
-    os.environ["LANGSMITH_API_KEY"] = s.langsmith_api_key
-    os.environ["LANGSMITH_PROJECT"] = s.langsmith_project
+    os.environ["LANGSMITH_TRACING"] = "true"  # 新名：开启追踪
+    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"  # 新名：追踪服务端点
+    os.environ["LANGSMITH_API_KEY"] = s.langsmith_api_key  # 新名：API 密钥
+    os.environ["LANGSMITH_PROJECT"] = s.langsmith_project  # 新名：项目名称
     # ---- 旧名（LANGCHAIN_ 前缀，老版本 SDK 仍读这一套，追踪开关带 V2 后缀）----
-    os.environ["LANGCHAIN_TRACING_V2"] = "true"
-    os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-    os.environ["LANGCHAIN_API_KEY"] = s.langsmith_api_key
-    os.environ["LANGCHAIN_PROJECT"] = s.langsmith_project
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"  # 旧名：开启追踪（带 V2 后缀）
+    os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"  # 旧名：追踪服务端点
+    os.environ["LANGCHAIN_API_KEY"] = s.langsmith_api_key  # 旧名：API 密钥
+    os.environ["LANGCHAIN_PROJECT"] = s.langsmith_project  # 旧名：项目名称

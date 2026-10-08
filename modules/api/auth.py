@@ -4,16 +4,16 @@
 企业级后端安全：用户鉴权、请求限流、权限分级、会话隔离校验。
 覆盖边界9.5：用户身份权限隔离、会话权限管控、工具权限分级、接口鉴权、资源访问限流。
 """
-import time
-from collections import defaultdict
-from typing import Optional
-from enum import Enum
-from fastapi import Request, HTTPException, Security, Header
-from fastapi.security import APIKeyHeader
-from modules.common.logger import get_logger
-from config import get_settings
+import time  # 时间戳：滑动窗口限流记录请求时刻
+from collections import defaultdict  # 默认字典：用户→请求时刻列表的映射自动初始化空列表
+from typing import Optional  # 类型标注：API Key 查不到时返回 None
+from enum import Enum  # 枚举基类：用户权限等级可枚举可比较
+from fastapi import Request, HTTPException, Security, Header  # FastAPI 核心：请求对象/异常/依赖/头
+from fastapi.security import APIKeyHeader  # API Key 提取器：从请求头取 X-API-Key
+from modules.common.logger import get_logger  # 统一日志器工厂
+from config import get_settings  # 配置单例工厂
 
-_logger = get_logger("auth")
+_logger = get_logger("auth")  # 本模块日志器，名 "auth"
 
 
 # 【什么】用户权限等级枚举（继承 str，可直接与字符串比较）
@@ -59,13 +59,13 @@ class AuthManager:
 
         生产环境应替换为 JWT/OAuth + DB 查询，此处用内存字典演示完整鉴权链路。
         """
-        user = cls._API_KEYS.get(api_key)
-        if not user:
+        user = cls._API_KEYS.get(api_key)  # 查内存 Key 表；未命中返回 None
+        if not user:  # 未命中：记录失败日志并返回 None
             # 只打前 12 位：够定位是哪一把 Key，又不让整把 Key 明文落进日志
-            _logger.warning(f"鉴权失败: api_key={api_key[:12]}...")
-            return None
-        _logger.info(f"鉴权成功: user={user['user_id']}, level={user['level']}")
-        return user
+            _logger.warning(f"鉴权失败: api_key={api_key[:12]}...")  # 截断日志避免敏感信息泄露
+            return None  # 返回 None 由上层统一抛 403，不暴露具体失败原因
+        _logger.info(f"鉴权成功: user={user['user_id']}, level={user['level']}")  # 成功日志记录用户与等级
+        return user  # 返回用户信息字典供路由使用
 
     # 【什么】会话归属校验：这个 session 是不是这个用户的
     # 【作用】挡住"拿自己的 Key 查别人的会话"；查不到或报错都按不通过处理
@@ -84,8 +84,8 @@ class AuthManager:
             改用独立的 SQL 只查记录是否存在，与状态内容解耦。
         """
         try:
-            return pg_manager.session_belongs_to(session_id, user_id)
-        except Exception:
+            return pg_manager.session_belongs_to(session_id, user_id)  # 查 PG：session_id 且 user_id 匹配才返回 True
+        except Exception:  # 数据库异常也按不通过处理：宁可误拒不可误放
             return False
 
 
@@ -130,18 +130,18 @@ class RateLimiter:
             时刻 t=20s  records=[0,1,...,19]            → True（计数20不<20，触发 False）
             时刻 t=61s  过滤掉 t<1s 的，剩 1~19         → True（窗口滑走 0s 那条）
         """
-        now = time.time()
-        records = self._records[user_id]
+        now = time.time()  # 当前时间戳（秒）
+        records = self._records[user_id]  # 取出该用户的请求时刻列表；defaultdict 自动初始化空列表
         # 原地过滤掉窗口外的旧时刻；剩下的条数就是"最近 60 秒内发了几次"
-        records[:] = [t for t in records if now - t < self._window]
-        if len(records) >= self._max:
+        records[:] = [t for t in records if now - t < self._window]  # 列表推导：保留窗口内的时刻
+        if len(records) >= self._max:  # 窗口内请求数已达上限
             _logger.warning(
                 f"限流触发: user={user_id} | "
                 f"请求数={len(records)}/{self._max} per {self._window}s"
-            )
-            return False
-        records.append(now)
-        return True
+            )  # 记录限流事件供运维排查
+            return False  # 拒绝：上层抛 429
+        records.append(now)  # 放行：把这次请求的时刻记进窗口
+        return True  # 放行：上层继续处理
 
 
 # 【什么】全局单例限流器：20 次 / 60 秒
@@ -177,21 +177,21 @@ async def get_current_user(api_key: str = Security(_api_key_header)) -> dict:
     Returns:
         鉴权通过的 user dict；失败时 raise HTTPException，本身不会返回 None
     """
-    from modules.enterprise.rbac_service import get_rbac_service
+    from modules.enterprise.rbac_service import get_rbac_service  # 延迟导入：避免模块加载时的循环依赖
 
-    if not api_key:
-        raise HTTPException(status_code=401, detail="缺少 API Key，请在请求头携带 X-API-Key")
+    if not api_key:  # 第一层校验：请求头没带 X-API-Key
+        raise HTTPException(status_code=401, detail="缺少 API Key，请在请求头携带 X-API-Key")  # 401 未登录
 
     # 连接数据库，查询用户信息
-    result = get_rbac_service().resolve(api_key)
-    if not result.ok:
-        raise HTTPException(status_code=403, detail=result.message or "API Key 无效或已失效")
+    result = get_rbac_service().resolve(api_key)  # 第二层校验：Key 无效/吊销/过期
+    if not result.ok:  # 解析失败（含 Key 无效、账号停用等）
+        raise HTTPException(status_code=403, detail=result.message or "API Key 无效或已失效")  # 403 鉴权失败
 
-    p = result.principal
-    if not _rate_limiter.check(p.user_code):
-        raise HTTPException(status_code=429, detail="请求频次超限，请稍后重试")
+    p = result.principal  # 第三层校验通过，拿到权限主体
+    if not _rate_limiter.check(p.user_code):  # 第四层校验：滑动窗口限流
+        raise HTTPException(status_code=429, detail="请求频次超限，请稍后重试")  # 429 请求太频繁
 
-    return {
+    return {  # 四层全过，返回用户信息字典供路由使用
         "user_id": p.user_code,      # 工号，如 U001；与 PG 会话表的 user_id 对齐
         "name": p.real_name,         # 姓名
         "level": p.user_level,       # normal/advanced/admin，兼容旧代码
@@ -226,22 +226,22 @@ def RequirePermission(required_level: UserLevel):
         dependency: 一个 async 函数，FastAPI 在请求时调用它做权限校验
     """
     # 等级 → 数字，数字大的能访问要求低的接口；取不到按 0 处理（最小权限）
-    level_order = {UserLevel.NORMAL: 1, UserLevel.ADVANCED: 2, UserLevel.ADMIN: 3}
+    level_order = {UserLevel.NORMAL: 1, UserLevel.ADVANCED: 2, UserLevel.ADMIN: 3}  # 等级→数字映射，数字越大权限越高
 
     # 【什么】真正的依赖函数：每次请求时由 FastAPI 调用
     # 【作用】等级不够抛 403；够了原样返回 user，供路由直接取字段
-    async def dependency(user: dict = Security(get_current_user)) -> dict:
-        user_level = user["level"] if isinstance(user["level"], UserLevel) else UserLevel(user["level"])
-        if level_order.get(user_level, 0) < level_order.get(required_level, 0):
+    async def dependency(user: dict = Security(get_current_user)) -> dict:  # 闭包依赖函数
+        user_level = user["level"] if isinstance(user["level"], UserLevel) else UserLevel(user["level"])  # 统一转成枚举类型
+        if level_order.get(user_level, 0) < level_order.get(required_level, 0):  # 数字比较：当前等级 < 要求等级
             _logger.warning(
                 f"权限不足: user={user['user_id']} level={user_level} < required={required_level}"
-            )
+            )  # 记录越权尝试供安全审计
             raise HTTPException(
                 status_code=403,
                 detail=f"权限不足，需要 {required_level.value} 等级",
-            )
-        return user
-    return dependency
+            )  # 403 权限不足
+        return user  # 等级够：原样返回用户信息
+    return dependency  # 返回闭包供路由挂载
 
 
 # 【什么】权限码依赖工厂：返回一个校验"有没有这个权限码"的 FastAPI 依赖
@@ -262,25 +262,25 @@ def RequirePerm(perm_code: str):
     """
     # 【什么】真正的依赖函数：每次请求时由 FastAPI 调用
     # 【作用】先写一条审计（allow/deny 都记），无权限再抛 403
-    async def dependency(user: dict = Security(get_current_user)) -> dict:
-        principal = user.get("principal")
-        allowed = principal is not None and principal.can(perm_code)
-        from modules.enterprise import audit
-        audit.log_audit(
-            principal.user_code if principal else "anonymous",
-            "api",
-            perm_code,
-            "allow" if allowed else "deny",
-            dept_code=principal.dept_code if principal else "",
+    async def dependency(user: dict = Security(get_current_user)) -> dict:  # 闭包依赖函数
+        principal = user.get("principal")  # 从 user dict 取权限主体
+        allowed = principal is not None and principal.can(perm_code)  # 有主体且主体声明了该权限码
+        from modules.enterprise import audit  # 延迟导入：避免模块加载时的循环依赖
+        audit.log_audit(  # 无论通过与否都记审计：安全事件需要完整留痕
+            principal.user_code if principal else "anonymous",  # 操作者工号；无主体记匿名
+            "api",  # 资源类型：API 接口
+            perm_code,  # 资源标识：权限码
+            "allow" if allowed else "deny",  # 结果：放行/拒绝
+            dept_code=principal.dept_code if principal else "",  # 部门码；无主体留空
         )
-        if not allowed:
-            raise HTTPException(status_code=403, detail="权限不足")
-        return user
-    return dependency
+        if not allowed:  # 无权限：抛 403
+            raise HTTPException(status_code=403, detail="权限不足")  # 403 权限不足
+        return user  # 有权限：原样返回用户信息
+    return dependency  # 返回闭包供路由挂载
 
 
 # 【什么】直接拿 Principal 的 FastAPI 依赖
 # 【作用】Agent 链路专用，省掉 user["principal"] 这一层取值
-async def get_principal(user: dict = Security(get_current_user)):
+async def get_principal(user: dict = Security(get_current_user)):  # 依赖注入：先跑 get_current_user
     """直接拿 Principal 的依赖（Agent 链路专用，省一层取值）。"""
-    return user["principal"]
+    return user["principal"]  # 直接返回 Principal 对象，路由里不用写 user["principal"]

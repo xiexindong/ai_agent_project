@@ -26,10 +26,10 @@ MySQL（业务/审计/用量）与 PG（会话/记忆/工具日志）之间没�
     RBAC_ENABLED=False 时 MySQL 侧根本不写审计与用量（见 llm._log_usage），
     这时候"MySQL 侧缺失"是设计如此，不是故障——本函数会跳过比对并注明原因。
 """
-from modules.common.logger import get_logger
-from config import get_settings
+from modules.common.logger import get_logger                      # 统一日志器工厂
+from config import get_settings                                   # 全局配置读取
 
-_logger = get_logger("reconcile")
+_logger = get_logger("reconcile")                                 # 本模块日志器，名称固定为 reconcile
 
 
 # 【什么】跨库对账入口：按 task_id 比对 PG 与 MySQL
@@ -50,29 +50,29 @@ def reconcile(hours: int = 24, limit: int = 5000) -> dict:
 
     try:
         # 【延迟导入】PGManager 依赖 PG 驱动，用到才导入
-        from modules.memory.pg_manager import PGManager
+        from modules.memory.pg_manager import PGManager            # 延迟导入 PG 管理器
 
         pg_ids = set(PGManager().list_task_ids_since(hours, limit))   # PG 侧的 task_id 集合
     except Exception as e:
-        result["ok"] = False
-        result["errors"].append(f"PG 不可用: {e}")
-        return result
-    result["pg_count"] = len(pg_ids)
+        result["ok"] = False                                      # PG 读不到，标记失败
+        result["errors"].append(f"PG 不可用: {e}")                # 记录错误
+        return result                                             # 提前返回，不做后续比对
+    result["pg_count"] = len(pg_ids)                              # 统计 PG 侧条数
 
     # 【跳过比对】RBAC 关闭时 MySQL 侧根本不写审计与用量，此时"MySQL 缺失"是设计如此
     if not get_settings().rbac_enabled:
         result["note"] = "RBAC_ENABLED=False，MySQL 侧不落审计与用量，已跳过 MySQL 比对"
-        return result
+        return result                                             # RBAC 关闭时直接返回，附 note 说明
 
     try:
-        from modules.enterprise.audit import list_task_ids_since
+        from modules.enterprise.audit import list_task_ids_since  # 延迟导入审计流水号查询
 
         mysql_ids = set(list_task_ids_since(hours, limit))   # MySQL 侧 = 审计 ∪ 用量
     except Exception as e:
-        result["ok"] = False
-        result["errors"].append(f"MySQL 不可用: {e}")
-        return result
-    result["mysql_count"] = len(mysql_ids)
+        result["ok"] = False                                      # MySQL 读不到，标记失败
+        result["errors"].append(f"MySQL 不可用: {e}")             # 记录错误
+        return result                                             # 提前返回
+    result["mysql_count"] = len(mysql_ids)                        # 统计 MySQL 侧条数
 
     result["matched"] = len(pg_ids & mysql_ids)              # 交集：两边都写了
     result["pg_only"] = sorted(pg_ids - mysql_ids)           # 差集排序，输出顺序稳定
@@ -82,4 +82,4 @@ def reconcile(hours: int = 24, limit: int = 5000) -> dict:
         _logger.warning(
             f"跨库对账不一致: pg_only={len(result['pg_only'])} mysql_only={len(result['mysql_only'])}"
         )
-    return result
+    return result                                                 # 返回对账结果字典

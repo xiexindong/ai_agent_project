@@ -11,18 +11,18 @@
         3. 限流开关要改时得去改每个 Agent
     统一在编排层：全局一桶令牌、全局一份配额、重试次数计入总预算。
 """
-from __future__ import annotations
+from __future__ import annotations  # 注解延迟求值：允许类型标注前置引用尚未定义的名字
 
-import random
-import threading
-import time
-from typing import Callable, Optional, TypeVar
+import random  # 随机抖动：打散并行重试时刻
+import threading  # 锁：令牌桶/配额账本都是多线程共享的
+import time  # 计时：补水、退避、算剩余时间都要它
+from typing import Callable, Optional, TypeVar  # 类型标注：可调用/可选/泛型
 
-from modules.common.logger import get_logger
+from modules.common.logger import get_logger  # 统一日志入口
 
-_logger = get_logger("control")
+_logger = get_logger("control")  # 本模块日志器：名字即模块名，日志可溯源
 
-T = TypeVar("T")
+T = TypeVar("T")  # 泛型变量：retry_with_backoff 的返回类型跟随被包装函数
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ T = TypeVar("T")
 #       time.sleep(1.0); bucket.try_consume()
 #       输出: True                          1 秒后补回 1 个令牌
 # ---------------------------------------------------------------------------
-class TokenBucket:
+class TokenBucket:  # 令牌桶：容量管突发上限，速率管长期平均
     # ------------------------------------------------------------------
     # 【什么】令牌桶的构造：容量 + 回血速率 + 记账三件套
     # 【作用】capacity 管突发上限、refill_per_sec 管长期平均速率；
@@ -48,7 +48,7 @@ class TokenBucket:
     # 【输入输出对照】TokenBucket(capacity=3, refill_per_sec=1.0)：
     #   启动时 _tokens=3.0（满桶），_last=当前时间
     # ------------------------------------------------------------------
-    def __init__(self, capacity: int = 40, refill_per_sec: float = 20.0):
+    def __init__(self, capacity: int = 40, refill_per_sec: float = 20.0):  # 默认：瞬时突发 40、长期 20/s
         self.capacity = max(1, int(capacity))                 # 桶容量 = 允许的瞬时突发上限
         self.refill_per_sec = max(0.0, float(refill_per_sec))  # 每秒补充的令牌数 = 长期平均速率
         self._tokens = float(self.capacity)                   # 当前令牌数：出生即满桶
@@ -63,7 +63,7 @@ class TokenBucket:
     # 【输入输出对照】capacity=3, refill=1.0：
     #   try_consume() → True（3→2）→ True（2→1）→ True（1→0）→ False（桶空）
     # ------------------------------------------------------------------
-    def try_consume(self, n: int = 1) -> bool:
+    def try_consume(self, n: int = 1) -> bool:  # 默认取 1 个：消息场景几乎都是单条
         with self._lock:                                      # 拿锁：补令牌 + 比大小 + 扣减三步必须一气呵成
             self._refill()                                    # 先按流逝的时间补令牌（见 _refill 注释）
             if self._tokens >= n:                             # 够 n 个才放行
@@ -79,7 +79,7 @@ class TokenBucket:
     # 【输入输出对照】capacity=3, refill=1.0，两次访问间隔 2.5 秒：
     #   elapsed=2.5 → 补 2.5 个 → _tokens = min(3, 原+2.5)，永远不超 3
     # ------------------------------------------------------------------
-    def _refill(self) -> None:
+    def _refill(self) -> None:  # 懒补水：只在被访问时才补，省掉后台线程
         now = time.time()                                     # 当前时刻
         elapsed = now - self._last                            # 距上次补水过了几秒
         if elapsed <= 0:                                      # 系统时钟回拨或同秒连调：补 0，避免负数令牌
@@ -91,13 +91,18 @@ class TokenBucket:
     # 【什么】只看还剩几个令牌，不扣（监控用）
     # 【作用】给 stats/日志读水位；取值前也要先补水，不然读到的是过期数字
     # ------------------------------------------------------------------
-    @property
-    def available(self) -> float:
-        with self._lock:
+    @property  # 属性化：调用方写 bucket.available 而不是 bucket.available()
+    def available(self) -> float:  # 当前可用令牌数（含本次补水）
+        with self._lock:  # 拿锁：补水与读数两步要对其他线程原子
             self._refill()                                    # 先补再报：报出去的数字才是"此刻"的
-            return self._tokens
+            return self._tokens  # 返回当前令牌数（浮点：可能有小数部分）
 
 
+# ---------------------------------------------------------------------------
+# 【什么】双层限流器：全局桶 + 每发送者桶
+# 【作用】总量可控 + 单体不会霸占
+# 【为什么】只有全局桶会被一个失控 Agent 吃光；只有个人桶总量仍可能超下游承载
+# ---------------------------------------------------------------------------
 class RateLimiter:
     """全局桶 + 每发送者桶的双层限流。
 
@@ -114,8 +119,10 @@ class RateLimiter:
         （若全局桶先空，则返回 (False, "global")，无论谁都被总闸拦下）
     """
 
-    def __init__(self, capacity: int = 40, refill_per_sec: float = 20.0,
-                 per_sender_capacity: int = 10, per_sender_refill: float = 5.0):
+    # 【什么】双层限流的构造：一个全局桶 + 一张"每人桶"登记表
+    # 【作用】全局桶管总量，每人桶管单体；桶按需创建（第一次来才建）
+    def __init__(self, capacity: int = 40, refill_per_sec: float = 20.0,  # 全局桶规格
+                 per_sender_capacity: int = 10, per_sender_refill: float = 5.0):  # 每人桶规格
         self.global_bucket = TokenBucket(capacity, refill_per_sec)      # 全局桶：所有人共用，管总量
         self._per_capacity = max(1, int(per_sender_capacity))           # 每人桶容量：max(1,...) 保底，传 0 = 永久封死所有人
         self._per_refill = max(0.0, float(per_sender_refill))           # 每人桶回血速率（个/秒）
@@ -130,7 +137,7 @@ class RateLimiter:
     #   _bucket_for("A") → 新建桶(capacity=10, refill=5.0) 并存入，返回它
     #   _bucket_for("A") → 直接命中 dict 里那个，不再新建
     # ------------------------------------------------------------------
-    def _bucket_for(self, sender: str) -> TokenBucket:
+    def _bucket_for(self, sender: str) -> TokenBucket:  # 拿（或新建）某发送者的专属桶
         with self._lock:                                                # 拿锁：两个线程同时查同一个新名字，只建一个桶
             b = self._senders.get(sender)                               # 查 dict：这个发送者来过吗？来过就有他的桶
             if b is None:                                               # None = 第一次来，dict 里还没有他的桶
@@ -146,12 +153,12 @@ class RateLimiter:
     #   让"被个人闸拦下的消耗"也计入全局账上，形成自然背压（见下方注释）
     #   先查个人能省掉全局桶的一次扣减；但这里选择全局先扣是为了
     # ------------------------------------------------------------------
-    def acquire(self, sender: str = "", n: int = 1) -> tuple[bool, str]:
+    def acquire(self, sender: str = "", n: int = 1) -> tuple[bool, str]:  # 空 sender 只过全局闸
         """取令牌。返回 (是否放行, 被谁拦下)。"""
         if not self.global_bucket.try_consume(n):       # 全局桶扣不动：总闸已满，无论谁都被拦
             return False, "global"
-        if sender:
-            if not self._bucket_for(sender).try_consume(n):
+        if sender:  # 有发送者才过个人闸；空 sender 视作系统内部流量
+            if not self._bucket_for(sender).try_consume(n):  # 个人桶扣不动
                 # 【为什么 per-sender 拦下后不把全局令牌还回去】
                 #   还回去等于"被限流的发送者可以无限重试直到把全局桶也耗光"；
                 #   不还，它这一轮的失败就会计入全局消耗，形成自然背压。
@@ -164,10 +171,10 @@ class RateLimiter:
     # 【输入输出对照】刚 acquire 掉 2 个、全局容量 40：
     #   stats() → {"global_available": 38.0, "senders": {"A": 8.0}}
     # ------------------------------------------------------------------
-    def stats(self) -> dict:
+    def stats(self) -> dict:  # 限流水位快照
         return {
-            "global_available": round(self.global_bucket.available, 2),
-            "senders": {k: round(v.available, 2) for k, v in self._senders.items()},
+            "global_available": round(self.global_bucket.available, 2),  # 全局桶水位（保留两位小数）
+            "senders": {k: round(v.available, 2) for k, v in self._senders.items()},  # 每个发送者的桶水位
         }
 
 
@@ -181,7 +188,7 @@ class RateLimiter:
 #       per_sender_round  同一发送者一轮最多几条（防某个 Agent 话痨刷屏）
 #       max_hops       一条对话链最多几跳（防 A→B→A→B 无限来回）
 # ---------------------------------------------------------------------------
-class Quota:
+class Quota:  # 配额：限流拦猛攻，配额拦慢刷
     # ------------------------------------------------------------------
     # 【什么】配额记账的构造：四道上限 + 三本账 + 一把锁
     # 【作用】上限在"速率"之外卡"总量"——限流拦猛攻，配额拦慢刷
@@ -189,8 +196,8 @@ class Quota:
     #   _total=0（总账）、_round_counts={}（按轮记账）、
     #   _sender_counts={}（按 (轮,发送者) 记账），全部从零开始
     # ------------------------------------------------------------------
-    def __init__(self, per_run: int = 100, per_round: int = 30,
-                 per_sender_round: int = 3, max_hops: int = 2):
+    def __init__(self, per_run: int = 100, per_round: int = 30,  # 总量两道闸：整次运行 / 单轮
+                 per_sender_round: int = 3, max_hops: int = 2):  # 单体与链路两道闸：每人每轮 / 跳数
         self.per_run = max(1, int(per_run))                      # 整次运行消息总量上限（防总量失控）
         self.per_round = max(1, int(per_round))                  # 单轮消息总量上限（防单轮爆炸）
         self.per_sender_round = max(1, int(per_sender_round))    # 同一人单轮条数上限（防话痨刷屏）
@@ -210,7 +217,7 @@ class Quota:
     #   check("A", 1, 1) → (False, "A 在第 1 轮已达上限 3")
     #   check("B", 1, 1) → (True, "")          B 只发了 1 条，不受 A 影响
     # ------------------------------------------------------------------
-    def check(self, sender: str, round_no: int, hop: int) -> tuple[bool, str]:
+    def check(self, sender: str, round_no: int, hop: int) -> tuple[bool, str]:  # 返回 (能否发, 不能发的原因)
         with self._lock:                                         # 拿锁：查的瞬间不能有人正在改账本
             if self._total >= self.per_run:                      # 闸① 总量：整次运行的消息数到顶了
                 return False, f"已达运行总量上限 {self.per_run}"
@@ -229,8 +236,8 @@ class Quota:
     # 【输入输出对照】consume("A", 1) 后：
     #   _total 0→1、_round_counts {1:1}、_sender_counts {(1,"A"):1}
     # ------------------------------------------------------------------
-    def consume(self, sender: str, round_no: int) -> None:
-        with self._lock:
+    def consume(self, sender: str, round_no: int) -> None:  # 记账：消息落地后必须调
+        with self._lock:  # 拿锁：三本账要原子地一起 +1
             self._total += 1                                     # 总账 +1
             self._round_counts[round_no] = self._round_counts.get(round_no, 0) + 1  # 本轮账 +1（该轮第一条时 get 兜底 0）
             key = (round_no, sender)                             # 复合键：同一个发送者在不同轮是两条账
@@ -240,22 +247,22 @@ class Quota:
     # 【什么】新一轮提问时清零重开（总账和分账全部归零）
     # 【作用】配额是"一轮运行的预算"不是终身预算；不重置 = 第一次跑满后永远被拦
     # ------------------------------------------------------------------
-    def reset_run(self) -> None:
-        with self._lock:
-            self._total = 0
-            self._round_counts.clear()
-            self._sender_counts.clear()
+    def reset_run(self) -> None:  # 新运行开始前清零全部账
+        with self._lock:  # 拿锁：清零时不能有人正在 check/consume
+            self._total = 0  # 总账归零
+            self._round_counts.clear()  # 按轮账清空
+            self._sender_counts.clear()  # 按(轮,发送者)账清空
 
     # ------------------------------------------------------------------
     # 【什么】当前各账本快照（监控用）
     # 【输入输出对照】A 在第 1 轮发了 2 条后：
     #   stats() → {"total": 2, "by_round": {1: 2}, "limits": {per_run: 100, ...}}
     # ------------------------------------------------------------------
-    def stats(self) -> dict:
-        with self._lock:
-            return {"total": self._total,
-                    "by_round": dict(self._round_counts),
-                    "limits": {"per_run": self.per_run, "per_round": self.per_round,
+    def stats(self) -> dict:  # 配额账本快照
+        with self._lock:  # 拿锁：读出来的三本账要是同一时刻的
+            return {"total": self._total,  # 总账当前值
+                    "by_round": dict(self._round_counts),  # 按轮账拷贝一份（防外部改到内部账）
+                    "limits": {"per_run": self.per_run, "per_round": self.per_round,  # 把上限也带上：监控好对比"用到哪了"
                                "per_sender_round": self.per_sender_round,
                                "max_hops": self.max_hops}}
 
@@ -267,14 +274,17 @@ class Quota:
 # ---------------------------------------------------------------------------
 
 
+# 【什么】通用重试包装器
+# 【作用】包任意可调用对象：成功直接返回，失败按指数退避重试，次数耗尽抛最后一次异常
+# 【为什么重试钩子要包一层 try】钩子崩了不能拖垮重试本身
 def retry_with_backoff(
-    fn: Callable[[], T],
-    attempts: int = 3,
-    base_delay: float = 0.5,
-    max_delay: float = 8.0,
-    retry_on: tuple = (Exception,),
-    on_retry: Optional[Callable[[int, BaseException], None]] = None,
-) -> T:
+    fn: Callable[[], T],  # 被包装的无参可调用对象（要传参请用 lambda/闭包）
+    attempts: int = 3,  # 总尝试次数：首跑也算一次
+    base_delay: float = 0.5,  # 第一次重试前的基准等待秒数
+    max_delay: float = 8.0,  # 单次等待封顶秒数
+    retry_on: tuple = (Exception,),  # 哪些异常才重试；不在名单里的异常直接抛
+    on_retry: Optional[Callable[[int, BaseException], None]] = None,  # 每次重试前的回调（记指标/告警用）
+) -> T:  # 返回类型跟随 fn
     """指数退避重试。
 
     【为什么退避要加随机抖动】
@@ -308,6 +318,9 @@ def retry_with_backoff(
     raise last                                      # 次数耗尽仍失败：抛最后一次异常，交给上层降级
 
 
+# 【什么】剩余时间计算器
+# 【作用】把"绝对截止时刻"换算成"还剩几秒"，供下游调用设单次超时
+# 【为什么 max(0,·)】已过截止时刻返回 0（=立刻超时），不返回负数让下游误判还有时间
 def remaining_seconds(deadline: float) -> float:
     """距绝对截止时刻还剩几秒。用于把总超时传导到每个下游调用。"""
     return max(0.0, deadline - time.time())         # max(0,·)：已过截止时刻返回 0（=立刻超时），不返回负数让下游误判还有时间

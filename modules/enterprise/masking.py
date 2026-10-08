@@ -12,7 +12,7 @@
     1 部分脱敏：证件号/手机号/银行卡保留头尾
     2 强脱敏：金额类字段整体替换为区间描述，杜绝精确值外泄
 """
-from typing import Any
+from typing import Any                                           # Any 用于任意类型值（金额可能是 Decimal/str/int）
 
 # 【什么】字段名 → 敏感类别的映射表（11 个键，4 类）
 # 【作用】按字段名判断该怎么脱敏；查不到的字段一律原样返回，不做猜测
@@ -36,21 +36,21 @@ _FIELD_KIND = {
 def _mask_id(v: str) -> str:
     """证件号：前 6 后 4，中间星号。"""
     v = str(v)                # 统一转字符串，数据库里可能是数字型
-    return v if len(v) <= 10 else f"{v[:6]}{'*' * (len(v) - 10)}{v[-4:]}"
+    return v if len(v) <= 10 else f"{v[:6]}{'*' * (len(v) - 10)}{v[-4:]}"  # 短号原样返回，长号中间打星
 
 
 # 【什么】手机号脱敏：留前 3 后 4
 # 【作用】中间固定 4 个星号；长度 < 7 的原样返回
 def _mask_phone(v: str) -> str:
-    v = str(v)
-    return v if len(v) < 7 else f"{v[:3]}****{v[-4:]}"
+    v = str(v)                # 统一转字符串
+    return v if len(v) < 7 else f"{v[:3]}****{v[-4:]}"  # 短号原样返回，长号留前3后4中间4星
 
 
 # 【什么】银行卡脱敏：只留后 4 位
 # 【作用】前面全星号；长度 ≤ 4 的原样返回（全遮等于没信息）
 def _mask_bank(v: str) -> str:
-    v = str(v)
-    return v if len(v) <= 4 else f"****{v[-4:]}"
+    v = str(v)                # 统一转字符串
+    return v if len(v) <= 4 else f"****{v[-4:]}"  # 短号原样返回，长号只留后4位前加4星
 
 
 # 【什么】金额脱敏：区间化或保留两位小数
@@ -90,7 +90,7 @@ def mask_value(field_name: str, value: Any, mask_level: int) -> Any:
         return _mask_bank(value)                                # 银行卡：只留后 4
     if kind == "money":
         return _mask_money(value, strong=(mask_level >= 2))     # 金额：2 级及以上才算强脱敏
-    return value
+    return value                                                # 理论上不可达，兜底原样返回
 
 
 # 【什么】递归脱敏一整条记录
@@ -101,7 +101,7 @@ def mask_record(record: Any, mask_level: int) -> Any:
         return record                  # 0 级：整条不脱敏，直接返回
     if isinstance(record, dict):
         # 【dict】先递归脱敏每个 value，再按 key（字段名）脱敏一次
-        return {k: mask_value(k, mask_record(v, mask_level), mask_level) for k, v in record.items()}
+        return {k: mask_value(k, mask_record(v, mask_level), mask_level) for k, v in record.items()}  # 递归 value + 按 key 脱敏
     if isinstance(record, list):
         return [mask_record(item, mask_level) for item in record]   # 【list】逐元素递归
     return record                      # 标量：字段名不在这里，无需处理

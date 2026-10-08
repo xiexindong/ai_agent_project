@@ -14,12 +14,12 @@ Principal（主体）= 一次请求里"这个用户到底是谁、能干啥"的�
     tool:mcp:*        前缀通配，命中所有 tool:mcp:xxx
     api:admin:*       同理
 """
-from dataclasses import dataclass, field
-from typing import Iterable
+from dataclasses import dataclass, field                        # dataclass 装饰器 + 可变字段默认值工厂
+from typing import Iterable                                     # can_any 参数类型：可迭代权限码
 
 # 【什么】数据域优先级表（self 0 < dept 1 < all 2）
 # 【作用】给 scope_for 比较大小用，数字越大可见范围越宽
-_SCOPE_ORDER = {"self": 0, "dept": 1, "all": 2}
+_SCOPE_ORDER = {"self": 0, "dept": 1, "all": 2}                 # self 最窄 0，dept 1，all 最宽 2
 
 
 # 【什么】一次请求的权限快照（dataclass）
@@ -64,21 +64,21 @@ class Principal:
                 prefix = granted[:-1]   # 去掉末尾的 '*'，得到 'tool:mcp:'
                 if perm_code.startswith(prefix):
                     return True         # 前缀通配命中，如 'tool:mcp:web_search'
-        return False
+        return False                    # 精确与通配都没命中 → 拒绝
 
     # 【什么】多权限码取"或"
     # 【作用】一个工具同时登记了普通码与 mcp 码时，任一命中就算有权限
     def can_any(self, perm_codes: Iterable[str]) -> bool:
         """任一命中即通过（工具同时登记了普通码与 mcp 码时用）。"""
-        return any(self.can(code) for code in perm_codes)
+        return any(self.can(code) for code in perm_codes)  # 逐码调 can()，任一 True 即通过
 
     # 【什么】知识库可读性判定
     # 【作用】kb_codes 为空表示未开启隔离，一律放行；否则必须列在 kb_codes 里
     def can_kb(self, kb_code: str) -> bool:
         """知识库可读性判定；未开启隔离时 kb_codes 为空表示不限制。"""
         if not self.kb_codes:
-            return True
-        return kb_code in self.kb_codes
+            return True                 # kb_codes 空 = 未开启隔离，一律放行
+        return kb_code in self.kb_codes  # 开启了隔离 → 必须在可见列表里
 
     # 【什么】确定某类业务数据的可见范围
     # 【作用】角色自带的 data_scope 与显式 data:xxx:all/dept 权限取最宽的那个
@@ -93,26 +93,26 @@ class Principal:
             if self.can(f"data:{data_type}:{cand}"):
                 if _SCOPE_ORDER[cand] > _SCOPE_ORDER.get(scope, 0):
                     scope = cand               # 只有当显式权限比现有范围更宽时才覆盖
-        return scope
+        return scope                           # 返回最终数据域：self/dept/all
 
 
     # 【什么】把快照转成可 JSON 序列化的 dict
     # 【作用】接口返回与日志落库用；set 转排序 list，避免输出顺序不稳定
     def to_dict(self) -> dict:
         return {
-            "user_code": self.user_code,
-            "real_name": self.real_name,
-            "tenant_code": self.tenant_code,
-            "dept_code": self.dept_code,
-            "dept_name": self.dept_name,
-            "job_title": self.job_title,
-            "user_level": self.user_level,
+            "user_code": self.user_code,                      # 工号
+            "real_name": self.real_name,                      # 姓名
+            "tenant_code": self.tenant_code,                  # 租户码
+            "dept_code": self.dept_code,                      # 部门码
+            "dept_name": self.dept_name,                      # 部门名
+            "job_title": self.job_title,                      # 岗位名
+            "user_level": self.user_level,                    # 用户等级
             "roles": list(self.roles),                  # 转 list 副本
             "permissions": sorted(self.permissions),    # set 排序后转 list，输出顺序稳定
             "kb_codes": list(self.kb_codes),            # 转 list 副本
-            "data_scope": self.data_scope,
-            "mask_level": self.mask_level,
-            "source": self.source,
+            "data_scope": self.data_scope,                    # 数据域
+            "mask_level": self.mask_level,                    # 脱敏强度
+            "source": self.source,                            # 来源：mysql / memory
         }
 
     # 【什么】日志用的一句话摘要
@@ -120,6 +120,6 @@ class Principal:
     def brief(self) -> str:
         """日志用的一句话摘要：U002/李四/财务部/D_FINANCE[财务专员]"""
         return (
-            f"{self.user_code}/{self.real_name}/{self.dept_name}"
-            f"/{self.dept_code}[{'+'.join(self.roles) or '无角色'}]"
+            f"{self.user_code}/{self.real_name}/{self.dept_name}"     # 工号/姓名/部门名
+            f"/{self.dept_code}[{'+'.join(self.roles) or '无角色'}]"   # 部门码[角色1+角色2]，无角色显示"无角色"
         )

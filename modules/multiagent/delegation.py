@@ -41,25 +41,25 @@
     要。ledger.denials 全部记下来：排查"为什么这块没人接"时，
     "根本没想转"和"想转但被治理拦了"是两件完全不同的事。
 """
-from __future__ import annotations
+from __future__ import annotations                                            # 允许延迟类型注解求值
 
-import time
-from typing import Any, Callable, Optional
+import time                                                                     # 算委派耗时用
+from typing import Any, Callable, Optional                                     # 类型注解：任意值/可调用/可空
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field                                          # 委派策略的数据契约
 
-from modules.common.logger import get_logger
+from modules.common.logger import get_logger                                   # 统一取模块 logger
 from modules.multiagent.models import (
-    AgentOutput,
-    AgentSpec,
-    DelegationDecision,
-    DelegationRecord,
-    SubTask,
-    TeamConfig,
-    json_schema_hint,
+    AgentOutput,                                                               # 受托方产出
+    AgentSpec,                                                                 # Agent 静态定义（花名册项）
+    DelegationDecision,                                                        # 委派决策（结构化输出）
+    DelegationRecord,                                                          # 委派台账记录
+    SubTask,                                                                   # 子任务契约
+    TeamConfig,                                                                # 团队配置（从这里取委派边界）
+    json_schema_hint,                                                          # 把决策 schema 压成给 LLM 看的提示
 )
 
-_logger = get_logger("delegation")
+_logger = get_logger("delegation")                                             # 模块级 logger，前缀 delegation
 
 
 # 【什么】委派治理策略
@@ -67,20 +67,20 @@ _logger = get_logger("delegation")
 class DelegationPolicy(BaseModel):
     """委派的四条边界。默认关闭：不启用时 can() 一律返回 False。"""
 
-    enabled: bool = Field(default=False, description="是否启用委派")
-    max_depth: int = Field(default=1, ge=0, description="最多转派几层")
-    max_per_run: int = Field(default=6, ge=0, description="单次运行最多委派几次")
-    max_per_agent: int = Field(default=2, ge=0, description="单个 Agent 最多委派几次")
+    enabled: bool = Field(default=False, description="是否启用委派")             # 默认关闭：不开就不产生任何额外开销
+    max_depth: int = Field(default=1, ge=0, description="最多转派几层")           # 0=只能主管直接派，子 Agent 不能再转
+    max_per_run: int = Field(default=6, ge=0, description="单次运行最多委派几次") # 整轮对话的总委派次数上限
+    max_per_agent: int = Field(default=2, ge=0, description="单个 Agent 最多委派几次")  # 防"专职二传手"
 
     # 【什么】从团队配置生成策略
     # 【作用】配置集中放在 TeamConfig 里，这里只做一次搬运，避免两处默认值打架
     @classmethod
     def from_config(cls, cfg: TeamConfig) -> "DelegationPolicy":
         return cls(
-            enabled=bool(getattr(cfg, "delegation_enabled", False)),
-            max_depth=int(getattr(cfg, "delegation_max_depth", 1) or 0),
-            max_per_run=int(getattr(cfg, "delegation_max_per_run", 6) or 0),
-            max_per_agent=int(getattr(cfg, "delegation_max_per_agent", 2) or 0),
+            enabled=bool(getattr(cfg, "delegation_enabled", False)),               # 从配置读开关，缺省为 False
+            max_depth=int(getattr(cfg, "delegation_max_depth", 1) or 0),            # or 0 防止传 None
+            max_per_run=int(getattr(cfg, "delegation_max_per_run", 6) or 0),        # or 0 同上
+            max_per_agent=int(getattr(cfg, "delegation_max_per_agent", 2) or 0),    # or 0 同上
         )
 
 
@@ -103,9 +103,9 @@ class DelegationLedger:
 
     def __init__(self, policy: DelegationPolicy, roster: Optional[dict[str, AgentSpec]] = None):
         self.policy = policy
-        self.roster: dict[str, AgentSpec] = dict(roster or {})   # {Agent 名: spec}，校验存在性用
-        self.records: list[DelegationRecord] = []
-        self.denials: list[dict] = []                            # 被拒绝的尝试（含原因）
+        self.roster: dict[str, AgentSpec] = dict(roster or {})   # 把传入花名册复制一份，防外部修改
+        self.records: list[DelegationRecord] = []                # 已执行的委派记录
+        self.denials: list[dict] = []                            # 被拒绝的尝试（含原因），排查用
 
     # ------------------------------------------------------------------
     # 准入：这次转派能不能做
@@ -122,11 +122,11 @@ class DelegationLedger:
             只留一个 False，事后只能靠猜。
         """
         p = self.policy
-        chain = list(chain or [])
+        chain = list(chain or [])                                   # 默认空链，防 None
 
         def deny(reason: str) -> tuple[bool, str]:
-            self.denials.append({"from": delegator, "to": delegatee, "depth": depth, "reason": reason})
-            _logger.info(f"委派被拒: {delegator}→{delegatee} | {reason}")
+            self.denials.append({"from": delegator, "to": delegatee, "depth": depth, "reason": reason})  # 记进被拒台账
+            _logger.info(f"委派被拒: {delegator}→{delegatee} | {reason}")  # 日志留痕
             return False, reason
 
         if not p.enabled:
@@ -162,7 +162,7 @@ class DelegationLedger:
     # 【什么】某个 Agent 已经转出去几次
     # 【作用】单人配额用；只数"真执行了"的记录，被拒的不算（没干活不该占额度）
     def count(self, agent: str) -> int:
-        return sum(1 for r in self.records if r.from_agent == agent)
+        return sum(1 for r in self.records if r.from_agent == agent)  # 只计成功发起的记录
 
     # 【什么】可以转派给谁
     # 【作用】给委派决策当候选名单：排除自己、排除主管、排除停用的人
@@ -171,37 +171,37 @@ class DelegationLedger:
     def candidates(self, exclude: str = "") -> list[AgentSpec]:
         from modules.multiagent.models import AgentRole
         return [
-            s for name, s in self.roster.items()
-            if name != exclude and s.enabled and s.role != AgentRole.SUPERVISOR
+            s for name, s in self.roster.items()                       # 遍历花名册
+            if name != exclude and s.enabled and s.role != AgentRole.SUPERVISOR  # 排除自己、停用者、主管
         ]
 
     # 【什么】开一条委派记录
     # 【作用】先记账再执行：执行中途崩了也留得下"这次转派发生过"
     def open(self, rec: DelegationRecord) -> DelegationRecord:
-        self.records.append(rec)
+        self.records.append(rec)                                      # 追加到台账，后续计数与总结都靠它
         return rec
 
     # 【什么】回填委派结果
     # 【作用】把受托方产出/失败原因与耗时写回记录，供 trace 与最终答案使用
     def close(self, rec: DelegationRecord, out: Optional[AgentOutput], started: float) -> DelegationRecord:
-        rec.duration_ms = int((time.time() - started) * 1000)
-        if out is None:
+        rec.duration_ms = int((time.time() - started) * 1000)         # 从 started 到现在，毫秒级计时
+        if out is None:                                               # 受托方根本没返回产出
             rec.success, rec.error = False, "委派未产出结果"
             return rec
-        rec.success = bool(out.success)
-        rec.content = (out.content or "")[:2000]      # 台账里留摘要，不把全文塞进结果
-        rec.error = "" if out.success else (out.error or "委派执行失败")
+        rec.success = bool(out.success)                               # 转成 bool，防 None
+        rec.content = (out.content or "")[:2000]                      # 台账里留摘要，不把全文塞进结果
+        rec.error = "" if out.success else (out.error or "委派执行失败")  # 失败时记原因，成功时清空
         return rec
 
     # 【什么】本次运行委派情况的汇总
     # 【作用】给日志与 RunResult 用：转了几次、成了几次、被拒几次
     def summary(self) -> dict:
         return {
-            "total": len(self.records),
-            "ok": sum(1 for r in self.records if r.success),
-            "failed": sum(1 for r in self.records if not r.success),
-            "denied": len(self.denials),
-            "max_depth": max((r.depth for r in self.records), default=0),
+            "total": len(self.records),                               # 总执行次数
+            "ok": sum(1 for r in self.records if r.success),          # 成功次数
+            "failed": sum(1 for r in self.records if not r.success),  # 失败次数
+            "denied": len(self.denials),                              # 被拒绝次数
+            "max_depth": max((r.depth for r in self.records), default=0),  # 最深委派层级（无记录则为 0）
         }
 
 
@@ -227,14 +227,14 @@ class DelegationExecutor:
                  ledger: DelegationLedger, roster: Optional[dict[str, AgentSpec]] = None,
                  on_event: Optional[Callable[[DelegationRecord, str], None]] = None,
                  context_factory: Optional[Callable[[int, list[str]], Any]] = None):
-        self._run_fn = run_fn                     # (agent_name, task, extra) → AgentOutput
-        self.ledger = ledger
-        self.roster: dict[str, AgentSpec] = dict(roster or {})
+        self._run_fn = run_fn                     # (agent_name, task, extra) → AgentOutput；由 harness 注入
+        self.ledger = ledger                       # 台账引用，执行结果会回填到这里
+        self.roster: dict[str, AgentSpec] = dict(roster or {})  # 花名册副本
         self.on_event = on_event                  # 委派发生时的回调（harness 用它写 trace）
         # 【什么】给受托方造一个"带委派深度的上下文"
         # 【作用】受托方自己还能不能再往下转，取决于 depth+1 是否还够，
         #         这个信息只有执行器知道，所以由它来构造
-        self._context_factory = context_factory
+        self._context_factory = context_factory    # 可选：为受托方生成隔离的 RunContext
 
     # 【什么】本执行器是否启用了委派
     # 【作用】Agent 靠它在"问模型要不要转派"之前先短路：
@@ -259,12 +259,12 @@ class DelegationExecutor:
             委派是"锦上添花"的能力：转不出去，原任务照样要做。
             抛异常会让整个子任务失败，等于为一个可选能力赔上主流程。
         """
-        chain = list(chain or [])
-        ok, why = self.ledger.can(from_agent, to_agent, depth=depth, chain=chain)
+        chain = list(chain or [])                                                  # 委派链：含所有上游委派方，防环用
+        ok, why = self.ledger.can(from_agent, to_agent, depth=depth, chain=chain)  # 过五道闸
         if not ok:
             if self.on_event is not None:
                 try:
-                    self.on_event(None, why)     # 拒绝也要进 trace：排查"为什么没人接"靠它
+                    self.on_event(None, why)                                       # 拒绝也要进 trace：排查"为什么没人接"靠它
                 except Exception as e:
                     _logger.debug(f"委派事件回调异常（忽略）: {e}")
             return None
@@ -272,32 +272,32 @@ class DelegationExecutor:
         rec = DelegationRecord(
             from_agent=from_agent, to_agent=to_agent, instruction=instruction,
             reason=reason, parent_task_id=parent_task_id, depth=depth,
-            chain=chain + [from_agent],
+            chain=chain + [from_agent],                                            # 把当前委派方加进链里，传给受托方
         )
-        self.ledger.open(rec)
+        self.ledger.open(rec)                                                      # 先记账，再执行
         # 【子任务 id 为什么要带委派痕迹】
         #   委派产出的 task_id 形如 "t2→researcher_1"，
         #   trace 里一眼能看出它不是主管派的原任务，而是中途转出来的
         task = SubTask(id=f"{parent_task_id or 'task'}>{to_agent}", assignee=to_agent,
                        instruction=instruction)
-        started = time.time()
+        started = time.time()                                                      # 计时开始
         try:
             extra = {
-                "delegated_by": from_agent,
-                "delegation_depth": depth + 1,          # 受托方再往下转就是第 depth+1 层
-                "delegation_chain": rec.chain,
+                "delegated_by": from_agent,                                       # 谁派来的
+                "delegation_depth": depth + 1,                                     # 受托方再往下转就是第 depth+1 层
+                "delegation_chain": rec.chain,                                     # 完整委派链
             }
-            ctx = self._context_factory(depth + 1, rec.chain) if self._context_factory else None
-            out = self._run_fn(to_agent, task, {"extra": extra, "ctx": ctx})
+            ctx = self._context_factory(depth + 1, rec.chain) if self._context_factory else None  # 有工厂就造隔离上下文
+            out = self._run_fn(to_agent, task, {"extra": extra, "ctx": ctx})       # 真正调用受托方
         except Exception as e:
             _logger.error(f"委派执行异常: {from_agent}→{to_agent}: {type(e).__name__}: {e}")
-            out = AgentOutput.failed(to_agent, task.id, f"{type(e).__name__}: {e}")
-        self.ledger.close(rec, out, started)
+            out = AgentOutput.failed(to_agent, task.id, f"{type(e).__name__}: {e}")  # 异常也收敛成 AgentOutput
+        self.ledger.close(rec, out, started)                                       # 回填结果与耗时
         _logger.info(f"委派完成: {rec.label} | {'成功' if rec.success else '失败'} "
                      f"| depth={depth} | {rec.duration_ms}ms")
         if self.on_event is not None:
             try:
-                self.on_event(rec, "委派完成" if rec.success else "委派失败")
+                self.on_event(rec, "委派完成" if rec.success else "委派失败")       # trace 留痕
             except Exception as e:
                 _logger.debug(f"委派事件回调异常（忽略）: {e}")
         return rec
@@ -314,11 +314,11 @@ def decide_delegation(llm: Any, instruction: str, roster: list[AgentSpec],
         收益是：analyst 缺数据时能当场找 researcher 要，
         而不是编一个数或者整单失败——后者要么污染答案，要么白跑一轮团队。
     """
-    if llm is None or not roster:
+    if llm is None or not roster:                                                  # 没 LLM 或花名册空就不用问了
         return None
     roster_text = "\n".join(
         f"- {a.name}（{a.role.value}）: {a.description or '通用执行者'}" for a in roster
-    )
+    )                                                                              # 把花名册变成 Markdown 列表给模型看
     prompt = (
         "## 你手上的任务\n{instruction}\n\n"
         "## 可选的同伴\n{roster}\n\n"
@@ -329,10 +329,10 @@ def decide_delegation(llm: Any, instruction: str, roster: list[AgentSpec],
         "## 输出结构（严格遵守）\n{schema}\n\n"
         "只输出一个 JSON 对象。"
     ).format(instruction=instruction, roster=roster_text,
-             schema=json_schema_hint(DelegationDecision))
+             schema=json_schema_hint(DelegationDecision))                          # 把字段结构塞进 prompt，模型按格子填
     try:
-        data = llm.invoke_structured(prompt, system_prompt=system_prompt)
-        return DelegationDecision.model_validate(data)
+        data = llm.invoke_structured(prompt, system_prompt=system_prompt)          # 结构化调用：返回 dict
+        return DelegationDecision.model_validate(data)                             # pydantic 校验；漏字段会自动降级为不委派
     except Exception as e:
         _logger.warning(f"委派决策解析失败（按不委派处理）: {e}")
-        return None
+        return None                                                                # 解析失败就当不委派，主流程不受影响

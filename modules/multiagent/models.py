@@ -419,12 +419,12 @@ class EvalCase(BaseModel):
 class EvalResult(BaseModel):
     """单条用例的评测结果。"""
 
-    case: str
-    passed: bool
+    case: str                                                                  # 对应用例名
+    passed: bool                                                               # 是否通过
     score: float = Field(default=0.0, ge=0.0, le=1.0)   # 0~1 综合分，0.6 及以上才判通过
-    reason: str = Field(default="")
-    duration_ms: int = Field(default=0)
-    status: str = Field(default="")
+    reason: str = Field(default="")                                             # 通过/失败的原因说明
+    duration_ms: int = Field(default=0)                                         # 本用例耗时
+    status: str = Field(default="")                                             # 对应 RunStatus 字符串（success/partial/…）
 
 
 # 【什么】整份评测报告
@@ -432,10 +432,10 @@ class EvalResult(BaseModel):
 class EvalReport(BaseModel):
     """整份评测报告。"""
 
-    total: int = 0
-    passed: int = 0
-    score: float = 0.0
-    results: list[EvalResult] = Field(default_factory=list)
+    total: int = 0                                                              # 用例总数
+    passed: int = 0                                                             # 通过数
+    score: float = 0.0                                                          # 所有用例的平均分
+    results: list[EvalResult] = Field(default_factory=list)                    # 各用例详细结果列表
 
     # 【什么】通过率的展示形式
     # 【作用】返回「通过数/总数」字符串，便于直接打印和写入日志
@@ -481,13 +481,13 @@ class AgentMessage(BaseModel):
         "*"            → 广播给所有其他成员
     """
 
-    id: str = Field(default_factory=lambda: new_id("msg"))
+    id: str = Field(default_factory=lambda: new_id("msg"))                     # 自动生成 msg_xxxxxxxx 短 ID
     sender: str = Field(description="发送者 Agent 名")
-    receiver: str = Field(default="*", description="接收者 Agent 名，* 表示广播")
-    kind: MessageKind = Field(default=MessageKind.FINDING)
+    receiver: str = Field(default="*", description="接收者 Agent 名，* 表示广播")  # 默认广播
+    kind: MessageKind = Field(default=MessageKind.FINDING)                     # 默认为共享发现
     content: str = Field(default="", description="消息正文")
-    ref_task_id: str = Field(default="", description="关联的 SubTask.id")
-    ts: int = Field(default_factory=now_ms)
+    ref_task_id: str = Field(default="", description="关联的 SubTask.id")        # 溯源用，可空
+    ts: int = Field(default_factory=now_ms)                                    # 发送时刻（毫秒）
 
     # 【什么】判断某 Agent 是否能看到这条消息
     # 【作用】广播（receiver="*"）对所有人可见，点对点消息只给指定接收者

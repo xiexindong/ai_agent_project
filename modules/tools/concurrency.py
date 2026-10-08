@@ -164,7 +164,7 @@ class ToolConcurrencyGuard:  # 并发闸门类：同名工具一把 Semaphore，
 
 # 【什么】有状态工具的实例池（借出-归还）
 # 【作用】每个线程借走一个专属实例，用完归还；池空时等待，避免多线程共用一个实例串状态
-class ToolInstancePool:
+class ToolInstancePool:  # 工具实例池：factory 配方 + _idle 数组 + Lock + Condition
     """工具实例池：factory 造实例，checkout/checkin 借还，池大小固定。
 
     【一句话看破】核心数据结构就是 self._idle 一个数组（list），没有更多了。
@@ -189,7 +189,7 @@ class ToolInstancePool:
         t1.checkin(#1) → t3 立刻拿到实例 #1
     """
 
-    def __init__(self, factory: Callable[[], Any], size: int = 4, name: str = "pool"):
+    def __init__(self, factory: Callable[[], Any], size: int = 4, name: str = "pool"):  # 构造：配方/池上限/池名
         # ------------------------------------------------------------------
         # 【什么】factory 是"造实例的配方"，name 是池子的名字
         #
@@ -215,8 +215,8 @@ class ToolInstancePool:
         #   pool.checkout() → 现造 #2（_created=2，造满）
         #   pool.checkout() → 不再调 factory，等归还，10s 没等到抛 TimeoutError
         # ------------------------------------------------------------------
-        self._factory = factory
-        self._name = name
+        self._factory = factory  # 配方：无参工厂函数，需要实例时调用它现造
+        self._name = name  # 池名：只出现在超时报错信息里
         self._size = max(1, int(size))          # 保底 1：传 0 池子永远空，永远借不到
         self._idle: list = []                   # 空闲实例栈（借出的不在池里）
         self._created = 0                       # 已创建总数（≤ size）
@@ -247,27 +247,27 @@ class ToolInstancePool:
 
     # 【什么】从池里借一个实例（阻塞等待，最多 timeout 秒）
     # 【作用】优先复用空闲实例；没有空闲且没造满就现造一个；造满了就等别人归还
-    def checkout(self, timeout: float = 10.0) -> Any:
-        with self._available:
-            deadline = time.time() + timeout
-            while True:
-                if self._idle: 
+    def checkout(self, timeout: float = 10.0) -> Any:  # 借一个实例：拿不到就阻塞等，最多等 timeout 秒
+        with self._available:  # 进入 Condition 上下文：自动拿 _lock，离开自动还
+            deadline = time.time() + timeout  # 算出截止时间戳
+            while True:  # 自旋等待：被喊醒后回到顶部重查
+                if self._idle:   # 空闲栈非空
                     return self._idle.pop()                      # ① 有空闲：直接复用，零创建成本
                                                                  #   pop() 从栈顶取走并移除一个实例：
                                                                  #   [实例#2, 实例#1].pop() → 返回#2，栈剩[#1] 就是一个数组
                                                                  #   取走的不再留在 _idle 里（借出的实例不在架上，checkin 才回来）
-                if self._created < self._size:
-                    self._created += 1
+                if self._created < self._size:  # 空闲栈空但还没造满
+                    self._created += 1  # 已创建数 +1（占位，防别的线程同时超造）
                     instance = self._factory()                   # ② 没空闲但没造满：现造一个
                                                                  #   等价于 new：若配方是 lambda: DataQueryTool()，
                                                                  #   这行就是 DataQueryTool()。不写死类名是因为池子
                                                                  #   是通用件，手法由装配处递配方进来。
                                                                  #   新实例不进 _idle 架子，造完直接借给当前线程。
                     self._available.notify_all()                 #   喊醒睡觉的线程重查条件（见下方 wait 分支）
-                    return instance
-                remaining = deadline - time.time()
-                if remaining <= 0 or not self._available.wait(remaining):
-                    raise TimeoutError(
+                    return instance  # 把新造的实例直接借出去
+                remaining = deadline - time.time()  # 还剩多少秒可等
+                if remaining <= 0 or not self._available.wait(remaining):  # 超时或 wait 超时返回 False
+                    raise TimeoutError(  # 抛超时异常
                         f"工具实例池 {self._name} 借出超时({timeout}s)："
                         f"上限 {self._size} 个实例全部在用"
                     )
@@ -275,7 +275,7 @@ class ToolInstancePool:
 
     # 【什么】归还实例
     # 【作用】放回空闲栈并唤醒等待者；不归还会让池永久缩容（借一个少一个）
-    def checkin(self, instance: Any) -> None:
+    def checkin(self, instance: Any) -> None:  # 归还实例：放回空闲栈并喊醒等待者
         # ------------------------------------------------------------------
         # 【什么】归还实例：append 回空闲栈 + notify_all 喊醒等待者
         # 【为什么锁内做】_idle 是普通 list，不拿锁并发 append/pop 会错乱：
@@ -285,26 +285,26 @@ class ToolInstancePool:
         # 【输入输出对照】_idle=[]、线程C 睡在 wait：
         #   append(#1) → _idle=[#1] → notify 唤醒 C → C pop 走 #1 → _idle=[]
         # ------------------------------------------------------------------
-        with self._available:
+        with self._available:  # 进 Condition 上下文：自动拿锁
             self._idle.append(instance)          # 实例放回空闲栈，等下个线程 checkout 时 pop 走复用
             self._available.notify_all()         # 喊醒睡在 wait 的线程：有货了，快去重查 _idle
 
     # 【什么】上下文管理器形式借还（推荐用法）
     # 【作用】with 结束自动归还，即使块内抛异常也不泄漏实例
-    def borrow(self, timeout: float = 10.0):
-        import contextlib
+    def borrow(self, timeout: float = 10.0):  # 返回一个上下文管理器，配 with 用
+        import contextlib  # 上下文管理器工具：@contextmanager 把生成器变成 with 可用的对象
 
-        @contextlib.contextmanager
-        def _ctx():
+        @contextlib.contextmanager  # 装饰器：把生成器函数包装成上下文管理器
+        def _ctx():  # 生成器：yield 前是 __enter__，yield 后是 __exit__
             instance = self.checkout(timeout=timeout)   # 进 with 时借：拿不到就抛 TimeoutError
-            try:
+            try:  # 保护 with 块
                 yield instance                          # 把实例交给 with 块内的代码用
-            finally:
+            finally:  # 无论 with 块内是否抛异常都走这里
                 self.checkin(instance)                  # 出 with 时还：块内抛异常也照还，不泄漏实例
 
         return _ctx()                                   # 返回生成器上下文管理器（支持 with pool.borrow() as x:）
 
-    def stats(self) -> Dict[str, int]:
+    def stats(self) -> Dict[str, int]:  # 返回池运行态快照
         """池状态：{'size': 上限, 'created': 已创建, 'idle': 当前空闲}。"""
-        with self._available:
-            return {"size": self._size, "created": self._created, "idle": len(self._idle)}
+        with self._available:  # 拿锁读账本
+            return {"size": self._size, "created": self._created, "idle": len(self._idle)}  # 三项观测值

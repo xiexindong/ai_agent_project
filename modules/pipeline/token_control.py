@@ -17,13 +17,13 @@ Token 长度控制与超长压缩
     规则压缩够用就不调 LLM；LLM 失败/没配 key 就直接硬截断 ——
     压缩环节失败不该让整条流水线挂掉。
 """
-from typing import Optional
+from typing import Optional                                 # 类型注解：LLM 压缩失败返回 Optional[str]
 
-from modules.common.logger import get_logger
-from modules.common.token_counter import count_tokens
-from modules.pipeline.models import TokenResult
+from modules.common.logger import get_logger                # 统一日志入口
+from modules.common.token_counter import count_tokens       # 统一 token 计数
+from modules.pipeline.models import TokenResult             # 本环节的结果模型
 
-_logger = get_logger("pipeline.token")
+_logger = get_logger("pipeline.token")                      # 本模块日志器，带 pipeline.token 前缀
 
 # ----------------------------------------------------------------------
 # 【寒暄套话】压缩时优先去掉的部分：它们对判断意图没有贡献
@@ -42,6 +42,7 @@ _COMPRESS_SYSTEM = (
 
 # 【什么】第 ① 级压缩：去重复行 + 去开头寒暄 + 压空白
 # 【作用】零成本零延迟地砍掉冗余，多数超长输入在这一级就能回到预算内
+# 【为什么】重复行与寒暄对意图判断零贡献，先去它们既省钱又不伤语义
 def _rule_compress(text: str) -> str:
     """规则压缩：去重行 + 去寒暄 + 压空白。
 
@@ -54,50 +55,52 @@ def _rule_compress(text: str) -> str:
         用户常先说结论再复述一遍细节，去重时保留首次出现 = 保留第一次的描述，
         语义顺序不变，不会把"原因"挪到"结论"前面。
     """
-    lines = []
-    seen = set()
-    for raw in text.split("\n"):
-        line = raw.strip()
-        if not line:
-            continue
+    lines = []                                              # 去重后的有效行容器
+    seen = set()                                            # 已见过的行（完全重复判定用）
+    for raw in text.split("\n"):                            # 按行遍历原文
+        line = raw.strip()                                  # 去行首尾空白
+        if not line:                                        # 空行
+            continue                                        # 丢弃
         if line in seen:          # 完全重复的行只留第一次
-            continue
-        seen.add(line)
-        lines.append(line)
+            continue                                        # 重复行丢弃
+        seen.add(line)                                      # 记录首次出现
+        lines.append(line)                                  # 收录
 
-    out = "\n".join(lines)
-    low = out.lower()
-    for word in _SMALL_TALK_PREFIX:
-        if low.startswith(word) and len(out) > len(word) + 4:
-            out = out[len(word):].lstrip("，,、：: ")
-            low = out.lower()
-            break
-    return out
+    out = "\n".join(lines)                                  # 重新拼成文本
+    low = out.lower()                                       # 小写副本，用于寒暄词的大小写无关比较
+    for word in _SMALL_TALK_PREFIX:                         # 逐个寒暄词试匹配
+        if low.startswith(word) and len(out) > len(word) + 4:  # 开头命中且去掉后还有实质内容
+            out = out[len(word):].lstrip("，,、：: ")       # 砍掉寒暄词与其后的标点空白
+            low = out.lower()                               # 同步更新小写副本
+            break                                           # 只去最前面那一个寒暄词
+    return out                                              # 返回规则压缩结果
 
 
 # 【什么】第 ② 级压缩：调一次模型做摘要式压缩
 # 【作用】规则压不动时靠模型保留实体与诉求；失败返回 None 交给第 ③ 级
+# 【为什么】规则只会"删"，模型会"改写"；但模型是花钱的外部依赖，失败必须能降级
 def _llm_compress(text: str, max_tokens: int, llm) -> Optional[str]:
     """LLM 压缩：调用一次模型做摘要式压缩。
 
     Returns:
         压缩后的文本；失败返回 None（调用方接着走硬截断）
     """
-    if llm is None:
-        return None
+    if llm is None:                                         # 未注入 LLM 客户端
+        return None                                         # 直接放弃本级，走硬截断
     try:
-        prompt = f"请把下面文本压缩到 {max_tokens} token 以内：\n\n{text}"
+        prompt = f"请把下面文本压缩到 {max_tokens} token 以内：\n\n{text}"  # 用户提示词：给预算 + 原文
         # temperature=0.1 压低发散；输出上限给预算的 2 倍，避免模型自己把结果写一半截断
         out = llm.invoke(prompt, system_prompt=_COMPRESS_SYSTEM, temperature=0.1, max_tokens=max_tokens * 2)
-        out = (out or "").strip()
-        return out or None
-    except Exception as e:
-        _logger.warning(f"LLM压缩失败，转硬截断: {e}")
-        return None
+        out = (out or "").strip()                           # 去首尾空白；None 兜底空串
+        return out or None                                  # 空输出按失败处理（返回 None）
+    except Exception as e:                                  # 网络/鉴权/超时等异常
+        _logger.warning(f"LLM压缩失败，转硬截断: {e}")       # 记警告日志
+        return None                                         # 返回 None，调用方接着走硬截断
 
 
 # 【什么】第 ③ 级压缩：按比例硬截断
 # 【作用】最后兜底，一定成功；会丢尾部信息但保证 token 一定达标
+# 【为什么】前两级都可能"压不够"，必须有一级数学上必然达标的兜底，否则流水线会卡死
 def _truncate(text: str, max_tokens: int, tokens_now: int) -> str:
     """硬截断：按 token 超出的比例反推要保留多少字符。
 
@@ -109,14 +112,15 @@ def _truncate(text: str, max_tokens: int, tokens_now: int) -> str:
         text="A"*10000, tokens_now=5000, max_tokens=2000
             → 保留 10000 * 2000/5000 * 0.95 = 3800 个字符
     """
-    if tokens_now <= 0:
-        return text[:max_tokens]
-    keep = int(len(text) * max_tokens / tokens_now * 0.95)
-    return text[:max(1, keep)]
+    if tokens_now <= 0:                                     # 防御：token 计数异常（0 或负）
+        return text[:max_tokens]                            # 退化为按字符数 1:1 截断
+    keep = int(len(text) * max_tokens / tokens_now * 0.95)  # 按比例反推保留字符数并留 5% 余量
+    return text[:max(1, keep)]                              # 至少保留 1 个字符，不为空串
 
 
 # 【什么】Token 长度控制总入口，按 ① 规则 → ② LLM → ③ 硬截断逐级降级
 # 【作用】把输入压到意图识别吃得下的长度，且压缩环节失败也不让流水线挂掉
+# 【为什么】三级从便宜到贵排列：多数输入第一级就够，少数才花钱，极端情况有数学兜底
 def control_tokens(
     text: str,                       # 清洗 + 风控后的文本
     max_tokens: int = 2000,          # token 预算，默认取 settings.pipeline_max_input_tokens
@@ -143,36 +147,36 @@ def control_tokens(
             → 若规则后仍 3000 token → 调 LLM → method="llm"
             → LLM 失败 → method="truncate", 截断到 <=2000 token
     """
-    tokens_before = count_tokens(text)
-    if tokens_before <= max_tokens:
+    tokens_before = count_tokens(text)                      # 先数一次：压缩前的 token 数
+    if tokens_before <= max_tokens:                         # 没超预算
         return TokenResult(text=text, tokens_before=tokens_before,
-                           tokens_after=tokens_before, compressed=False, method="none")
+                           tokens_after=tokens_before, compressed=False, method="none")  # 原样返回，未压缩
 
-    if not compress_enabled:
-        cut = _truncate(text, max_tokens, tokens_before)
+    if not compress_enabled:                                # 配置关闭了压缩
+        cut = _truncate(text, max_tokens, tokens_before)    # 直接硬截断
         return TokenResult(text=cut, tokens_before=tokens_before,
-                           tokens_after=count_tokens(cut), compressed=True, method="truncate")
+                           tokens_after=count_tokens(cut), compressed=True, method="truncate")  # 返回截断结果
 
     # ① 规则压缩
-    ruled = _rule_compress(text)
-    tokens_ruled = count_tokens(ruled)
-    if tokens_ruled <= max_tokens:
-        _logger.info(f"规则压缩: {tokens_before} -> {tokens_ruled} token")
+    ruled = _rule_compress(text)                            # 去重行 + 去寒暄 + 压空白
+    tokens_ruled = count_tokens(ruled)                      # 数规则压缩后的 token 数
+    if tokens_ruled <= max_tokens:                          # 规则压缩后已达标
+        _logger.info(f"规则压缩: {tokens_before} -> {tokens_ruled} token")  # 记压缩日志
         return TokenResult(text=ruled, tokens_before=tokens_before,
-                           tokens_after=tokens_ruled, compressed=True, method="rule")
+                           tokens_after=tokens_ruled, compressed=True, method="rule")  # method=rule
 
     # ② LLM 压缩
-    llm_out = _llm_compress(ruled, max_tokens, llm)
-    if llm_out:
-        tokens_llm = count_tokens(llm_out)
-        if tokens_llm <= max_tokens:
-            _logger.info(f"LLM压缩: {tokens_before} -> {tokens_llm} token")
+    llm_out = _llm_compress(ruled, max_tokens, llm)         # 规则压不动，调模型做摘要压缩；失败返回 None
+    if llm_out:                                             # LLM 给出了非空压缩结果
+        tokens_llm = count_tokens(llm_out)                  # 数 LLM 压缩后的 token 数
+        if tokens_llm <= max_tokens:                        # LLM 压缩后达标
+            _logger.info(f"LLM压缩: {tokens_before} -> {tokens_llm} token")  # 记压缩日志
             return TokenResult(text=llm_out, tokens_before=tokens_before,
-                               tokens_after=tokens_llm, compressed=True, method="llm")
+                               tokens_after=tokens_llm, compressed=True, method="llm")  # method=llm
 
     # ③ 硬截断（兜底：一定成功）
-    cut = _truncate(ruled, max_tokens, tokens_ruled)
-    tokens_cut = count_tokens(cut)
-    _logger.warning(f"硬截断: {tokens_before} -> {tokens_cut} token（规则压缩后仍 {tokens_ruled}）")
+    cut = _truncate(ruled, max_tokens, tokens_ruled)        # 前两级都没压到预算内，按比例硬切
+    tokens_cut = count_tokens(cut)                          # 数截断后的 token 数
+    _logger.warning(f"硬截断: {tokens_before} -> {tokens_cut} token（规则压缩后仍 {tokens_ruled}）")  # 警告：丢尾部信息了
     return TokenResult(text=cut, tokens_before=tokens_before,
-                       tokens_after=tokens_cut, compressed=True, method="truncate")
+                       tokens_after=tokens_cut, compressed=True, method="truncate")  # method=truncate

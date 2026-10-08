@@ -23,43 +23,44 @@ Human-in-the-Loop 子包：让人能在 Agent 跑的过程中插手。
     # 单元测试 / CI（没有人）：注入自动答复器
     gate = build_gate(enabled=True, resolver=auto_resolver(HumanAction.APPROVE))
 """
-from typing import Optional
+from typing import Optional  # 可选类型标注
 
-from modules.common.logger import get_logger
-from modules.hitl.gate import HumanGate, Resolver, auto_resolver, scripted_resolver
-from modules.hitl.models import (
-    HumanAction,
-    HumanReply,
-    InterruptKind,
-    InterruptRecord,
-    InterruptRequest,
-    InterruptStatus,
-    new_interrupt_id,
-    now_ms,
+from modules.common.logger import get_logger  # 项目统一日志器工厂
+from modules.hitl.gate import HumanGate, Resolver, auto_resolver, scripted_resolver  # 闸门与自动答复器
+from modules.hitl.models import (  # 导入数据契约
+    HumanAction,  # 人工决策动作枚举
+    HumanReply,  # 人工回复模型
+    InterruptKind,  # 中断点类型枚举
+    InterruptRecord,  # 请求 + 回复归档模型
+    InterruptRequest,  # 中断请求模型
+    InterruptStatus,  # 生命周期状态枚举
+    new_interrupt_id,  # 短 ID 生成工具
+    now_ms,  # 毫秒时间戳工具
 )
-from modules.hitl.notify import (
-    InterruptNotifier,
-    build_notifier,
-    format_interrupt_text,
-    get_global_notifier,
-    set_global_notifier,
+from modules.hitl.notify import (  # 导入通知器
+    InterruptNotifier,  # 通知器类
+    build_notifier,  # 按配置造通知器
+    format_interrupt_text,  # 请求格式化文本工具
+    get_global_notifier,  # 取进程级共享通知器
+    set_global_notifier,  # 替换进程级共享通知器
 )
-from modules.hitl.policy import HITLPolicy
-from modules.hitl.store import InMemoryInterruptStore, InterruptStore
+from modules.hitl.policy import HITLPolicy  # 触发策略
+from modules.hitl.store import InMemoryInterruptStore, InterruptStore  # 存储协议与进程内实现
 
-_logger = get_logger("hitl")
+_logger = get_logger("hitl")  # 本模块日志器
 
 
 # 【什么】一行构造闸门
 # 【作用】调用方不必自己拼 policy / store / resolver 三件套
+# 【为什么】构造细节收敛一处，调用方只给开关与名单
 def build_gate(
-    enabled: bool = False,
-    sensitive_tools: Optional[list] = None,
-    resolver=None,
-    timeout_seconds: float = 60.0,
-    on_event=None,
-    **policy_kwargs,
-) -> HumanGate:
+    enabled: bool = False,  # 总开关；关掉时所有 ask 立即放行
+    sensitive_tools: Optional[list] = None,  # 需要人工批准的工具名
+    resolver=None,  # 自动答复器（测试 / CI 用 auto_resolver）
+    timeout_seconds: float = 60.0,  # 单次等待上限
+    on_event=None,  # 请求登记后的通知钩子（InterruptNotifier.notify）
+    **policy_kwargs,  # 其余策略字段透传（kinds / tool_action 等）
+) -> HumanGate:  # 返回造好的闸门
     """构造一个人工闸门。
 
     Args:
@@ -69,13 +70,13 @@ def build_gate(
         timeout_seconds: 单次等待上限
         on_event:       请求登记后的通知钩子（InterruptNotifier.notify）
     """
-    policy = HITLPolicy(
-        enabled=enabled,
-        sensitive_tools=list(sensitive_tools or []),
-        timeout_seconds=timeout_seconds,
-        **policy_kwargs,
+    policy = HITLPolicy(  # 组装策略对象
+        enabled=enabled,  # 总开关
+        sensitive_tools=list(sensitive_tools or []),  # 敏感工具名单，缺省为空
+        timeout_seconds=timeout_seconds,  # 等待上限
+        **policy_kwargs,  # 透传其余策略配置
     )
-    return HumanGate(policy=policy, resolver=resolver, on_event=on_event)
+    return HumanGate(policy=policy, resolver=resolver, on_event=on_event)  # 用策略造闸门（存储用默认内存实现）
 
 
 # ---------------------------------------------------------------------------
@@ -91,47 +92,53 @@ def build_gate(
 #   【依赖警告】单实例部署才成立。多副本部署时审批请求可能打到另一台机器，
 #       此时必须把 store 换成共享存储（如 PG），接口一行不用改。
 # ---------------------------------------------------------------------------
-_GLOBAL_GATE: Optional["HumanGate"] = None
+_GLOBAL_GATE: Optional["HumanGate"] = None  # 进程级共享闸门实例，首次使用时建造
 
 
-def get_global_gate(enabled: Optional[bool] = None, **policy_kwargs) -> "HumanGate":
+# 【什么】取进程级共享闸门
+# 【作用】首次调用按配置建造，之后返回同一实例
+# 【为什么】审批接口和 Agent 链路必须用同一个 gate，否则人点了批准 Agent 永远收不到
+def get_global_gate(enabled: Optional[bool] = None, **policy_kwargs) -> "HumanGate":  # enabled 可显式覆盖配置开关
     """取进程级共享闸门（第一次调用时按配置建造）。"""
-    global _GLOBAL_GATE
-    if _GLOBAL_GATE is None:
-        from config import get_settings
-        s = get_settings()
-        _GLOBAL_GATE = build_gate(
-            enabled=s.hitl_enabled if enabled is None else enabled,
-            sensitive_tools=[t for t in s.hitl_sensitive_tools.split(",") if t.strip()],
-            kinds=[k for k in s.hitl_kinds.split(",") if k.strip()],
-            timeout_seconds=s.hitl_timeout_seconds,
-            **policy_kwargs,
+    global _GLOBAL_GATE  # 声明读写模块级变量
+    if _GLOBAL_GATE is None:  # 尚未建造
+        from config import get_settings  # 延迟导入，避免模块级循环依赖
+        s = get_settings()  # 读全局配置
+        _GLOBAL_GATE = build_gate(  # 按配置建造闸门
+            enabled=s.hitl_enabled if enabled is None else enabled,  # 显式传参优先于配置
+            sensitive_tools=[t for t in s.hitl_sensitive_tools.split(",") if t.strip()],  # 逗号分隔字符串转工具名单
+            kinds=[k for k in s.hitl_kinds.split(",") if k.strip()],  # 逗号分隔字符串转中断点白名单
+            timeout_seconds=s.hitl_timeout_seconds,  # 等待上限
+            **policy_kwargs,  # 透传其余配置
         )
         # 【挂上通知器】不通过 build_gate 传参，而是造完再补：
         #   通知器要读配置建造，而 build_gate 本身不依赖配置 ——
         #   这样单测里 new 一个独立 gate 时不会被全局通知器打扰。
         try:
-            _GLOBAL_GATE.on_event = get_global_notifier().notify
-        except Exception as e:
-            _logger.warning(f"HITL 通知器装配失败（仍可审批，只是没人被通知）: {e}")
-    return _GLOBAL_GATE
+            _GLOBAL_GATE.on_event = get_global_notifier().notify  # 把共享通知器挂为事件钩子
+        except Exception as e:  # 通知器装配失败
+            _logger.warning(f"HITL 通知器装配失败（仍可审批，只是没人被通知）: {e}")  # 只记警告，不阻断
+    return _GLOBAL_GATE  # 返回共享闸门
 
 
-def set_global_gate(gate: Optional["HumanGate"]) -> None:
+# 【什么】替换进程级共享闸门
+# 【作用】演示、测试注入自动答复器时换实现
+# 【为什么】不替换的话测试会走真人等待，永远卡住
+def set_global_gate(gate: Optional["HumanGate"]) -> None:  # 传 None 可清空
     """替换共享闸门（演示、测试注入自动答复器时用）。"""
-    global _GLOBAL_GATE
-    _GLOBAL_GATE = gate
+    global _GLOBAL_GATE  # 声明写模块级变量
+    _GLOBAL_GATE = gate  # 替换共享实例
 
 
-__all__ = [
-    "get_global_gate", "set_global_gate",
-    "InterruptKind", "HumanAction", "InterruptStatus",
-    "InterruptRequest", "HumanReply", "InterruptRecord",
-    "new_interrupt_id", "now_ms",
-    "HITLPolicy",
-    "InterruptStore", "InMemoryInterruptStore",
-    "HumanGate", "Resolver", "auto_resolver", "scripted_resolver",
-    "build_gate",
-    "InterruptNotifier", "build_notifier", "format_interrupt_text",
-    "get_global_notifier", "set_global_notifier",
+__all__ = [  # 公开导出清单
+    "get_global_gate", "set_global_gate",  # 共享闸门的取与换
+    "InterruptKind", "HumanAction", "InterruptStatus",  # 枚举契约
+    "InterruptRequest", "HumanReply", "InterruptRecord",  # 数据模型
+    "new_interrupt_id", "now_ms",  # 工具函数
+    "HITLPolicy",  # 触发策略
+    "InterruptStore", "InMemoryInterruptStore",  # 存储协议与实现
+    "HumanGate", "Resolver", "auto_resolver", "scripted_resolver",  # 闸门与答复器
+    "build_gate",  # 一行构造
+    "InterruptNotifier", "build_notifier", "format_interrupt_text",  # 通知器
+    "get_global_notifier", "set_global_notifier",  # 共享通知器的取与换
 ]

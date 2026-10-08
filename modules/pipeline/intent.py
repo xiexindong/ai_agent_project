@@ -21,13 +21,13 @@ LLM 结构化意图识别
     兜底结果 confidence 一律 ≤ 0.4（必然低于 0.5 阈值 = 不调工具），
     宁可让模型空手回答，也不让一个不确定的分类触发工具调用。
 """
-import re
-from typing import Any, Dict, List, Optional
+import re                                                       # 正则：兜底规则匹配与字段清洗用
+from typing import Any, Dict, List, Optional                    # 类型注解：任意值 / 字典 / 列表 / 可选
 
-from modules.common.logger import get_logger
-from modules.pipeline.models import IntentResult, IntentType
+from modules.common.logger import get_logger                    # 统一日志入口
+from modules.pipeline.models import IntentResult, IntentType    # 意图结果模型与 6 类意图常量
 
-_logger = get_logger("pipeline.intent")
+_logger = get_logger("pipeline.intent")                         # 本模块日志器，带 pipeline.intent 前缀
 
 # ----------------------------------------------------------------------
 # 【分类提示词】三段式：先给类别定义，再给输出格式，最后给判断要点
@@ -76,24 +76,25 @@ _MAX_DOMAIN_LEN = 32     # domain_tag 最多 32 字符
 #   保证降级时不会误触发工具调用（安全默认值）。
 # ----------------------------------------------------------------------
 _RULE_FALLBACK: List[tuple] = [
-    ("continue_memory", "general", r"^(继续|接着|然后呢|再说|详细说|上面|刚才|之前那个|上一个)", 0.40),
-    ("rag", "general", r"(制度|规定|流程|文档|知识库|政策|标准|手册|指南|办法)", 0.40),
-    ("local_skill", "general", r"(几点|时间|现在.*时候|天气|计算|算一下|等于|汇率)", 0.35),
-    ("mcp_remote", "finance", r"(报销|发票|预算|成本|审计|付款)", 0.35),
-    ("mcp_remote", "hr", r"(考勤|请假|年假|招聘|绩效|组织|花名册)", 0.35),
-    ("mcp_remote", "it", r"(工单|运维|服务器|权限|VPN|资产|账号)", 0.35),
-    ("local_skill", "general", r"(订单|库存|数据|统计|报表|查询)", 0.35),
+    ("continue_memory", "general", r"^(继续|接着|然后呢|再说|详细说|上面|刚才|之前那个|上一个)", 0.40),  # 续聊：以"继续/刚才"等开头
+    ("rag", "general", r"(制度|规定|流程|文档|知识库|政策|标准|手册|指南|办法)", 0.40),                  # 知识库：出现制度/文档类词
+    ("local_skill", "general", r"(几点|时间|现在.*时候|天气|计算|算一下|等于|汇率)", 0.35),              # 本地工具：时间/天气/计算类
+    ("mcp_remote", "finance", r"(报销|发票|预算|成本|审计|付款)", 0.35),                                 # 远程技能·财务域
+    ("mcp_remote", "hr", r"(考勤|请假|年假|招聘|绩效|组织|花名册)", 0.35),                               # 远程技能·人事域
+    ("mcp_remote", "it", r"(工单|运维|服务器|权限|VPN|资产|账号)", 0.35),                                # 远程技能·IT 域
+    ("local_skill", "general", r"(订单|库存|数据|统计|报表|查询)", 0.35),                                # 本地工具：数据查询类
 ]
 # 【什么】预编译后的兜底规则表
 # 【作用】导入时编译一次正则，降级路径每条请求都要过一遍，避免重复解析
-_COMPILED_FALLBACK = [(t, d, re.compile(p), c) for t, d, p, c in _RULE_FALLBACK]
+_COMPILED_FALLBACK = [(t, d, re.compile(p), c) for t, d, p, c in _RULE_FALLBACK]  # 四元组中的正则串编译成 Pattern 对象
 
 # 兜底用的关键词抽取：中文词 2-6 字 + 英文单词 2 字以上
-_WORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,}")
+_WORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,}")  # 中文连续 2~6 字或英文 2 字母以上记为一个词
 
 
 # 【什么】按正则从文本里抽关键词（去重、限数量）
 # 【作用】给降级路径和 keyword_list 兜底，保证召回总能拿到可用的关键词
+# 【为什么】LLM 路径失败时召回环节仍需要关键词，正则抽取是最便宜的兜底来源
 def _extract_keywords(text: str, limit: int = _MAX_KEYWORDS) -> List[str]:
     """从文本里抽关键词（兜底路径用，也用于给 LLM 的 keyword_list 兜底）。
 
@@ -101,17 +102,18 @@ def _extract_keywords(text: str, limit: int = _MAX_KEYWORDS) -> List[str]:
         输入 "帮我查一下上海明天的天气怎么样"
             → 输出 ["帮我", "查一下", "上海", "明天", "天气", "怎么样"]
     """
-    words: List[str] = []
-    for w in _WORD_RE.findall(text or ""):
-        if w not in words:
-            words.append(w)
-        if len(words) >= limit:
-            break
-    return words
+    words: List[str] = []                                   # 去重后的关键词容器（保持出现顺序）
+    for w in _WORD_RE.findall(text or ""):                  # 逐枚匹配到的候选词；None 输入兜底空串
+        if w not in words:                                  # 简单去重（数量小，O(n²) 可接受）
+            words.append(w)                                 # 首次出现才收录
+        if len(words) >= limit:                             # 达到数量上限
+            break                                           # 提前结束，避免无效遍历
+    return words                                            # 返回去重限长后的关键词列表
 
 
 # 【什么】把 LLM 各种形态的"是/否"统一成 bool
 # 【作用】模型有时给 true、有时给"是"、有时给 1，不统一会在下游判断上出错
+# 【为什么】下游 need_memory 直接参与 if 判断，类型不收敛会出现 "false" 也为真的坑
 def _to_bool(value: Any) -> bool:
     """把 LLM 可能给出的各种形态统一成 bool。
 
@@ -119,15 +121,16 @@ def _to_bool(value: Any) -> bool:
         True → True；"true" → True；"是" → True；1 → True
         "false"/"" /None/0 → False
     """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    return str(value).strip().lower() in ("true", "1", "yes", "是", "需要")
+    if isinstance(value, bool):                             # 本身就是布尔
+        return value                                        # 原样返回
+    if isinstance(value, (int, float)):                     # 数值型
+        return value != 0                                   # 非 0 即真
+    return str(value).strip().lower() in ("true", "1", "yes", "是", "需要")  # 其余按字符串白名单判断
 
 
 # 【什么】规整字符串列表：只留字符串、去空白、去重、限长、限数量
 # 【作用】挡住模型把整段原文或"无"塞进数组这类输出，保证下游遍历有意义
+# 【为什么】下游会对列表做 for 遍历与 in 判断，脏数据会被误当成有效关键词/工具名
 def _clean_list(value: Any, limit: int = _MAX_KEYWORDS) -> List[str]:
     """规整字符串列表：只留字符串、去空白、去重、限长、限数量。
 
@@ -141,69 +144,72 @@ def _clean_list(value: Any, limit: int = _MAX_KEYWORDS) -> List[str]:
         输入 "无"                        → 输出 []
         输入 ["A"*50]                    → 输出 [前 24 个字符]
     """
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, (list, tuple)):
-        return []
-    out: List[str] = []
-    for item in value:
-        s = str(item).strip()
-        if not s or s in ("无", "none", "null", "[]"):
-            continue
-        if len(s) > _MAX_WORD_LEN:
-            s = s[:_MAX_WORD_LEN]
-        if s not in out:
-            out.append(s)
-        if len(out) >= limit:
-            break
-    return out
+    if isinstance(value, str):                              # 模型把单个字符串当数组返回时
+        value = [value]                                     # 包成单元素列表再统一处理
+    if not isinstance(value, (list, tuple)):                # 既不是字符串也不是列表/元组
+        return []                                           # 直接放弃，返回空列表
+    out: List[str] = []                                     # 清洗结果容器
+    for item in value:                                      # 逐项处理
+        s = str(item).strip()                               # 转字符串并去首尾空白
+        if not s or s in ("无", "none", "null", "[]"):      # 空串或"占位词"
+            continue                                        # 丢弃
+        if len(s) > _MAX_WORD_LEN:                          # 单个词超长
+            s = s[:_MAX_WORD_LEN]                           # 截断到上限
+        if s not in out:                                    # 去重
+            out.append(s)                                   # 收录
+        if len(out) >= limit:                               # 达到数量上限
+            break                                           # 提前结束
+    return out                                              # 返回清洗后的列表
 
 
 # 【什么】规整业务域标签：只留字母数字下划线、小写、限长
 # 【作用】domain_tag 会拼进召回过滤条件，必须收敛成可控字符集
+# 【为什么】domain_tag 最终要进 SQL 过滤条件，字符集不收拢就有注入与匹配失败风险
 def _normalize_domain(value: Any) -> str:
     """规整业务域标签：小写、只留字母数字下划线、超长截断、空值兜底 general。"""
-    s = re.sub(r"[^A-Za-z0-9_]", "", str(value or "")).lower()
-    if not s:
-        return "general"
-    return s[:_MAX_DOMAIN_LEN]
+    s = re.sub(r"[^A-Za-z0-9_]", "", str(value or "")).lower()  # 剔除非字母数字下划线字符并转小写
+    if not s:                                               # 清洗后为空
+        return "general"                                    # 兜底为 general
+    return s[:_MAX_DOMAIN_LEN]                              # 超长截断后返回
 
 
 # 【什么】把 LLM 原始 JSON 归一化成 IntentResult
 # 【作用】字段逐个校验收敛，出参的六个字段对下游而言全部可信
+# 【为什么】LLM 输出是"不可信输入"，必须在边界处一次收敛，下游才能不做防御性判断
 def _normalize(raw: Dict[str, Any]) -> IntentResult:
     """把 LLM 原始 JSON 归一化成 IntentResult（字段全部可信）。"""
-    itype = str(raw.get("intent_type", "")).strip().lower()
-    if itype not in IntentType.ALL:
+    itype = str(raw.get("intent_type", "")).strip().lower()  # 取类别字段并规整成小写
+    if itype not in IntentType.ALL:                         # 不在 6 个合法类别里
         # --------------------------------------------------------------
         # 【非法类别怎么处理】不抛异常，直接归为 invalid。
         #   模型偶尔会自创类别（如 "tool_call"、"search"），
         #   归 invalid 的效果是：不召回工具、走拒答/澄清分支 —— 比猜一个类别安全。
         # --------------------------------------------------------------
-        if itype:
+        if itype:                                           # 非空的未知类别才记日志（空串是缺省，不算异常）
             _logger.warning(f"LLM 返回未知意图类别: {itype} → 归为 invalid")
-        itype = IntentType.INVALID
+        itype = IntentType.INVALID                          # 统一归为 invalid
 
     try:
-        conf = float(raw.get("intent_confidence", 0.0))
-    except (TypeError, ValueError):
-        conf = 0.0
+        conf = float(raw.get("intent_confidence", 0.0))     # 置信度转 float
+    except (TypeError, ValueError):                         # 模型给了"高"/"0.8分"这类怪值
+        conf = 0.0                                          # 按 0 处理
     conf = max(0.0, min(1.0, conf))   # clamp 到 [0,1]
 
     return IntentResult(
-        intent_type=itype,
-        intent_confidence=conf,
-        need_memory=_to_bool(raw.get("need_memory", False)),
-        domain_tag=_normalize_domain(raw.get("domain_tag", "general")),
-        keyword_list=_clean_list(raw.get("keyword_list")),
-        exclude_tool_list=_clean_list(raw.get("exclude_tool_list")),
-        raw=raw if isinstance(raw, dict) else {},
-        degraded=False,
+        intent_type=itype,                                  # 校验过的类别
+        intent_confidence=conf,                             # 收敛到 [0,1] 的置信度
+        need_memory=_to_bool(raw.get("need_memory", False)),  # 统一成 bool
+        domain_tag=_normalize_domain(raw.get("domain_tag", "general")),  # 收敛字符集
+        keyword_list=_clean_list(raw.get("keyword_list")),  # 清洗关键词数组
+        exclude_tool_list=_clean_list(raw.get("exclude_tool_list")),  # 清洗黑名单数组
+        raw=raw if isinstance(raw, dict) else {},           # 原始输出留档，排障用
+        degraded=False,                                     # 走到这里说明 LLM 路径成功
     )
 
 
 # 【什么】规则兜底：按关键词表猜一个意图
 # 【作用】LLM 不可用时也能给出可用结果，且置信度封顶 0.4 保证不误触发工具
+# 【为什么】意图识别挂了不该让请求失败；降级只损失"调工具的能力"，不制造误调用
 def _rule_fallback(text: str, reason: str) -> IntentResult:
     """规则兜底：LLM 不可用时的降级判定。
 
@@ -211,27 +217,28 @@ def _rule_fallback(text: str, reason: str) -> IntentResult:
         规则匹配是"看着像"，不是"判得准"。封在 0.4 以下，
         下游 0.5 阈值会一律禁止调工具 —— 降级时只损失能力，不产生误调用。
     """
-    if not text:
+    if not text:                                            # 空输入
         return IntentResult(intent_type=IntentType.INVALID, intent_confidence=0.9,
-                            degraded=True, degrade_reason=reason or "输入为空")
+                            degraded=True, degrade_reason=reason or "输入为空")  # 直接判无效
 
-    for itype, domain, pattern, conf in _COMPILED_FALLBACK:
-        if pattern.search(text):
+    for itype, domain, pattern, conf in _COMPILED_FALLBACK:  # 按表顺序逐条匹配（先续聊、再 rag、再工具）
+        if pattern.search(text):                            # 命中某条规则
             return IntentResult(
                 intent_type=itype, intent_confidence=conf, need_memory=False,
-                domain_tag=domain, keyword_list=_extract_keywords(text),
-                degraded=True, degrade_reason=reason,
+                domain_tag=domain, keyword_list=_extract_keywords(text),  # 带上兜底关键词供召回用
+                degraded=True, degrade_reason=reason,       # 标记降级及原因
             )
 
     return IntentResult(
         intent_type=IntentType.CHAT, intent_confidence=0.30, need_memory=False,
         domain_tag="general", keyword_list=_extract_keywords(text),
-        degraded=True, degrade_reason=reason,
+        degraded=True, degrade_reason=reason,               # 无规则命中：兜底 chat、置信度 0.30
     )
 
 
 # 【什么】意图识别总入口：LLM 结构化输出 + 规则降级
 # 【作用】给出 6 选 1 大类与辅助字段；任何异常都不上抛，一律转规则兜底
+# 【为什么】意图识别是流水线中段环节，它挂了整条链不该断；降级输出仍能让链路走完
 def recognize_intent(text: str, llm=None, use_llm: bool = True) -> IntentResult:
     """意图识别（LLM 结构化输出 + 规则降级）。
 
@@ -253,35 +260,35 @@ def recognize_intent(text: str, llm=None, use_llm: bool = True) -> IntentResult:
                            domain_tag="finance", degraded=True,
                            degrade_reason="LLM 未配置或调用失败")
     """
-    if not use_llm:
+    if not use_llm:                                         # 调用方强制关闭 LLM（离线/单测）
         return _rule_fallback(text, "已关闭 LLM 意图识别（use_llm=False）")
 
     try:
-        if llm is None:
-            from modules.agent.llm import LLMClient
-            from config import get_settings
-            if not get_settings().deepseek_api_key:
+        if llm is None:                                     # 未注入客户端时内部按需创建
+            from modules.agent.llm import LLMClient         # 延迟导入：避免无依赖环境下导入本模块即失败
+            from config import get_settings                 # 延迟读配置
+            if not get_settings().deepseek_api_key:         # 没配 API Key
                 return _rule_fallback(text, "未配置 DEEPSEEK_API_KEY，走规则兜底")
-            llm = LLMClient()
+            llm = LLMClient()                               # 有 key 才实例化客户端
 
         # text[:2000]：分类不需要全文，超长部分砍掉省 token，也避免被细节带偏
-        prompt = _INTENT_PROMPT_TMPL.format(text=text[:2000])
-        raw = llm.invoke_structured(prompt, system_prompt=_INTENT_SYSTEM, temperature=0.1)
+        prompt = _INTENT_PROMPT_TMPL.format(text=text[:2000])  # 渲染用户提示词（只取前 2000 字）
+        raw = llm.invoke_structured(prompt, system_prompt=_INTENT_SYSTEM, temperature=0.1)  # 低温调分类，压低发散
 
         # ------------------------------------------------------------------
         # 【invoke_structured 的失败形态】解析不出来时它返回 {"error":..., "raw":...}
         #   而不是抛异常 —— 所以必须显式检查 error 字段，不能只看"返回了 dict"。
         # ------------------------------------------------------------------
-        if not isinstance(raw, dict) or "error" in raw:
-            _logger.warning(f"意图识别解析失败，走规则兜底: {str(raw)[:200]}")
+        if not isinstance(raw, dict) or "error" in raw:     # 返回非 dict 或带 error 字段都算失败
+            _logger.warning(f"意图识别解析失败，走规则兜底: {str(raw)[:200]}")  # 日志截断，防止超长输出刷屏
             return _rule_fallback(text, "LLM 输出无法解析为 JSON")
 
-        result = _normalize(raw)
+        result = _normalize(raw)                            # 字段归一化成 IntentResult
         _logger.info(
             f"意图识别: {result.intent_type} conf={result.intent_confidence:.2f} "
             f"domain={result.domain_tag} keywords={result.keyword_list}"
-        )
-        return result
-    except Exception as e:
-        _logger.warning(f"意图识别异常，走规则兜底: {e}")
-        return _rule_fallback(text, f"LLM 调用异常: {e}")
+        )                                                   # 成功日志：类别/置信度/业务域/关键词
+        return result                                       # 返回 LLM 路径结果
+    except Exception as e:                                  # 网络/鉴权/解析等任何异常
+        _logger.warning(f"意图识别异常，走规则兜底: {e}")    # 记警告日志
+        return _rule_fallback(text, f"LLM 调用异常: {e}")   # 一律降级，不上抛
