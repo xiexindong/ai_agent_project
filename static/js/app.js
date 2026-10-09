@@ -317,6 +317,19 @@ $(function () {
         const $content = aiMsg.$content;
         const $meta = aiMsg.$meta;
 
+        // 团队模式开关：勾选时改发 /agent/team/run（同步 JSON），否则走下方原 /chat SSE 流式
+        if ($("#teamMode").prop("checked")) {
+            // 临时会话号逻辑与函数末尾 /chat 分支一致（提前 return 需自行保证会话存在）
+            if (!state.currentSessionId) {
+                const tmpId = "tmp-" + Date.now();
+                state.currentSessionId = tmpId;
+                $currentSession.text(tmpId.slice(0, 12) + "...");
+                addSessionToList(tmpId, query.slice(0, 30));
+            }
+            sendTeamRun(query, $content, $meta);
+            return;
+        }
+
         let fullAnswer = "";
         let toolCalls = [];
         let iterations = 0;
@@ -433,6 +446,99 @@ $(function () {
             $currentSession.text(tmpId.slice(0, 12) + "...");
             addSessionToList(tmpId, query.slice(0, 30));
         }
+    }
+
+    // 团队模式：POST /agent/team/run（同步 JSON，无 SSE），一次性渲染 RunResult
+    function sendTeamRun(query, $content, $meta) {
+        setLoading("团队协作中：主管拆任务 → 并行执行 → 汇总终审...");
+        $content.html('<span class="streaming-status">团队协作中：主管拆任务 → 并行执行 → 汇总终审...<span class="cursor"></span></span>');
+        scrollToBottom();
+
+        fetch(state.apiBase + "/agent/team/run", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": state.apiKey,
+            },
+            body: JSON.stringify({
+                query: query,
+                session_id: state.currentSessionId || null,
+            }),
+        })
+        .then(async response => {
+            if (!response.ok) {
+                let detail = "";
+                try { detail = (await response.json()).detail || ""; } catch (e) { /* 非 JSON 错误体忽略 */ }
+                if (response.status === 503) throw new Error("多Agent模块未启用");
+                if (response.status === 401 || response.status === 403) throw new Error("API Key 无效或权限不足");
+                throw new Error("HTTP " + response.status + (detail ? ": " + detail : ""));
+            }
+            return response.json();
+        })
+        .then(result => renderTeamResult(result, $content, $meta))
+        .catch(err => {
+            $content.html('<span style="color:var(--danger)">⚠️ 团队请求失败: ' + escapeHtml(err.message) + "</span>");
+            showToast("团队对话失败: " + err.message, "error");
+        })
+        .finally(() => {
+            setLoading(null);
+        });
+    }
+
+    // 渲染团队结果：主管思路 → 子任务清单 → 执行产出 → 终审 → 最终答案
+    function renderTeamResult(result, $content, $meta) {
+        const plan = result.plan || {};
+        const subtasks = plan.subtasks || [];
+        const outputs = result.outputs || [];
+        let html = "";
+
+        if (plan.thought) {
+            html += '<div class="team-plan"><b>📋 主管思路：</b>' + escapeHtml(plan.thought) + "</div>";
+        }
+        if (subtasks.length) {
+            html += '<div class="team-subtasks"><b>子任务 ' + subtasks.length + " 个：</b><ul>";
+            for (const t of subtasks) {
+                const dep = (t.depends_on && t.depends_on.length)
+                    ? "（依赖 " + t.depends_on.join(", ") + "）"
+                    : "（可立即开始）";
+                html += "<li>" + escapeHtml(t.id) + " → <b>" + escapeHtml(t.assignee) + "</b>: "
+                    + escapeHtml(t.instruction) + " " + escapeHtml(dep) + "</li>";
+            }
+            html += "</ul></div>";
+        }
+        if (outputs.length) {
+            html += '<div class="team-outputs"><b>执行产出：</b>';
+            for (const out of outputs) {
+                const flag = out.success ? "✅" : "❌";
+                const err = out.success ? "" : ' <span style="color:var(--danger)">' + escapeHtml(out.error || "") + "</span>";
+                html += '<div class="team-output"><div>' + flag + " <b>" + escapeHtml(out.agent) + "</b>("
+                    + escapeHtml(out.role || "") + ") 步数=" + (out.steps || 0) + " 耗时=" + (out.duration_ms || 0) + "ms"
+                    + err + "</div>";
+                if (out.content) {
+                    const text = String(out.content);
+                    html += '<div class="team-output-content">' + escapeHtml(text.slice(0, 120)) + (text.length > 120 ? "..." : "") + "</div>";
+                }
+                html += "</div>";
+            }
+            html += "</div>";
+        }
+        if (result.review && result.review.content) {
+            const rv = String(result.review.content);
+            html += '<div class="team-review"><b>🔍 终审：</b>' + escapeHtml(rv.slice(0, 120)) + (rv.length > 120 ? "..." : "") + "</div>";
+        }
+        html += '<hr class="team-divider"><div class="team-answer">' + renderMarkdown(result.final_answer || "（无最终答案）") + "</div>";
+        if (result.error) {
+            html += '<div style="color:var(--danger)">⚠️ ' + escapeHtml(result.error) + "</div>";
+        }
+        $content.html(html);
+        $meta.html(
+            '<span class="meta-item">模式: 团队协作</span>' +
+            '<span class="meta-item">状态: ' + escapeHtml(result.status || "-") + "</span>" +
+            '<span class="meta-item">耗时: ' + (result.duration_ms || 0) + "ms</span>" +
+            (outputs.length ? '<span class="meta-item">产出: ' + outputs.length + " 个</span>" : "") +
+            (result.replan_count > 0 ? '<span class="meta-item">重规划: ' + result.replan_count + " 次</span>" : "")
+        );
+        scrollToBottom();
     }
 
     function createStreamingMessage() {

@@ -155,6 +155,55 @@ def _sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+# 【什么】多 Agent 团队运行路由（Mock）
+# 【作用】 与真实 /agent/team/run 同路径同步返 JSON（RunResult 结构），
+#          让前端"团队模式"开关在预览服务下也能演示，不报 404
+async def team_run(request):
+    """Mock 团队运行接口：固定返回一次「拆任务 → 并行执行 → 汇总 → 终审」的 RunResult。"""
+    user, err = _auth(request)
+    if err:
+        return err
+    body = await request.json()
+    query = body.get("query", "")
+    session_id = body.get("session_id") or f"team-{uuid.uuid4().hex[:8]}"   # 与真实端点同款兜底
+
+    return JSONResponse({
+        "run_id": str(uuid.uuid4()),
+        "query": query,
+        "status": "completed",
+        "plan": {
+            "thought": f"「{query[:24]}」需要先查事实再算结论，t2 依赖 t1 的产出",
+            "subtasks": [
+                {"id": "t1", "assignee": "researcher_1",
+                 "instruction": f"检索与「{query[:20]}」相关的事实数据",
+                 "depends_on": [], "priority": 3},
+                {"id": "t2", "assignee": "analyst_1",
+                 "instruction": "基于 t1 的数据计算并给出结论",
+                 "depends_on": ["t1"], "priority": 2},
+            ],
+            "direct_answer": "",
+            "needs_review": True,
+        },
+        "outputs": [
+            {"agent": "researcher_1", "role": "researcher", "task_id": "t1",
+             "success": True, "content": "（Mock）已完成资料检索：找到 2 组相关数据，Q3=1250、Q4=1475。",
+             "error": "", "steps": 2, "duration_ms": 920, "tool_calls": []},
+            {"agent": "analyst_1", "role": "analyst", "task_id": "t2",
+             "success": True, "content": "（Mock）基于上游数据计算：Q4 环比 Q3 增长 18%。",
+             "error": "", "steps": 1, "duration_ms": 610, "tool_calls": []},
+        ],
+        "final_answer": f"（Mock 团队答案）围绕「{query[:30]}」：两个成员先后完成检索与计算，"
+                        "结论是环比上升 18%，建议持续观察下一季度数据。",
+        "review": {"agent": "reviewer_1", "role": "reviewer", "task_id": "review",
+                   "success": True, "content": "（Mock）数据链路完整，结论与产出一致，通过。",
+                   "error": "", "steps": 1, "duration_ms": 280, "tool_calls": []},
+        "consensus": None, "arbitration": None,
+        "replan_count": 0, "delegations": [], "interrupt_count": 0,
+        "trace_id": str(uuid.uuid4()), "spans": [], "trace": [],
+        "duration_ms": 1810, "multimodal": None, "error": "",
+    })
+
+
 # 【什么】历史记录路由
 # 【作用】 返回空列表占位，让前端历史面板不报错（预览模式不存数据）
 async def history(request):
@@ -274,6 +323,7 @@ def create_demo_app() -> Starlette:
         Route("/knowledge/stats", kb_stats),                        # 知识库统计
         Route("/knowledge/ingest", ingest, methods=["POST"]),       # 入库（只收 POST）
         Route("/chat", chat, methods=["POST"]),                     # 对话（SSE 流式）
+        Route("/agent/team/run", team_run, methods=["POST"]),       # 多Agent团队运行（Mock，同步 JSON）
         Route("/history/{session_id}", history),                    # 历史记录
         Route("/tools/logs", tool_logs),                            # 工具日志
         Route("/reviews/pending", pending_reviews),                 # 待复核列表

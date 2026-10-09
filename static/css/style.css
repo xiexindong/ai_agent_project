@@ -309,6 +309,49 @@ body {
     text-align: center;
 }
 
+/* 团队模式开关：多 Agent 协作入口，勾选后聊天请求改发 /agent/team/run */
+.team-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 44px;
+    padding: 0 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+    transition: all 0.15s;
+}
+.team-toggle:hover { border-color: var(--accent); }
+.team-toggle input { cursor: pointer; accent-color: var(--accent); }
+.team-toggle:has(input:checked) {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* 团队模式结果渲染区：计划/产出/终审分块展示 RunResult */
+.team-plan { margin-bottom: 8px; font-size: 13px; }
+.team-subtasks { margin-bottom: 10px; font-size: 13px; }
+.team-subtasks ul { margin: 6px 0 0 18px; padding: 0; }
+.team-subtasks li { margin-bottom: 4px; }
+.team-outputs { margin-bottom: 10px; font-size: 13px; }
+.team-output {
+    margin-top: 6px;
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.team-output-content { margin-top: 4px; color: var(--text-secondary); font-size: 12px; }
+.team-review { margin-bottom: 8px; font-size: 13px; }
+.team-divider { margin: 10px 0; border: none; border-top: 1px dashed var(--border); }
+.team-answer { font-size: 14px; }
+
 
 .btn {
     padding: 7px 14px;
