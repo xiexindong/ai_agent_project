@@ -478,6 +478,7 @@ class AgentHarness:  # 多 Agent 运行时框架：注册团队 → 跑任务 �
                 self._emit(result, "error", f"存在循环依赖或无效依赖，已剔除: {cyclic}")  # 记事件但不中断
             self._emit(result, "dispatch", f"共 {len(batches)} 批，最大并行 {self.config.max_workers}")  # 记派活事件
 
+
             for batch_no, batch in enumerate(batches, 1):  # 逐批执行，batch_no 从 1 起
                 if time.time() > deadline:  # 撞总超时
                     for t in batch:  # 本批剩余任务全部标记未执行

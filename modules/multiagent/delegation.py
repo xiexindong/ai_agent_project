@@ -269,10 +269,17 @@ class DelegationExecutor:
                     _logger.debug(f"委派事件回调异常（忽略）: {e}")
             return None
 
+        # 【什么】建一条委派记录：五道闸已放行，正式登记这次转派
+        # 【作用】这是台账里的一条"流水账"，open() 会把它塞进 records；
+        #        受托方执行完后 close() 回填 success/content/duration_ms，收工时整本归档
         rec = DelegationRecord(
-            from_agent=from_agent, to_agent=to_agent, instruction=instruction,
-            reason=reason, parent_task_id=parent_task_id, depth=depth,
-            chain=chain + [from_agent],                                            # 把当前委派方加进链里，传给受托方
+            from_agent=from_agent,             # 委派方：谁要把活转出去
+            to_agent=to_agent,                 # 受托方：活转给谁
+            instruction=instruction,           # 转出去的那部分活的具体指令
+            reason=reason,                     # 委派理由（让受托方/主管知道为什么转）
+            parent_task_id=parent_task_id,     # 父任务 id：trace 里能看出它从哪个任务转出来的
+            depth=depth,                       # 当前委派深度（主管直派=0，再转一层+1）
+            chain=chain + [from_agent],        # 经手人名单：把当前委派方追加进去，传给受托方防环用
         )
         self.ledger.open(rec)                                                      # 先记账，再执行
         # 【子任务 id 为什么要带委派痕迹】

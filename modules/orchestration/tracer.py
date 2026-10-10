@@ -244,6 +244,7 @@ class Tracer:  # span 树的写入器
     def start_span(self, trace: Trace, name: str, kind: str = "", parent_id: str = "",
                    **attributes) -> Span:  # attributes 进 span.attributes：自由属性
         """开一个 span；parent_id 非空时自动挂到父节点的 children 上。"""
+        # kind = run
         span = Span(trace_id=trace.trace_id, name=name, kind=kind,
                     parent_id=parent_id, attributes=attributes)  # 建 span：开始时刻默认取现在
         with self._lock:  # 拿锁：平铺表与父的 children 都要原子写
