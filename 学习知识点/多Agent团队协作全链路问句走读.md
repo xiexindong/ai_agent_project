@@ -1,7 +1,8 @@
 # 多Agent团队协作全链路问句走读
 
-> 本文按一次代码走读的真实顺序，收录本会话的**全部问句**。
-> 从 API 入口一行代码出发，一路追到：run 函数 → trace/span 观测 → RunContext → 委派台账 → 五道闸 → 防环。
+> 本文按一次代码走读的真实顺序，收录本会话的**全部问句**（Q1-Q23）。
+> 从 API 入口一行代码出发，一路追到：run 函数 → trace/span 观测 → RunContext → 委派台账 → 五道闸 → 防环
+> → 主管规划调模型 → plan 后流水线 → _emit 事件留痕 → HITL 人工确认前后端全链路。
 
 ---
 
@@ -19,7 +20,21 @@ POST /agent/team/run  (server.py L712)
       │  └─ DelegationLedger            delegation.py L89
       │     └─ can() 五道闸             delegation.py L115
       │        └─ chain 防环            delegation.py L134-L140
-      └─ bus.clear()                    coordination.py L151
+      ├─ bus.clear()                    coordination.py L151
+      │
+      ├─ 第1步 主管规划                  harness.py L429 → agents.py L491 plan()
+      │  └─ llm.invoke_structured()     agents.py L517 → llm.py L425（一次调用返回 JSON 工单）
+      │     PlanResult.model_validate   agents.py L518（本地验票，失败重试→降级）
+      ├─ _emit("plan") 事件留痕         harness.py L435 → _emit L218（trace 账本 + on_event 喇叭）
+      ├─ 第2步 is_direct 直答收工       harness.py L438
+      ├─ 第2.5步 HITL 计划确认          harness.py L449 gate.ask()
+      │  ├─ 下行：Notifier → SSE /hitl/stream 推 interrupt 卡片
+      │  └─ 上行：POST /hitl/reply → store.submit() → Event.set() 唤醒
+      ├─ 第3步 topo_batches 分批        harness.py L475 → L339（按 depends_on 拓扑分批）
+      │  └─ _run_batch 并行执行         harness.py L500 → L771 → agent.run() agents.py L303
+      ├─ 第3.5步 失败重规划（可选）      harness.py L529
+      ├─ 第4步 一致性/仲裁 → synthesize harness.py L541 / L612
+      └─ 第5步 review 终审 + 终稿确认    harness.py L633 / L649
 ```
 
 ---
@@ -377,6 +392,186 @@ Harness.run()           ← server.py 调的（团队总入口）
 
 ---
 
+# 七、主管规划：大模型怎么拆任务
+
+## Q20：`agents.py L517-518` 这一步是不是调用大模型进行分步骤？
+
+```python
+data = self.llm.invoke_structured(prompt, system_prompt=self.system_prompt)  # L517
+return PlanResult.model_validate(data)                                       # L518
+```
+
+**是的，调大模型拆步骤的核心动作就在 L517，但两行职责不同：**
+
+| 行 | 干什么 | 是否调模型 |
+|:---|:---|:---:|
+| L517 | 把填好的规划提示词发给大模型，**要求返回一个 JSON**（拆几个子任务、每个派给谁、依赖谁） | ✅ 真正发请求，全程就这一次 |
+| L518 | 拿到的只是普通字典，本地用 Pydantic 按 `PlanResult` 结构**当场验票**：字段齐不齐、assignee 有没有填 | ❌ 纯本地校验 |
+
+`invoke_structured` 内部（**llm.py L425-448**）：拼上 system_prompt、追加"请严格以 JSON 格式输出"，并用 `response_format={"type": "json_object"}` 强制服务端返回合法 JSON；温度特意压到 **0.2** 保证输出稳定可解析。
+
+模型返回长这样（相当于在固定格子里填空）：
+
+```json
+{
+  "thought": "先查后算，两步可并行",
+  "subtasks": [
+    {"id": "t1", "assignee": "researcher_1", "instruction": "查 Q3/Q4 营收"},
+    {"id": "t2", "assignee": "analyst_1", "instruction": "算环比", "depends_on": ["t1"]}
+  ],
+  "direct_answer": "",
+  "needs_review": false
+}
+```
+
+**关键区分："分步骤"的决策在一次调用里整体返回，模型不是边执行边想下一步**；真正的逐步执行是后面调度器照这张工单派工。
+
+通俗比喻——**主管填派工单**：L510-515 备料（问题 + 工人名单 roster + 派工规则 + 工单格式 schema）→ L517 打电话问大脑 → L518 验工单。
+
+两道保险（agents.py L519-539）：校验失败把错误原文**回喂重试一次**（最常见错是漏字段）；第二次还失败就**降级为单 Agent 直答**，团队不停摆。
+
+## Q21：plan() 执行完毕，下一步在哪里？
+
+`plan()` 自己不决定下一步——它是被 **`Harness.run()`** 调用的，调用点在 **harness.py L429**。返回 `PlanResult` 后控制权回到 `run()`，沿流水线往下：
+
+```
+plan() 返回 PlanResult
+  │
+  ├─ ① 记账留痕      L433-435  plan 写进 result + emit("plan") 推送
+  ├─ ② 直接答收工    L437-443  is_direct 为真（寒暄/单步）→ 用 direct_answer 返回
+  ├─ ②.5 人工确认拆法 L445-472  HITL 可选：人可批准/驳回/终止
+  ├─ ③ DAG 分批      L474-478  topo_batches()（L339）按 depends_on 切批次
+  ├─ ③ 逐批并行执行  L481-525  _run_batch()（L771）线程池并行调 agent.run()
+  │                            产出写两处：result.outputs / ctx.upstream
+  ├─ ③.5 失败重规划  L527-530  可选，默认关（省 token）
+  ├─ ④ 一致性/仲裁   L541-602  产出打架时比对相似度、仲裁员/人工裁决
+  ├─ ④ 主管汇总      L604-615  synthesize() 汇成草稿
+  ├─ ⑤ 终审          L632-642  可选：ReviewerAgent.review()
+  └─ ⑤.5 终稿人工确认 L649+     最后一道人工放行 → 组装 RunResult
+```
+
+真正开始干活的两个入口：
+
+- **topo_batches()**（harness.py L339）：带子依赖的任务按拓扑序切成"批次"，同批可并行，有环的依赖被剔除；
+- **_run_batch()**（harness.py L771）：一批之内并行调每个成员的 `agent.run()`（agents.py L303）。
+
+比喻：plan 是主管画完**施工横道图** → 图纸贴公告栏 → 小事主管自己答 → 真动工先排分期工程（分批）→ 每期多工种同时进场（并行）→ 前期成果放共享区（upstream）→ 主管验收汇总、质检员终审。
+
+旁路：挂了 CrewAI 后端时调用点在 crewai_backend.py L244，规划仍用自研 plan()，执行交给 CrewAI 框架。
+
+---
+
+# 八、事件留痕：_emit
+
+## Q22：`harness.py L435-436` emit 是干什么？
+
+`_emit` 是 Harness 内部的**事件播报器**——流水线每到关键节点就喊一嗓子"现在发生了什么"，外面看得见进度、事后能复盘。定义只有 9 行（**harness.py L216-226**），做两件事：
+
+```python
+event = TraceEvent(kind=kind, message=message, agent=agent, payload=payload)
+result.trace.append(event)   # ① 内部账本：追加到本次运行事件流水，随 RunResult 返回
+if self.on_event:            # ② 外部喇叭：回调构造 Harness 时传入的钩子（SSE/审计）
+    self.on_event(event)     #    钩子异常 try/except 吞掉只记 debug，绝不炸主流程
+```
+
+| 组成 | 含义 | L435 那行的实际值 |
+|:---|:---|:---|
+| `kind` | 事件类型，取值被 TraceKind 写死（models.py L240-249），写错字符串类型检查阶段就报错 | `"plan"` |
+| `message` | 给人看的一句话 | 主管思考摘要，没有就写"拆出 N 个子任务" |
+| `agent` | 这事谁干的 | supervisor.name |
+| `payload` | 机器读的结构化附载 | 完整子任务清单 |
+| `ts` | 毫秒时间戳，建事件时自动盖 | 自动生成 |
+
+`TraceEvent` 定义在 models.py L254-261；kind 全集：`plan / dispatch / agent_start / agent_end / synthesize / review / done / error / consensus / arbitration / hitl / replan / delegate`。
+
+通俗比喻——工地门口：**`result.trace` 是施工日志本**（按时间登记、收工存档），**`on_event` 是广播喇叭**（同步喊给前端进度条/审计系统），`_emit` 就是"一边登记一边按喇叭"。
+
+易混点：委派模块也有个 `on_event`（delegation.py L228），但它的归宿仍是 `_emit`——委派放行/被拒后在 harness.py L247-255 的回调内部调 `self._emit(result, "delegate", ...)`。**全团队所有环节的事件最终走 _emit 一个出口**，trace 格式统一。
+
+---
+
+# 九、人工确认（HITL）：后端等人与前端互通
+
+## Q23：`harness.py L450-458` gate.ask 阻塞等人工，怎么通知到前端？前端又怎么把决策传回来？
+
+靠三样东西配合：**一个阻塞的 `threading.Event`（后端等人）、一条 SSE 长连接（服务器→前端推卡片）、一个 POST 接口（前端→服务器回决策）**。
+
+### 完整时序
+
+```
+Agent 工作线程                     后端 FastAPI                    前端审批页
+─────────────                     ────────────                    ──────────
+gate.ask()（gate.py L135）
+  ├─ store.save(req) 登记请求 + 预热 threading.Event
+  ├─ on_event(req) ──► InterruptNotifier.notify()（notify.py L174）
+  │                      三通道扇出：① stderr 终端
+  │                      ② 塞进每个 SSE 订阅者的队列
+  │                      ③ 钉钉/飞书 webhook（可选）
+  │                                       GET /hitl/stream ◄── 提前挂着的 SSE 长连接
+  │                                       队列拿到 req ─────► event: interrupt 帧
+  │                                                           渲染卡片（标题/子任务/倒计时）
+  │                                       POST /hitl/reply ◄── 人点"批准"
+  │                                       {request_id, action}
+  │                      gate.submit() → store.submit()（store.py L118）
+  │                        存回复、WAITING→RESOLVED
+  │                        ★ event.set() 唤醒
+  ◄─ event.wait() 立刻醒来拿到 HumanReply
+  ▼
+harness L459 按 reply.action 决定继续派活 / 驳回 / 终止
+```
+
+### 下行（服务器 → 页面）：请求怎么变成卡片
+
+1. **登记并挂起**：gate.ask()（gate.py L155-178）先 `store.save(req)` 存字典并配一个 Event，再调 `on_event(req)` 钩子；
+2. **通知器扇出**：钩子是 InterruptNotifier.notify()，SSE 这一路把请求塞进每个订阅者的专属队列（notify.py subscribe L300）；
+3. **SSE 端点推帧**：前端挂着的 `GET /hitl/stream`（hitl_routes.py L103-132）消费队列，推标准帧：
+
+```
+event: interrupt
+data: {"id":"hitl_xxx","kind":"before_plan","title":"确认任务分解（2 个子任务）",
+       "context":{...},"options":[...],"wait_seconds":60}
+```
+
+补救渠道：连上 SSE 的瞬间**先补发积压待办**（L112/116）；也可以直接轮询 `GET /hitl/pending`（L89-95）。
+
+### 上行（页面 → 服务器）：点按钮怎么唤醒线程
+
+人点按钮 → 普通 POST（hitl_routes.py L140-163）：
+
+```
+POST /hitl/reply   {"request_id":"hitl_xxx","action":"approve","modified":"","note":""}
+```
+
+服务端 `gate.submit()` → **store.submit()**（store.py L118-139）做三件事：
+① 校验请求仍是 WAITING（重复点击第二次返回 **409**，保住第一次决策）；
+② 存回复、状态改 RESOLVED、回填归档；
+③ **`event.set()`——这一行就是"唤醒"**。
+
+Agent 线程阻塞在 store.wait() 的 `event.wait(timeout)`（store.py L150-166），set() 是内核级信号，**立刻**醒来取回复返回，ask() 拿到 HumanReply，harness L459 按动作分支继续。
+
+### 为什么线程阻塞不卡服务
+
+团队执行跑在**线程池**的工作线程里（_run_batch 并行派活），阻塞的是工作线程；POST /hitl/reply 由 asyncio 主线程接收，submit() 只是写字典 + 拨 Event，毫秒级完成。两个世界靠 threading.Event 碰面。不用轮询等待的原因（store.py L13-17）：白占线程 + 最坏一个轮询周期才生效，体感"点了没反应"。
+
+### 通俗比喻：手术室等家属签字
+
+医生开签字单（InterruptRequest，带单号）贴护士站（store）→ 坐休息室等叫号（Event.wait）→ 大喇叭三渠道喊人（终端/SSE/ webhook）→ 家属 App 看单子点"同意"（POST 回单号）→ 护士盖章归档按呼叫铃（event.set）→ 医生立刻听见回去手术，不用自己跑去问。
+
+### 三道兜底
+
+| 情况 | 行为 | 位置 |
+|:---|:---|:---|
+| 人一直不点 | 等到超时（配置默认 60s）按 default_action 兜底（工具默认拒绝、终稿默认放行） | gate.py L182-192 |
+| 网络重试点两次 | 第二次返回 409 Conflict，第一次决策不可覆盖 | store.py L124-126 |
+| 流程提前结束 | cancel_waiting() 置 CANCELLED 并唤醒，避免线程挂到超时占并行度 | gate.py L283-295 |
+
+### 两个部署注意
+
+1. **存储是进程内的**（store.py L19-22）：多副本部署时抛中断与收回复可能不在同一台机器，会"点了批准却永远等不到"，须换共享存储（预留 PGInterruptStore）；
+2. **浏览器原生 EventSource 发不了自定义请求头**，本项目鉴权走 X-API-Key（hitl_routes.py L100-102），网页端要用 fetch + ReadableStream 接 SSE 或网关注入 key，否则 401/403。
+
+---
+
 # 附录 A：关键代码位置总表
 
 | 功能 | 文件 | 行号 |
@@ -396,6 +591,18 @@ Harness.run()           ← server.py 调的（团队总入口）
 | DelegationLedger / can() | modules/multiagent/delegation.py | L89 / L115 |
 | 防环检查 | modules/multiagent/delegation.py | L134-L140 |
 | DelegationExecutor / delegate() | modules/multiagent/delegation.py | L210 / L253 |
+| SupervisorAgent.plan | modules/multiagent/agents.py | L491（调模型 L517 / 校验 L518 / 重试降级 L519-539） |
+| invoke_structured | modules/agent/llm.py | L425（json_object 强制 JSON，温度 0.2） |
+| plan 调用点 / 规划 span | modules/multiagent/harness.py | L429 / L426 |
+| _emit 事件播报器 | modules/multiagent/harness.py | L218（trace 记账 + on_event 回调） |
+| TraceEvent / TraceKind | modules/multiagent/models.py | L254 / L240 |
+| topo_batches 拓扑分批 | modules/multiagent/harness.py | L339（调用在 L475） |
+| _run_batch 并行派活 | modules/multiagent/harness.py | L771（调用在 L500） |
+| synthesize 汇总 / review 终审 | modules/multiagent/harness.py | L612 / L640 |
+| HumanGate.ask | modules/hitl/gate.py | L135（ask_tool L203 / ask_final L241 / cancel_waiting L283） |
+| InMemoryInterruptStore | modules/hitl/store.py | save L78 / submit L118 / wait L150（Event 唤醒在 L134） |
+| InterruptNotifier | modules/hitl/notify.py | notify L174 / subscribe L300 |
+| HITL 三个 HTTP 接口 | modules/api/hitl_routes.py | GET /hitl/stream L103、POST /hitl/reply L140、GET /hitl/pending L89 |
 
 ---
 
@@ -406,3 +613,8 @@ Harness.run()           ← server.py 调的（团队总入口）
 3. **RunContext 作用？** 全队共享的资料袋（问题/上游产出）+ 公共设施（bus/gate）+ 委派三件套，避免参数层层透传。
 4. **怎么防委派死循环？** chain 经手人名单只增不减，受托方在名单上即拒绝；深度上限做第二道保险。
 5. **委派被拒为什么留痕、为什么返回 None？** "没想转"和"想转被拦"要可区分；委派是可选能力，不能拖垮主流程。
+6. **规划为什么用结构化输出？** 自由文本靠正则抠 assignee/depends_on 极脆弱；喂 JSON Schema 让模型在格子里填空，model_validate 当场校验，失败带错误原文重试一次，再失败降级单 Agent 直答。
+7. **"分步骤"发生在哪？** 分步决策在 plan 的一次 LLM 调用里整体返回；模型不边执行边想，逐步执行由 topo_batches 按依赖分批、_run_batch 并行派活完成。
+8. **_emit 的两个去向？** 内部 result.trace 事件流水（随 RunResult 返回可复盘）+ 外部 on_event 钩子（SSE 推送/审计落库）；钩子异常隔离不炸主流程，全团队事件统一走这一个出口。
+9. **HITL 阻塞等待怎么和前端互通？** 后端工作线程靠 threading.Event 内核级等待；下行 Notifier 扇出经 SSE /hitl/stream 推 interrupt 卡片，上行 POST /hitl/reply 经 store.submit() 置 RESOLVED 并 event.set() 立刻唤醒；超时按默认动作兜底，重复提交返回 409。
+10. **阻塞为什么不拖垮服务？** 阻塞的是线程池工作线程，HTTP 回帖由 asyncio 主线程毫秒级处理；进程内 Event 只适用单实例，多副本须换共享存储。
