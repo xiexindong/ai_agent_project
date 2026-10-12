@@ -69,6 +69,25 @@ return RunResult（HTTP 响应给客户端）
 
 ---
 
+## 快速跳转目录（点文件名直达代码）
+
+| 文件 | 职责 |
+|---|---|
+| [modules/api/server.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/api/server.py) | HTTP 接口层：/agent/team/run 入口 |
+| [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py) | 团队编排总入口 Harness.run |
+| [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py) | 三个 Agent 类与 BaseAgent 执行逻辑 |
+| [modules/multiagent/delegation.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/delegation.py) | 委派台账与五道闸 |
+| [modules/multiagent/models.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/models.py) | SubTask / PlanResult 等数据模型 |
+| [modules/hitl/gate.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/gate.py) | 人工审批闸门（阻塞询问） |
+| [modules/hitl/store.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/store.py) | 审批请求存储与 Event 唤醒 |
+| [modules/hitl/notify.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/notify.py) | 审批通知三通道扇出 |
+| [modules/api/hitl_routes.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/api/hitl_routes.py) | SSE 卡片下行 / 回帖上行接口 |
+
+> 注意：项目里有**两个 harness.py**——本文提到的 `harness.py` 一律指 `modules/multiagent/harness.py`（团队编排）；
+> 你 IDE 里打开的 `modules/harness/harness.py` 是工具治理 Harness，是另一个模块，别走错门。
+
+---
+
 ## 二、逐阶段拆解：每步函数的输入、动作、产出
 
 ### 阶段① HTTP 入口：`team_run`
@@ -295,31 +314,31 @@ run(task, ctx)
 
 ## 七、附录：函数位置速查表
 
-| 函数 | 文件 | 行号 | 一句话职责 |
+| 函数 | 文件（点击直达） | 行号 | 一句话职责 |
 |---|---|---|---|
-| team_run | server.py | L713 | HTTP 入口：翻译请求+安全检查 |
-| Harness.run | harness.py | L371 | 团队总入口：流水线编排 |
-| Harness._new_delegation | harness.py | L233 | 装配本轮委派台账与执行器 |
-| Harness._emit | harness.py | L218 | 事件双写：trace 账本+外部喇叭 |
-| Harness.topo_batches | harness.py | L339 | Kahn 拓扑分层（静态方法） |
-| Harness._run_batch | harness.py | L771 | 线程池并行跑一批 |
-| _one（内嵌） | harness.py | L786 | 单任务全套：取人/HITL/span/执行 |
-| Harness._first_by_role | harness.py | L855 | 按角色找终审员/仲裁者 |
-| Harness.evaluate | harness.py | L866 | 回归评测（关键词门禁） |
-| SupervisorAgent.plan | agents.py | L491 | 拆任务（LLM#1，重试+降级） |
-| SupervisorAgent.synthesize | agents.py | L545 | 汇总（LLM#2，失败回退拼接） |
-| WorkerAgent（空壳继承） | agents.py | L562 | 完全复用 BaseAgent.run |
-| ReviewerAgent.review | agents.py | L580 | 终审打分（LLM#3，失败放行） |
-| BaseAgent.run | agents.py | L303 | 单任务执行：备料/委派/拼prompt/二选一执行 |
-| BaseAgent._run_with_tools | agents.py | ~L235 | 工具循环：LLM↔工具直到无 tool_calls |
-| BaseAgent._build_prompt | agents.py | L410 | 六段式提示词拼接 |
-| BaseAgent._upstream_text | agents.py | L398 | 上游产出文本（截 1200） |
-| BaseAgent.llm（property） | agents.py | L163 | 惰性 LLM：注入优先，否则现建 |
-| build_default_team | agents.py | L608 | 默认 4 人花名册（AgentSpec 档案） |
-| build_agent | agents.py | L644 | 角色→类映射工厂 |
-| decide_delegation | delegation.py | — | 委派决策（LLM） |
-| DelegationLedger.can / delegate | delegation.py | L89/L253 | 委派五道闸 / 执行转派 |
-| HumanGate.ask / ask_final / ask_tool | gate.py | L135/L241/L203 | 四类 HITL 阻塞询问 |
-| InMemoryInterruptStore.submit | store.py | L118 | 回帖落账 + Event.set 唤醒 |
-| InterruptNotifier.notify | notify.py | L174 | 三通道扇出（终端/SSE/webhook） |
-| GET /hitl/stream、POST /hitl/reply | hitl_routes.py | L103/L140 | 审批卡片下行 / 决策回传上行 |
+| team_run | [modules/api/server.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/api/server.py#L712-L752) | L713 | HTTP 入口：翻译请求+安全检查 |
+| Harness.run | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L371-L417) | L371 | 团队总入口：流水线编排 |
+| Harness._new_delegation | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L233) | L233 | 装配本轮委派台账与执行器 |
+| Harness._emit | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L218-L226) | L218 | 事件双写：trace 账本+外部喇叭 |
+| Harness.topo_batches | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L339-L364) | L339 | Kahn 拓扑分层（静态方法） |
+| Harness._run_batch | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L771-L851) | L771 | 线程池并行跑一批 |
+| _one（内嵌） | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L786-L834) | L786 | 单任务全套：取人/HITL/span/执行 |
+| Harness._first_by_role | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L855-L859) | L855 | 按角色找终审员/仲裁者 |
+| Harness.evaluate | [modules/multiagent/harness.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/harness.py#L866) | L866 | 回归评测（关键词门禁） |
+| SupervisorAgent.plan | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L491-L541) | L491 | 拆任务（LLM#1，重试+降级） |
+| SupervisorAgent.synthesize | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L545-L557) | L545 | 汇总（LLM#2，失败回退拼接） |
+| WorkerAgent（空壳继承） | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L562-L563) | L562 | 完全复用 BaseAgent.run |
+| ReviewerAgent.review | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L580-L603) | L580 | 终审打分（LLM#3，失败放行） |
+| BaseAgent.run | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L303-L381) | L303 | 单任务执行：备料/委派/拼prompt/二选一执行 |
+| BaseAgent._run_with_tools | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L235-L299) | ~L235 | 工具循环：LLM↔工具直到无 tool_calls |
+| BaseAgent._build_prompt | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L410-L427) | L410 | 六段式提示词拼接 |
+| BaseAgent._upstream_text | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L398-L406) | L398 | 上游产出文本（截 1200） |
+| BaseAgent.llm（property） | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L162-L168) | L163 | 惰性 LLM：注入优先，否则现建 |
+| build_default_team | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L608-L639) | L608 | 默认 4 人花名册（AgentSpec 档案） |
+| build_agent | [modules/multiagent/agents.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/agents.py#L644-L650) | L644 | 角色→类映射工厂 |
+| decide_delegation | [modules/multiagent/delegation.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/delegation.py) | — | 委派决策（LLM） |
+| DelegationLedger.can / delegate | [modules/multiagent/delegation.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/multiagent/delegation.py#L89) | L89/L253 | 委派五道闸 / 执行转派 |
+| HumanGate.ask / ask_final / ask_tool | [modules/hitl/gate.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/gate.py#L135) | L135/L241/L203 | 四类 HITL 阻塞询问 |
+| InMemoryInterruptStore.submit | [modules/hitl/store.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/store.py#L118-L139) | L118 | 回帖落账 + Event.set 唤醒 |
+| InterruptNotifier.notify | [modules/hitl/notify.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/hitl/notify.py#L174-L181) | L174 | 三通道扇出（终端/SSE/webhook） |
+| GET /hitl/stream、POST /hitl/reply | [modules/api/hitl_routes.py](file:///e:/workspace/AI/AI-project/ai_agent_project/modules/api/hitl_routes.py#L103) | L103/L140 | 审批卡片下行 / 决策回传上行 |
